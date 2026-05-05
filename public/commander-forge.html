@@ -1351,30 +1351,44 @@
       else setPhase("import");
     };
 
-    // Try the primary provider first; on failure (rate-limit, network, parse error)
-    // fall back to the next configured provider. Cloudflare's built-in is always
-    // "configured" (no key needed). Order: primary → others (built-in always last
-    // unless it's primary, since we want to favour user-supplied higher-quality keys).
-    // Returns { text, finishReason, completionTokens, promptTokens, provider }.
-    const callAI = async (userText, systemText, maxTokens = 4096) => {
+    // Compute the provider order (primary first, others after, only those with
+    // a key configured — Cloudflare's built-in needs no key so it's always usable).
+    const aiUsableProviders = (exclude = []) => {
       const all = ["cloudflare", "groq", "gemini"];
       const order = [provider, ...all.filter(p => p !== provider)];
-      const usable = order.filter(p =>
-        p === "cloudflare" ? true : !!apiKeys[p]   // built-in needs no key
+      return order.filter(p =>
+        !exclude.includes(p) && (p === "cloudflare" ? true : !!apiKeys[p])
       );
+    };
 
+    // Run a prompt on a single, specific provider. Throws on API failure.
+    // Used by callAI (which adds rotation on failure) and by buildDeck's
+    // multi-provider retry loop (which rotates on PARSE failure too).
+    const callAIOn = async (p, userText, systemText, maxTokens) => {
+      const fn  = p === "groq"   ? callGroq
+                : p === "gemini" ? callGemini
+                :                  callCloudflare;
+      const key = apiKeys[p] || "";   // empty for cloudflare; ignored by callCloudflare
+      const mdl = models[p]  || PROVIDERS[p].models[0].id;
+      const result = await fn(key, mdl, userText, systemText, maxTokens);
+      return { ...result, provider: p };
+    };
+
+    // Try the primary provider first; on API-level failure (rate-limit, network,
+    // 5xx) fall back to the next configured provider. Does NOT detect bad-content
+    // responses — for that, buildDeck has its own provider-rotation loop that
+    // rotates on parse failure too (some small models return valid HTTP 200 with
+    // unparseable garbage; only the caller knows what "valid output" looks like).
+    // Returns { text, finishReason, completionTokens, promptTokens, provider }.
+    const callAI = async (userText, systemText, maxTokens = 4096, exclude = []) => {
+      const usable = aiUsableProviders(exclude);
       let lastErr = null;
       for (let i = 0; i < usable.length; i++) {
         const p = usable[i];
         try {
-          const fn  = p === "groq"   ? callGroq
-                    : p === "gemini" ? callGemini
-                    :                  callCloudflare;
-          const key = apiKeys[p] || "";   // empty for cloudflare; ignored by callCloudflare
-          const mdl = models[p]  || PROVIDERS[p].models[0].id;
-          const result = await fn(key, mdl, userText, systemText, maxTokens);
+          const result = await callAIOn(p, userText, systemText, maxTokens);
           if (i > 0) addLog(`✅ Fallback to ${PROVIDERS[p].label} succeeded.`);
-          return { ...result, provider: p };
+          return result;
         } catch (e) {
           lastErr = e;
           const msg  = (e.message || "").slice(0, 110);
@@ -1691,51 +1705,85 @@ Keep ALL "reason" strings ≤ 80 chars. Keep total response well under your outp
 Total cards across all "cards" arrays MUST equal 99.`;
         const sysPrompt =
           "You are an expert MTG Commander deckbuilder. CRITICAL: emit the `categories` array FIRST in the JSON, before theme/description/warnings, so the deck survives any truncation. The mainboard MUST always contain exactly 99 cards (commander excluded). Basic lands are unlimited and you MUST add repeated basic land entries to top the deck up to 99 if other slots are short. Non-basics come only from the provided list. If a budget cap is set, keep total estimated USD under it. Keep `reason` and `warning` strings concise. Return valid JSON only — no prose, no markdown.";
-        const replyObj = await callAI(userPrompt, sysPrompt, 8192);
-        const reply    = replyObj.text;
-        const tt = replyObj.thoughtsTokens ? `, thoughts=${replyObj.thoughtsTokens}` : "";
-        addLog(`📊 ${PROVIDERS[replyObj.provider]?.label || replyObj.provider}: finish=${replyObj.finishReason}, completion_tokens=${replyObj.completionTokens ?? "?"}${tt} (out of 8192 max).`);
-        setProg(80);
-
-        // ── Parse + auto-retry on truncation ─────────────────────────
-        let deckData = safeParse(reply);
-        if (!deckData?.categories) {
-          const raw0      = safeParse.lastRaw || "";
-          const reason1   = replyObj.finishReason;
-          const trunc1    = reason1 === "length" || reason1 === "max_tokens"
-                           || !raw0.trimEnd().endsWith("}");
-          const why = reason1 === "length" || reason1 === "max_tokens"
-            ? "hit max_tokens"
-            : reason1 === "stop"
-              ? "model stopped early"
-              : `finish_reason=${reason1}`;
-          addLog(`⚠️ First response was ${raw0.length} chars (${replyObj.completionTokens ?? "?"} tokens), ${why}. Retrying focused prompt…`);
-
-          // Retry: ask for ONLY the categories array, no warnings/theme. The
-          // previous attempt blew its budget on prose; this one is the deck only.
-          const retrySys = sysPrompt + " Respond with the categories array ONLY. Skip theme/description/warnings entirely on this retry.";
-          const retryUser = userPrompt + `
+        // ── Multi-provider rotation with parse-failure detection ─────────
+        // Each provider gets two shots (full prompt + focused retry). If both
+        // produce unparseable output, rotate to the next provider. This is the
+        // crucial fix vs callAI's API-only fallback: small models (Llama 3.1 8B
+        // on Workers AI) routinely return HTTP 200 with garbage like 17 Mountain
+        // entries in a row, which API-level fallback can't catch.
+        const retrySys  = sysPrompt + " Respond with the categories array ONLY. Skip theme/description/warnings entirely on this retry.";
+        const retryUser = userPrompt + `
 
 PREVIOUS RESPONSE WAS TRUNCATED OR INCOMPLETE. Send ONLY the JSON shape:
 { "categories": [ ...exactly 99 cards across all categories... ] }
 No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
-          const reply2Obj = await callAI(retryUser, retrySys, 8192);
-          addLog(`📊 Retry: finish=${reply2Obj.finishReason}, completion_tokens=${reply2Obj.completionTokens ?? "?"}.`);
-          deckData = safeParse(reply2Obj.text);
+
+        let deckData = null, replyObj = null;
+        const tried        = [];
+        const aiOrder      = aiUsableProviders();   // local: provider rotation order
+
+        for (const p of aiOrder) {
+          // ── Attempt 1: full prompt ──
+          let r1;
+          try { r1 = await callAIOn(p, userPrompt, sysPrompt, 8192); }
+          catch (e) {
+            addLog(`⚠️ ${PROVIDERS[p].label} failed (${(e.message || "").slice(0,110)}). Trying next provider…`);
+            tried.push({ provider: p, error: e.message });
+            continue;
+          }
+          const tt1 = r1.thoughtsTokens ? `, thoughts=${r1.thoughtsTokens}` : "";
+          addLog(`📊 ${PROVIDERS[p].label}: finish=${r1.finishReason}, completion_tokens=${r1.completionTokens ?? "?"}${tt1} (out of 8192 max).`);
+          let parsed = safeParse(r1.text);
+          if (parsed?.categories) { deckData = parsed; replyObj = r1; break; }
+
+          // ── Attempt 2: focused retry on same provider ──
+          const raw0    = safeParse.lastRaw || "";
+          const reason1 = r1.finishReason;
+          const why = reason1 === "length" || reason1 === "max_tokens"
+            ? "hit max_tokens"
+            : reason1 === "stop"
+              ? "model stopped early or returned bad JSON"
+              : `finish_reason=${reason1}`;
+          addLog(`⚠️ ${PROVIDERS[p].label}: ${raw0.length} chars (${r1.completionTokens ?? "?"} tokens), ${why}. Retrying focused prompt on same provider…`);
+
+          let r2;
+          try { r2 = await callAIOn(p, retryUser, retrySys, 8192); }
+          catch (e) {
+            addLog(`⚠️ ${PROVIDERS[p].label} focused retry failed (${(e.message || "").slice(0,110)}). Trying next provider…`);
+            tried.push({ provider: p, replyObj: r1, error: e.message });
+            continue;
+          }
+          addLog(`📊 ${PROVIDERS[p].label} retry: finish=${r2.finishReason}, completion_tokens=${r2.completionTokens ?? "?"}.`);
+          parsed = safeParse(r2.text);
+          if (parsed?.categories) { deckData = parsed; replyObj = r2; break; }
+
+          // Both attempts on this provider failed to parse. Rotate.
+          tried.push({ provider: p, replyObj: r2 });
+          const next = aiOrder[aiOrder.indexOf(p) + 1];
+          if (next) {
+            addLog(`⚠️ ${PROVIDERS[p].label} produced unparseable output twice. Falling back to ${PROVIDERS[next].label}…`);
+          }
         }
 
         if (!deckData?.categories) {
+          // Use the last attempted response for diagnostic output.
+          const last    = tried[tried.length - 1];
           const raw     = safeParse.lastRaw || "";
           const len     = raw.length;
           const snippet = raw.slice(0, 800).replace(/\s+/g, " ");
           const truncated = !raw.trimEnd().endsWith("}");
-          addLog(`❌ AI parse failed after retry — response was ${len} chars${truncated ? " (truncated)" : ""}.`);
+          const triedLabels = tried.map(t => PROVIDERS[t.provider]?.label || t.provider).join(", ");
+          addLog(`❌ All providers failed (${triedLabels}). Last response: ${len} chars${truncated ? " (truncated)" : ""}.`);
           addLog(`📝 First 800 chars: ${snippet || "(empty response)"}`);
-          if (len > 800) addLog(`…(truncated; full response stashed for the error screen)`);
+          if (len > 800) addLog(`…(full response stashed for the error screen)`);
           throw new Error(truncated
-            ? `AI response was truncated mid-output, even after a retry. The current model (${PROVIDERS[provider]?.label}) is stopping early on long structured outputs. Try Gemini 2.5 Pro (most reliable for complete decks) or switch primary provider in Settings.`
-            : "Could not parse deck — see the build log below for the raw AI response. Try again, switch model, or share the response with the developer.");
+            ? `Every available provider returned a truncated or unparseable deck. Built-in (Llama 3.1 8B) often fails on full deck builds — paste a Gemini key in Settings for reliable output.`
+            : `Every available provider returned an unparseable response. Tried: ${triedLabels}. See the build log for the raw output. Add or switch to a stronger provider in Settings.`);
         }
+        if (replyObj.provider !== aiOrder[0]) {
+          addLog(`✅ ${PROVIDERS[replyObj.provider].label} produced a valid deck after fallback.`);
+        }
+        setProg(80);
 
         // Strip the commander itself from the 99-card mainboard if the AI
         // included it (it lives in the command zone, not the deck). Also
