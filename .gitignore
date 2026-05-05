@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node (only relevant if you ever revive the Vite scaffold)
+node_modules/
+
+# Claude Code config — local to this machine
+.claude/
