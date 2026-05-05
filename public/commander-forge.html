@@ -1674,17 +1674,24 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         const tried        = [];
         const aiOrder      = aiUsableProviders();   // local: provider rotation order
 
+        // Gemini 2.5 Flash supports up to 65536 output tokens; Llama 3.3 70B on
+        // Groq supports 32768. A 99-card deck with concise reasons fits in
+        // ~6-10K tokens, but verbose models (especially Gemini in non-thinking
+        // mode) sometimes burn through 8K writing long reasons and truncate
+        // mid-output. 16K gives generous headroom; both providers handle it.
+        const DECK_MAX_TOKENS = 16384;
+
         for (const p of aiOrder) {
           // ── Attempt 1: full prompt ──
           let r1;
-          try { r1 = await callAIOn(p, userPrompt, sysPrompt, 8192); }
+          try { r1 = await callAIOn(p, userPrompt, sysPrompt, DECK_MAX_TOKENS); }
           catch (e) {
             addLog(`⚠️ ${PROVIDERS[p].label} failed (${(e.message || "").slice(0,110)}). Trying next provider…`);
             tried.push({ provider: p, error: e.message });
             continue;
           }
           const tt1 = r1.thoughtsTokens ? `, thoughts=${r1.thoughtsTokens}` : "";
-          addLog(`📊 ${PROVIDERS[p].label}: finish=${r1.finishReason}, completion_tokens=${r1.completionTokens ?? "?"}${tt1} (out of 8192 max).`);
+          addLog(`📊 ${PROVIDERS[p].label}: finish=${r1.finishReason}, completion_tokens=${r1.completionTokens ?? "?"}${tt1} (out of ${DECK_MAX_TOKENS} max).`);
           let parsed = safeParse(r1.text);
           if (parsed?.categories) { deckData = parsed; replyObj = r1; break; }
 
@@ -1699,7 +1706,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           addLog(`⚠️ ${PROVIDERS[p].label}: ${raw0.length} chars (${r1.completionTokens ?? "?"} tokens), ${why}. Retrying focused prompt on same provider…`);
 
           let r2;
-          try { r2 = await callAIOn(p, retryUser, retrySys, 8192); }
+          try { r2 = await callAIOn(p, retryUser, retrySys, DECK_MAX_TOKENS); }
           catch (e) {
             addLog(`⚠️ ${PROVIDERS[p].label} focused retry failed (${(e.message || "").slice(0,110)}). Trying next provider…`);
             tried.push({ provider: p, replyObj: r1, error: e.message });
