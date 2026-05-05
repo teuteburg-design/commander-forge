@@ -1,16 +1,10 @@
 // Commander Forge — Cloudflare Worker entry point.
 //
 // Routes:
-//   POST /api/ai     → run a prompt through Workers AI Llama 3.1 8B
 //   /edhrec/*        → proxy GET to json.edhrec.com (CORS sidestep)
 //   /spellbook/*     → proxy POST to backend.commanderspellbook.com (CORS sidestep)
 //   /archidekt/*     → proxy any method to archidekt.com (CORS sidestep + auth header forwarding)
 //   anything else    → fall through to ASSETS (static files in ./public)
-//
-// The /api/ai endpoint exists so friends visiting the live site don't need to
-// supply their own Groq / Gemini key. They share the host's Workers AI quota
-// (~10 000 neurons/day, free tier). Friends can still paste their own keys in
-// Settings to use Groq or Gemini for higher-quality output.
 //
 // The proxy routes mirror what proxy.py does for local development. They exist
 // because:
@@ -19,12 +13,8 @@
 //   - Spellbook's find-my-combos POST isn't CORS-friendly.
 //   - Archidekt's API has no documented browser-CORS allowance at all.
 
-const MODEL = "@cf/meta/llama-3.1-8b-instruct";   // best free-tier instruct model
-const HARD_MAX_TOKENS = 4096;
-
-// Path prefix → upstream base URL. Order matters only for the AI route which
-// is checked first. Each request hitting one of these prefixes is forwarded
-// server-side; the browser sees a same-origin response.
+// Path prefix → upstream base URL. Each request hitting one of these prefixes
+// is forwarded server-side; the browser sees a same-origin response.
 const PROXY_ROUTES = {
   "/edhrec/":    "https://json.edhrec.com",
   "/spellbook/": "https://backend.commanderspellbook.com",
@@ -49,13 +39,6 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/api/ai") {
-      if (request.method !== "POST") {
-        return jsonResponse({ error: "POST only" }, 405);
-      }
-      return handleAI(request, env);
-    }
-
     // Match against proxy routes. First-prefix-wins.
     for (const [prefix, target] of Object.entries(PROXY_ROUTES)) {
       if (url.pathname.startsWith(prefix)) {
@@ -67,44 +50,6 @@ export default {
     return env.ASSETS.fetch(request);
   },
 };
-
-async function handleAI(request, env) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "request body must be JSON" }, 400);
-  }
-
-  const system     = (body.system || "").toString();
-  const user       = (body.user   || "").toString();
-  const max_tokens = Math.min(parseInt(body.max_tokens) || 4096, HARD_MAX_TOKENS);
-
-  if (!user) return jsonResponse({ error: "missing 'user' field" }, 400);
-
-  const messages = [];
-  if (system) messages.push({ role: "system", content: system });
-  messages.push({ role: "user", content: user });
-
-  try {
-    // NOTE: Llama 3.1 8B on Workers AI does NOT accept response_format =
-    // { type: "json_object" } (returns "unknown variant 'json_object'…
-    // expected 'json_schema'"). We rely on the system prompt asking for
-    // JSON and on safeParse() in the client to tolerate prose wrappers.
-    const result = await env.AI.run(MODEL, { messages, max_tokens });
-
-    const content = typeof result === "string"
-      ? result
-      : (result?.response ?? JSON.stringify(result));
-
-    return jsonResponse({ content, model: MODEL });
-  } catch (e) {
-    return jsonResponse({
-      error: (e?.message || String(e)).slice(0, 300),
-      model: MODEL,
-    }, 502);
-  }
-}
 
 async function handleProxy(request, prefix, target) {
   const url = new URL(request.url);

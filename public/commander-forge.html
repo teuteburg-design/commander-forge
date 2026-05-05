@@ -58,15 +58,6 @@
   const UN_SET_CODES = new Set(["ugl","unh","ust","und","unf","h17"]);
 
   const PROVIDERS = {
-    cloudflare: {
-      label: "Built-in (Cloudflare AI)",
-      keyHint: "(no key — uses host's free quota)",
-      keyUrl: "developers.cloudflare.com/workers-ai/models",
-      builtIn: true,                              // marker: no key field rendered
-      models: [
-        { id:"@cf/meta/llama-3.1-8b-instruct", label:"Llama 3.1 8B (free, host-paid)" },
-      ],
-    },
     groq: {
       label: "Groq", keyHint: "gsk_…", keyUrl: "console.groq.com",
       models: [
@@ -446,31 +437,6 @@
       finishReason: choice.finish_reason || "unknown",       // length | stop | content_filter | tool_calls
       completionTokens: d.usage?.completion_tokens || null,
       promptTokens:     d.usage?.prompt_tokens     || null,
-    };
-  }
-
-  // Built-in Cloudflare Workers AI — friends don't need any key. Routes through
-  // the host's Worker (POST /api/ai), which runs the prompt on Llama 3.1 8B
-  // server-side using the host's daily neuron quota.
-  // Note: when running locally via `python3 -m http.server`, /api/ai is unreachable
-  // because the Worker isn't running. Use `wrangler dev` for local AI testing.
-  async function callCloudflare(_apiKey, _model, userText, systemText, maxTokens = 4096) {
-    const r = await fetch("/api/ai", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ system: systemText, user: userText, max_tokens: maxTokens }),
-    });
-    let d = null;
-    try { d = await r.json(); } catch {}
-    if (!r.ok) {
-      const msg = d?.error || `Cloudflare AI error ${r.status}`;
-      throw new Error(msg);
-    }
-    return {
-      text: d?.content || "",
-      finishReason: "stop",          // Workers AI doesn't surface this consistently
-      completionTokens: null,
-      promptTokens: null,
     };
   }
 
@@ -1092,11 +1058,10 @@
     // `provider` is just the PRIMARY — the other is auto-tried as fallback when set.
     const [apiKeys,  setApiKeys]  = useState({ groq: "", gemini: "" });
     const [aki,      setAKI]      = useState({ groq: "", gemini: "" });   // input-field state
-    const [provider, setProvider] = useState("cloudflare");   // built-in default
+    const [provider, setProvider] = useState("groq");
     const [models,   setModels]   = useState({
-      cloudflare: PROVIDERS.cloudflare.models[0].id,
-      groq:       PROVIDERS.groq.models[0].id,
-      gemini:     PROVIDERS.gemini.models[0].id,
+      groq:   PROVIDERS.groq.models[0].id,
+      gemini: PROVIDERS.gemini.models[0].id,
     });
     // Convenience for places that need the primary's key/model.
     const apiKey = apiKeys[provider] || "";
@@ -1188,9 +1153,10 @@
       const groqKey   = localStorage.getItem(LS_KEY_GROQ)   || "";
       const geminiKey = localStorage.getItem(LS_KEY_GEMINI) || "";
       const oldKey    = localStorage.getItem(LS_APIKEY)     || "";
-      // Default primary: built-in Cloudflare AI, so first-time visitors don't
-      // need to configure anything to start using the app.
-      let prov        = localStorage.getItem(LS_PROVIDER)   || "cloudflare";
+      let prov        = localStorage.getItem(LS_PROVIDER)   || "groq";
+      // If old storage saved "cloudflare" as primary (a removed provider), pick
+      // whichever real provider has a key — or default to "groq" otherwise.
+      if (prov !== "groq" && prov !== "gemini") prov = geminiKey ? "gemini" : "groq";
       const oldModel  = localStorage.getItem(LS_MODEL)      || "";
       let savedModels = {};
       try { savedModels = JSON.parse(localStorage.getItem(LS_MODELS) || "{}"); } catch {}
@@ -1198,20 +1164,14 @@
       const keys = { groq: groqKey, gemini: geminiKey };
 
       // Migrate single-key storage → dual-key storage.
-      if (oldKey && (prov === "groq" || prov === "gemini") && !keys[prov]) {
+      if (oldKey && !keys[prov]) {
         keys[prov] = oldKey;
         localStorage.setItem(prov === "groq" ? LS_KEY_GROQ : LS_KEY_GEMINI, oldKey);
       }
       if (oldKey) localStorage.removeItem(LS_APIKEY);
 
-      // Sanity: if saved primary needs a key it doesn't have, fall back to
-      // built-in. (Prevents "no key configured" on first deploy of this version.)
-      if ((prov === "groq" || prov === "gemini") && !keys[prov]) prov = "cloudflare";
-
       // Migrate single-model storage → per-provider model storage.
-      if (oldModel && (prov === "groq" || prov === "gemini") && !savedModels[prov]) {
-        savedModels[prov] = oldModel;
-      }
+      if (oldModel && !savedModels[prov]) savedModels[prov] = oldModel;
       if (oldModel) localStorage.removeItem(LS_MODEL);
 
       // Validate every saved model ID against the current catalog. Models get
@@ -1222,12 +1182,11 @@
         return list.some(m => m.id === id) ? id : list[0].id;
       };
       const mods = {
-        cloudflare: validateModel("cloudflare", savedModels.cloudflare || PROVIDERS.cloudflare.models[0].id),
-        groq:       validateModel("groq",       savedModels.groq       || PROVIDERS.groq.models[0].id),
-        gemini:     validateModel("gemini",     savedModels.gemini     || PROVIDERS.gemini.models[0].id),
+        groq:   validateModel("groq",   savedModels.groq   || PROVIDERS.groq.models[0].id),
+        gemini: validateModel("gemini", savedModels.gemini || PROVIDERS.gemini.models[0].id),
       };
       // Persist if anything was corrected so we don't keep auto-fixing on every load.
-      const same = ["cloudflare", "groq", "gemini"].every(k => mods[k] === savedModels[k]);
+      const same = ["groq", "gemini"].every(k => mods[k] === savedModels[k]);
       if (!same) localStorage.setItem(LS_MODELS, JSON.stringify(mods));
 
       setProvider(prov);
@@ -1235,8 +1194,8 @@
       setAKI(keys);
       setModels(mods);
 
-      // Built-in is always available, so first-run no longer forces the Settings
-      // panel — friends just hit the app and start importing/building.
+      // First-run: force the Settings panel until at least one key is saved.
+      if (!keys.groq && !keys.gemini) { setPhase("setup"); return; }
 
       const savedCards   = localStorage.getItem(LS_CARDS);
       const savedBinders = localStorage.getItem(LS_BINDERS);
@@ -1313,12 +1272,9 @@
       const gemK  = (aki.gemini || "").trim();
       const groqOK = groqK.length >= 20;
       const gemOK  = gemK.length  >= 20;
-      // Built-in Cloudflare AI is always available, so no minimum-key requirement.
-      // Friends can save Settings with no keys and still use the app.
-      // If they pick Groq or Gemini as primary but didn't paste a key, warn them.
-      if ((provider === "groq"   && !groqOK) ||
-          (provider === "gemini" && !gemOK)) {
-        setError(`${PROVIDERS[provider].label} is selected as primary but no key is set. Paste a key or pick a different primary.`);
+      // At least one valid key required; both is preferred (enables fallback).
+      if (!groqOK && !gemOK) {
+        setError("Please enter at least one valid API key (Groq or Gemini).");
         return;
       }
       // Persist whichever keys are present; clear blanks.
@@ -1351,25 +1307,21 @@
       else setPhase("import");
     };
 
-    // Compute the provider order (primary first, others after, only those with
-    // a key configured — Cloudflare's built-in needs no key so it's always usable).
+    // Compute the provider order (primary first, other after, only those with
+    // a key configured).
     const aiUsableProviders = (exclude = []) => {
-      const all = ["cloudflare", "groq", "gemini"];
+      const all = ["groq", "gemini"];
       const order = [provider, ...all.filter(p => p !== provider)];
-      return order.filter(p =>
-        !exclude.includes(p) && (p === "cloudflare" ? true : !!apiKeys[p])
-      );
+      return order.filter(p => !exclude.includes(p) && !!apiKeys[p]);
     };
 
     // Run a prompt on a single, specific provider. Throws on API failure.
     // Used by callAI (which adds rotation on failure) and by buildDeck's
     // multi-provider retry loop (which rotates on PARSE failure too).
     const callAIOn = async (p, userText, systemText, maxTokens) => {
-      const fn  = p === "groq"   ? callGroq
-                : p === "gemini" ? callGemini
-                :                  callCloudflare;
-      const key = apiKeys[p] || "";   // empty for cloudflare; ignored by callCloudflare
-      const mdl = models[p]  || PROVIDERS[p].models[0].id;
+      const fn  = p === "groq" ? callGroq : callGemini;
+      const key = apiKeys[p] || "";
+      const mdl = models[p]   || PROVIDERS[p].models[0].id;
       const result = await fn(key, mdl, userText, systemText, maxTokens);
       return { ...result, provider: p };
     };
@@ -2386,15 +2338,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 ${(() => {
                   const groqOK = (apiKeys.groq   || "").length >= 20;
                   const gemOK  = (apiKeys.gemini || "").length >= 20;
-                  const extras = (groqOK ? 1 : 0) + (gemOK ? 1 : 0);
-                  // Built-in is always available, so the messaging shifts:
-                  // 0 keys → "default works, add a key for higher quality"
-                  // 1 key  → "fallback enabled (key + built-in)"
-                  // 2 keys → "all three providers configured, ladder of fallback"
                   const status =
-                    extras === 0 ? { txt:"● Built-in Cloudflare AI is active. Add a Groq / Gemini key for higher-quality decks.", col:"#1a5080", bg:"#e8f0fa" }
-                  : extras === 1 ? { txt:"✓ Built-in + 1 user key — automatic fallback enabled.", col:"#1a6a2a", bg:"#e6f4e6" }
-                  :                { txt:"✓ All three providers configured — full fallback chain (primary → next → built-in).", col:"#1a6a2a", bg:"#e6f4e6" };
+                    groqOK && gemOK ? { txt:"✓ Both providers configured — automatic fallback enabled.", col:"#1a6a2a", bg:"#e6f4e6" }
+                  : groqOK || gemOK ? { txt:"⚠️ Only one provider configured — add a second key to enable automatic fallback.", col:"#7a4010", bg:"#fff5e8" }
+                  :                   { txt:"Add at least one provider key to continue.", col:"#5a3a1a", bg:"#faf5ee" };
                   return html`
                     <div style=${{
                       padding:"8px 12px", borderRadius:8, marginBottom:14,
@@ -2407,7 +2354,6 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 ${Object.entries(PROVIDERS).map(([pid, p]) => {
                   const isPrimary = provider === pid;
                   const hasKey    = (apiKeys[pid] || "").length >= 20;
-                  const builtIn   = !!p.builtIn;
                   return html`
                     <div key=${pid} style=${{
                       padding:"14px 14px 10px", borderRadius:10, marginBottom:12,
@@ -2426,36 +2372,20 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             padding:"2px 8px", background:"#ead0a0", borderRadius:10,
                           }}>Primary</span>
                         `}
-                        ${builtIn
-                          ? html`<span style=${{ fontSize:11, color:"#1a5080", fontWeight:600 }}>● no key required</span>`
-                          : hasKey && html`<span style=${{ fontSize:11, color:"#1a6a2a", fontWeight:600 }}>✓ saved</span>`}
+                        ${hasKey && html`
+                          <span style=${{ fontSize:11, color:"#1a6a2a", fontWeight:600 }}>✓ saved</span>
+                        `}
                         <span style=${{ marginLeft:"auto", fontSize:11, color:"#7a5a3a" }}>
-                          ${builtIn
-                            ? html`<a href=${"https://" + p.keyUrl} target="_blank" rel="noopener"
-                                style=${{ color:"#7a2e0e", textDecoration:"underline" }}>About this model</a>`
-                            : html`Get a free key at <a href=${"https://" + p.keyUrl} target="_blank" rel="noopener"
-                                style=${{ color:"#7a2e0e", textDecoration:"underline" }}>${p.keyUrl}</a>`}
+                          Get a free key at <a href=${"https://" + p.keyUrl} target="_blank" rel="noopener"
+                            style=${{ color:"#7a2e0e", textDecoration:"underline" }}>${p.keyUrl}</a>
                         </span>
                       </div>
 
-                      ${builtIn
-                        ? html`
-                          <div style=${{ fontSize:12, color:"#3a4a6a", lineHeight:1.6,
-                            padding:"8px 12px", background:"#f0f7ff",
-                            border:"1px solid #b8d0e8", borderRadius:8 }}>
-                            Runs on the host's free Cloudflare quota — about
-                            <strong>~10,000 neurons/day</strong> shared across all visitors.
-                            Quality is lower than Groq / Gemini for complex deck building;
-                            paste your own key below for higher-quality output if you want.
-                          </div>
-                        `
-                        : html`
-                          <input type="password" placeholder=${p.keyHint}
-                            value=${aki[pid] || ""}
-                            onInput=${e => setAKI(prev => ({ ...prev, [pid]: e.target.value }))}
-                            onKeyDown=${e => e.key === "Enter" && saveSettings()}
-                            style=${inp} />
-                        `}
+                      <input type="password" placeholder=${p.keyHint}
+                        value=${aki[pid] || ""}
+                        onInput=${e => setAKI(prev => ({ ...prev, [pid]: e.target.value }))}
+                        onKeyDown=${e => e.key === "Enter" && saveSettings()}
+                        style=${inp} />
 
                       <div style=${{ marginTop:8 }}>
                         <span style=${{ ...label, marginBottom:4 }}>Model</span>
