@@ -1728,9 +1728,23 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           addLog(`❌ All providers failed (${triedLabels}). Last response: ${len} chars${truncated ? " (truncated)" : ""}.`);
           addLog(`📝 First 800 chars: ${snippet || "(empty response)"}`);
           if (len > 800) addLog(`…(full response stashed for the error screen)`);
+
+          // Build a recommendation tailored to what the user actually has saved.
+          const hasGroq = !!apiKeys.groq, hasGemini = !!apiKeys.gemini;
+          let suggestion;
+          if (!hasGroq && !hasGemini) {
+            suggestion = "Open ⚙ Settings and paste at least one API key (free Gemini key from aistudio.google.com is recommended).";
+          } else if (hasGroq && !hasGemini) {
+            suggestion = "Groq's free tier sometimes truncates long deck JSON. Add a free Gemini key in Settings (aistudio.google.com) — it has a much larger output budget and is the most reliable provider for this task.";
+          } else if (hasGemini && !hasGroq) {
+            suggestion = "Try switching the Gemini model in Settings to gemini-2.5-pro (slower but emits longer JSON reliably), or add a Groq key as fallback.";
+          } else {
+            suggestion = "Both providers responded but neither produced parseable JSON. Try switching to gemini-2.5-pro in Settings, or retry — this is usually transient.";
+          }
+
           throw new Error(truncated
-            ? `Every available provider returned a truncated or unparseable deck. Built-in (Llama 3.1 8B) often fails on full deck builds — paste a Gemini key in Settings for reliable output.`
-            : `Every available provider returned an unparseable response. Tried: ${triedLabels}. See the build log for the raw output. Add or switch to a stronger provider in Settings.`);
+            ? `${triedLabels} returned a truncated response. ${suggestion}`
+            : `${triedLabels} returned an unparseable response. ${suggestion} Full output is in the build log below.`);
         }
         if (replyObj.provider !== aiOrder[0]) {
           addLog(`✅ ${PROVIDERS[replyObj.provider].label} produced a valid deck after fallback.`);
