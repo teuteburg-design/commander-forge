@@ -1,18 +1,19 @@
 # Commander Forge
 
-A browser-based MTG Commander deck builder. Bring your own AI key (Groq or Gemini — both have free tiers); no install, no backend, no telemetry.
+A browser-based MTG Commander deck builder. Three AI options with automatic fallback; no install, no backend, no telemetry.
 
 ## Use it
 
-👉 **https://commander-forge.pages.dev** *(replace with your deployed URL)*
+👉 **https://commander-forge.rafaelteuteburg.workers.dev** *(or your deployed URL)*
 
 ## What you'll need
 
-1. A free **Gemini** API key from <https://aistudio.google.com> (recommended — its free tier easily covers normal use)
-   — or a **Groq** key from <https://console.groq.com> (small daily token cap on the free tier)
-2. Your card collection exported as CSV from [Manabox](https://manabox.app)
+1. **Just visit the URL** — the built-in **Cloudflare AI** (Llama 3.1 8B) is always available, no key required. Quality is fine for ranking commanders and adequate for simple decks.
+2. *(optional)* A free **Gemini** API key from <https://aistudio.google.com> for higher-quality 99-card decks. Paste it in ⚙ Settings.
+3. *(optional)* A **Groq** key from <https://console.groq.com> for fast Llama 3.3 70B. Small daily quota on the free tier.
+4. Your card collection exported as CSV from [Manabox](https://manabox.app).
 
-With both keys saved, the app automatically falls back to the secondary provider if the primary is rate-limited.
+With multiple providers configured, the app falls back automatically when one is rate-limited or unavailable.
 
 ## How it works
 
@@ -32,20 +33,39 @@ With both keys saved, the app automatically falls back to the secondary provider
 
 ## Self-hosting
 
-Drop `commander-forge.html` and `index.html` onto any static host (Cloudflare Pages, GitHub Pages, Netlify, S3, etc.). No build step required — all dependencies load from `esm.sh` at runtime.
+This repo is set up for **Cloudflare Workers** deployment via Cloudflare's git integration:
+
+1. Fork or clone this repo
+2. Connect it as a Workers project at <https://dash.cloudflare.com>
+3. Cloudflare reads `wrangler.toml` and deploys automatically on every push
+
+The Worker (`worker/index.js`) serves the static files from `./public/` and exposes a `POST /api/ai` endpoint that calls Workers AI for the built-in option.
+
+For static-only hosting (no built-in AI), drop `public/index.html` and `public/commander-forge.html` onto any host (GitHub Pages, Netlify, S3, etc.). The app still works — friends just need to bring their own Groq / Gemini key.
 
 ## Local development
 
 ```sh
+# Static-only (no built-in AI; bring your own key)
+cd public
 python3 -m http.server 5173
 # open http://localhost:5173
+
+# Full local Worker (built-in AI works locally too)
+npm i -g wrangler
+wrangler dev
+# open the URL it prints
 ```
 
 ## Tech notes
 
-- Single self-contained HTML file (~3000 lines)
+- Single self-contained HTML file at `public/commander-forge.html` (~4000 lines)
 - Preact 10 + htm 3 (no JSX compiler, no bundler)
+- Worker entry at `worker/index.js` (~70 lines)
 - Card data: [Scryfall](https://scryfall.com/docs/api) `/cards/collection` (cached locally, 7-day TTL)
-- Synergy ranking: [EDHRec](https://edhrec.com) public JSON endpoints
+- Synergy ranking: [EDHRec](https://edhrec.com) public JSON endpoints (with CORS proxy fallback)
 - Combo discovery: [Commander Spellbook](https://commanderspellbook.com) `/find-my-combos/` API
-- AI: [Groq](https://groq.com) (Llama 3.3) and [Google Gemini](https://aistudio.google.com) (Gemini 2.5 Flash) with automatic fallback
+- AI providers (with automatic fallback chain):
+  - **Built-in** — Cloudflare Workers AI Llama 3.1 8B, no key required, host-paid
+  - **Groq** — Llama 3.3 70B, user key, BYO
+  - **Gemini** — Gemini 2.5 Flash, user key, BYO

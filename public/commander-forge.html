@@ -51,7 +51,22 @@
   // Direct calls to archidekt.com from a browser origin are blocked.
   const ARCH_API      = "/archidekt/api";
 
+  // Scryfall set codes for Magic's "joke" sets, none of which are legal in EDH.
+  //   ugl = Unglued · unh = Unhinged · ust = Unstable · und = Unsanctioned
+  //   unf = Unfinity · h17 = Heroes of the Realm
+  // Stored lowercase; compared case-insensitively in isEDHLegalCard.
+  const UN_SET_CODES = new Set(["ugl","unh","ust","und","unf","h17"]);
+
   const PROVIDERS = {
+    cloudflare: {
+      label: "Built-in (Cloudflare AI)",
+      keyHint: "(no key — uses host's free quota)",
+      keyUrl: "developers.cloudflare.com/workers-ai/models",
+      builtIn: true,                              // marker: no key field rendered
+      models: [
+        { id:"@cf/meta/llama-3.1-8b-instruct", label:"Llama 3.1 8B (free, host-paid)" },
+      ],
+    },
     groq: {
       label: "Groq", keyHint: "gsk_…", keyUrl: "console.groq.com",
       models: [
@@ -113,6 +128,11 @@
       oracle_text: sf.oracle_text, color_identity: sf.color_identity,
       cmc: sf.cmc, power: sf.power, toughness: sf.toughness, loyalty: sf.loyalty,
       edhrec_rank: sf.edhrec_rank,    // popularity rank on EDHRec (lower = more popular)
+      // Legality + provenance — used to reject Unfinity/silver-border/emblem cards.
+      border_color: sf.border_color,  // "black" | "silver" (un-set) | "gold" (promo) | "white"
+      set:          (sf.set || "").toLowerCase(),  // 3-letter set code, e.g. "unf"
+      set_type:     sf.set_type,      // "funny" = Unfinity / Un-sets
+      commander_legal: sf.legalities?.commander === "legal",
     };
     if (sf.image_uris)
       s.image_uris = { small: sf.image_uris.small, normal: sf.image_uris.normal };
@@ -145,7 +165,10 @@
     }
   }
 
-  async function fetchAllScryfall(cards, onProgress) {
+  // Caller can pass `onLog` to receive human-readable status lines (cache
+  // hit/miss counts, batch progress) — wired to the build log in the UI.
+  async function fetchAllScryfall(cards, onProgress, onLog) {
+    const log = msg => { if (typeof onLog === "function") onLog(msg); };
     const cache = getSFCache();
     const now   = Date.now();
     const out   = [], toFetch = [];
@@ -160,6 +183,9 @@
         toFetch.push(card);
       }
     }
+
+    log(`📦 Cache: ${out.length}/${cards.length} cards served instantly` +
+        (toFetch.length ? `, fetching ${toFetch.length} from Scryfall…` : "."));
 
     if (toFetch.length === 0) { if (onProgress) onProgress(100); return out; }
 
@@ -193,6 +219,10 @@
         unmatched += batch.length - matched.size;
       });
       if (onProgress) onProgress(Math.round(Math.min(((i + PAR) / batches.length) * 100, 100)));
+      const done = Math.min(i + PAR, batches.length);
+      // Log every batch group so the user sees motion (avoids the silent
+      // "Loading…" hang for large collections).
+      log(`   …${done}/${batches.length} batches fetched (${out.length}/${cards.length} cards ready)`);
     }
 
     if (cacheUpdated) setSFCache(cache);
@@ -217,13 +247,18 @@
   }
 
   // Extract the canonical EDHRec slug from Scryfall's related_uris.edhrec URL.
-  // Scryfall already strips diacritics, normalises DFCs to the front face,
-  // and produces the exact slug EDHRec uses on its own domain.
+  // Scryfall produces clean slug URLs (https://edhrec.com/commanders/<slug>)
+  // for most cards, BUT for many recent DFCs (e.g. Sephiroth, Universes Beyond
+  // transform commanders) it instead returns a routing URL of the form
+  //   https://edhrec.com/route/?cc=<urlencoded+name>
+  // — that's a frontend redirect, not a slug. Treat any URL whose tail looks
+  // like a query string ("?cc=…") or whose path is `/route/` as unusable and
+  // fall back to slugging the front-face name ourselves.
   function edhrecSlugFromScryfall(sf) {
     const url = sf?.related_uris?.edhrec;
-    if (url) {
+    if (url && !/\/route\/?\??/.test(url)) {
       const tail = url.replace(/\/+$/, "").split("/").pop();
-      if (tail) return tail;
+      if (tail && !tail.startsWith("?")) return tail;
     }
     if (sf?.name) return edhrecSlug(sf.name);
     return null;
@@ -267,7 +302,11 @@
         continue;
       }
       // 404 means EDHRec genuinely has no page for this slug — no proxy will help.
-      if (r.status === 404) return { suggestions: [], status: "no_page", slug, via: name };
+      // 403 from json.edhrec.com is the same situation: their CDN serves
+      // "AccessDenied" XML for any path that doesn't map to a known commander
+      // page, instead of a proper 404. Treat it as "no_page" too.
+      if (r.status === 404 || r.status === 403)
+        return { suggestions: [], status: "no_page", slug, via: name, http: r.status };
       if (!r.ok) {
         lastErr = `${name}: HTTP ${r.status}`;
         lastHttp = r.status;
@@ -410,6 +449,31 @@
     };
   }
 
+  // Built-in Cloudflare Workers AI — friends don't need any key. Routes through
+  // the host's Worker (POST /api/ai), which runs the prompt on Llama 3.1 8B
+  // server-side using the host's daily neuron quota.
+  // Note: when running locally via `python3 -m http.server`, /api/ai is unreachable
+  // because the Worker isn't running. Use `wrangler dev` for local AI testing.
+  async function callCloudflare(_apiKey, _model, userText, systemText, maxTokens = 4096) {
+    const r = await fetch("/api/ai", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ system: systemText, user: userText, max_tokens: maxTokens }),
+    });
+    let d = null;
+    try { d = await r.json(); } catch {}
+    if (!r.ok) {
+      const msg = d?.error || `Cloudflare AI error ${r.status}`;
+      throw new Error(msg);
+    }
+    return {
+      text: d?.content || "",
+      finishReason: "stop",          // Workers AI doesn't surface this consistently
+      completionTokens: null,
+      promptTokens: null,
+    };
+  }
+
   async function callGemini(apiKey, model, userText, systemText, maxTokens = 4096) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
     // Gemini 2.5 ("thinking") models charge internal reasoning tokens against
@@ -448,12 +512,13 @@
   // are likely CORS-blocked from a browser origin like localhost; callers must
   // be prepared to handle network/CORS failures by falling back to clipboard.
   async function archLogin(username, password) {
-    // Real endpoint is /api/rest-auth/login/ (django-rest-auth), NOT /api/users/login/
+    // Real endpoint is /api/rest-auth/login/ (dj-rest-auth), NOT /api/users/login/
     // as the docs claimed. Verified against archidekt.com 2026-05.
     const r = await fetch(`${ARCH_API}/rest-auth/login/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
+      method:      "POST",
+      credentials: "include",  // capture session cookies if Archidekt sets any
+      headers:     { "Content-Type": "application/json" },
+      body:        JSON.stringify({ username, password }),
     });
     let body = null;
     try { body = await r.json(); } catch {}
@@ -462,33 +527,51 @@
         || `Login failed (HTTP ${r.status})`;
       const err = new Error(msg); err.status = r.status; throw err;
     }
-    // django-rest-auth returns `{ key: "<token>" }`. Keep token/auth_token as fallbacks.
-    const token = body?.key || body?.token || body?.auth_token;
-    if (!token) throw new Error("Login succeeded but no token in response.");
+    // dj-rest-auth response shapes:
+    //   • Token mode:  { "key": "<40-char hex>" }
+    //   • JWT  mode:   { "access_token": "<jwt>", "refresh_token": "<jwt>", ... }
+    //   • Older simplejwt direct: { "access": "<jwt>", "refresh": "<jwt>" }
+    // Archidekt uses JWT mode (verified by token shape eyJ…), so prefer those.
+    const token = body?.access_token || body?.access
+                || body?.key || body?.token || body?.auth_token;
+    if (!token) {
+      const keys = body && typeof body === "object" ? Object.keys(body).slice(0, 8).join(", ") : "(empty)";
+      throw new Error(`Login succeeded but no token in response. Response keys: [${keys}].`);
+    }
     return token;
   }
 
-  async function archCreateDeck(token, { name, description = "", format = 3, isPrivate = true, categories = [] }) {
-    // Real endpoint is /api/decks/v2/, NOT /api/decks/ as the docs claimed
-    // (the latter only accepts GET for listing).
-    //
-    // Categories MUST be pre-defined on the deck — Archidekt does NOT auto-
-    // create categories from per-card POSTs. Cards referencing undefined
-    // categories cause Archidekt's frontend to error ("Whoopsie!") on render.
-    // The response shape (see GET /decks/{id}/) uses `private` (snake-ish),
-    // so that's what we send; `isPrivate` is included for hedge against doc.
+  // Real endpoint is /api/decks/v2/, NOT /api/decks/ as the docs claimed.
+  // Payload shape verified against an Archidekt UI request capture (2026-05):
+  //   { name, deckFormat, edhBracket, description, private, unlisted,
+  //     theorycrafted, featured, playmat, game, cardPackage,
+  //     extras: { decksToInclude, commandersToAdd, forceCardsToSingleton,
+  //               ignoreCardsOutOfCommanderIdentity } }
+  // Cards and categories are NOT included here — they're set via
+  // /api/cards/massDeckEdit/ after the deck exists.
+  async function archCreateDeck(token, { name, description = "", deckFormat = 3, isPrivate = true, edhBracket = null }) {
     const r = await fetch(`${ARCH_API}/decks/v2/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Token ${token}` },
+      method:      "POST",
+      credentials: "include",
+      headers:     { "Content-Type": "application/json", "Authorization": `JWT ${token}` },
       body: JSON.stringify({
-        name, description, deckFormat: format, format,
-        private: isPrivate, isPrivate,
-        categories: categories.map(c => ({
-          name: c.name,
-          isPremier: !!c.isPremier,
-          includedInDeck: c.includedInDeck !== false,
-          includedInPrice: c.includedInPrice !== false,
-        })),
+        name,
+        deckFormat,
+        edhBracket,
+        description,
+        private: isPrivate,
+        unlisted: true,           // newly-created decks default to unlisted
+        theorycrafted: false,
+        featured: "",
+        playmat: "",
+        game: null,
+        cardPackage: null,
+        extras: {
+          decksToInclude: [],
+          commandersToAdd: [],    // we add the commander via massDeckEdit instead
+          forceCardsToSingleton: false,
+          ignoreCardsOutOfCommanderIdentity: true,
+        },
       }),
     });
     let body = null;
@@ -501,40 +584,79 @@
     return body.id;
   }
 
-  // Add a single card with retry/backoff on 429. Throws on non-recoverable failure.
-  // GET /decks/{id}/ shows each card has `categories: ["Commander"]` (array, plural)
-  // and `card: <numericId>` — we send Scryfall UUID under both `card` and
-  // `cardId` for hedge, and `categories` as an array. Live response shape
-  // confirmed against deck 1 on archidekt.com (2026-05).
-  async function archAddCard(token, deckId, { cardId, quantity, categories }) {
-    const url = `${ARCH_API}/decks/${deckId}/cards/`;
-    const cats = Array.isArray(categories) ? categories : [categories].filter(Boolean);
-    // Send both `card` and `cardId` for the UUID, both `categories` and `category`
-    // for the category — Archidekt's API accepts either across endpoint versions.
-    const payload = {
-      card: cardId, cardId,
-      quantity,
-      categories: cats, category: cats[0] || "",
-    };
-    const delays = [500, 1000, 2000];
-    for (let attempt = 0; attempt <= delays.length; attempt++) {
-      const r = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Token ${token}` },
-        body: JSON.stringify(payload),
-      });
-      if (r.ok) return true;
-      if (r.status === 429 && attempt < delays.length) {
-        await new Promise(res => setTimeout(res, delays[attempt]));
-        continue;
-      }
-      let body = null; try { body = await r.json(); } catch {}
+  // Step 1 of save flow: POST /api/cards/massDeckEdit/ — pure parser endpoint.
+  // Takes a plain-text deck list, returns parsed structure including `toAdd`
+  // with Archidekt's INTERNAL numeric card IDs (which the modifyCards/v2/
+  // endpoint requires; Scryfall UUIDs alone won't work). Schema discovered
+  // by reading chunk 4081 of their UI bundle.
+  //   Request:  { parser: "archidekt", current: <text>, edit: <text> }
+  //   Response: { toAdd:[…], toRemove:[…], categories:{…},
+  //               syntaxErrors:[…], cardErrors:[…] }
+  async function archParseDeckText(token, deckListText) {
+    const r = await fetch(`${ARCH_API}/cards/massDeckEdit/`, {
+      method:      "POST",
+      credentials: "include",
+      headers:     { "Content-Type": "application/json", "Authorization": `JWT ${token}` },
+      body:        JSON.stringify({ parser: "archidekt", current: "", edit: deckListText }),
+    });
+    let body = null; try { body = await r.json(); } catch {}
+    if (!r.ok) {
       const detail = body?.detail
-        || (body && typeof body === "object" ? JSON.stringify(body).slice(0, 160) : null)
+        || (body && typeof body === "object" ? JSON.stringify(body).slice(0, 240) : null)
         || `HTTP ${r.status}`;
-      const err = new Error(`Add card failed: ${detail}`);
+      const err = new Error(`massDeckEdit failed: ${detail}`);
       err.status = r.status; err.body = body; throw err;
     }
+    return body;
+  }
+
+  // Step 2 of save flow: PATCH /api/decks/{id}/modifyCards/v2/ — the actual
+  // persist call. Schema captured from a real Archidekt UI request:
+  //   { cards: [{ action, cardid, customCardId, categories, patchId,
+  //               modifications: { quantity, modifier, customCmc,
+  //                                companion, flippedDefault, label } }] }
+  // `cardid` is Archidekt's INTERNAL numeric card ID (as a string) —
+  // not Scryfall UUID. `patchId` is a unique random string per entry.
+  function randomPatchId() {
+    // Match Archidekt's UI: ~8-12 chars from [A-Za-z0-9_-].
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+    let out = "";
+    for (let i = 0; i < 11; i++) out += chars[Math.floor(Math.random() * chars.length)];
+    return out;
+  }
+
+  async function archModifyCards(token, deckId, cardsToAdd) {
+    const url = `${ARCH_API}/decks/${deckId}/modifyCards/v2/`;
+    const cards = cardsToAdd.map(c => ({
+      action: "add",
+      cardid: String(c.cardid != null ? c.cardid : (c.card?.id ?? c.id)),
+      customCardId: c.customCardId || null,
+      categories: Array.isArray(c.categories) ? c.categories : [c.categories].filter(Boolean),
+      patchId: randomPatchId(),
+      modifications: {
+        quantity:        c.quantity        ?? 1,
+        modifier:        c.modifier        ?? "Normal",
+        customCmc:       c.customCmc       ?? null,
+        companion:       c.companion       ?? false,
+        flippedDefault:  c.flippedDefault  ?? false,
+        label:           c.label           ?? ",#656565",
+      },
+    }));
+    const r = await fetch(url, {
+      method:      "PATCH",
+      credentials: "include",
+      headers:     { "Content-Type": "application/json", "Authorization": `JWT ${token}` },
+      body:        JSON.stringify({ cards }),
+    });
+    let body = null; try { body = await r.json(); } catch {}
+    if (!r.ok) {
+      const detail = body?.detail
+        || (body && typeof body === "object" ? JSON.stringify(body).slice(0, 240) : null)
+        || `HTTP ${r.status}`;
+      const err = new Error(`modifyCards failed: ${detail}`);
+      err.status = r.status; err.body = body; throw err;
+    }
+    return body;
   }
 
   // Resolve a card name → Scryfall UUID via Scryfall (when our local enrichment
@@ -642,16 +764,34 @@
   function fingerprint(cards) {
     return cards.map(c => c.name).sort().slice(0, 80).join("|");
   }
-  function isCommander(sf) {
-    // Reject tokens — Scryfall flags them via layout (`token` / `double_faced_token`)
-    // and almost always includes "Token" in the type line. Some tokens (e.g. the
-    // LOTR Smaug, the Golden token) carry "Legendary Creature" in their type line,
-    // so the legacy text-only check would mis-classify them as commanders.
-    if (sf.layout === "token" || sf.layout === "double_faced_token") return false;
-    // Combine main + face data so DFCs / MDFCs (e.g. "Kefka, Court Mage // Kefka, Ruler of Ruin") are caught.
+  // Shared filter — rejects everything that can't legally appear in an EDH deck.
+  // Catches tokens, emblems, art cards, silver-bordered Un-cards (Unfinity), and
+  // anything Scryfall flags as `legalities.commander !== "legal"` (when known).
+  // Conservative for older cached data lacking the new fields.
+  function isEDHLegalCard(sf) {
+    if (!sf) return false;
+    const bad = ["token", "double_faced_token", "emblem", "art_series",
+                 "scheme", "vanguard", "planar"];
+    if (bad.includes(sf.layout)) return false;
+    if (sf.border_color === "silver") return false;          // Un-sets
+    if (sf.set_type === "funny")     return false;           // Unfinity etc.
+    // Set-code blocklist — catches Un-set cards even when border_color/set_type
+    // aren't yet cached (older slim entries).
+    if (sf.set && UN_SET_CODES.has(String(sf.set).toLowerCase())) return false;
+    // Explicit commander_legal flag — reject when present and false.
+    if (sf.commander_legal === false) return false;
+    // Type-line safety net for old cache entries missing the new fields.
     const faces = sf.card_faces || [];
     const tl = [sf.type_line, ...faces.map(f => f.type_line)].filter(Boolean).join(" // ").toLowerCase();
-    if (/\btoken\b/.test(tl)) return false;       // safety net for cards whose layout isn't populated
+    if (/\btoken\b/.test(tl))  return false;
+    if (/\bemblem\b/.test(tl)) return false;
+    return true;
+  }
+
+  function isCommander(sf) {
+    if (!isEDHLegalCard(sf)) return false;
+    const faces = sf.card_faces || [];
+    const tl = [sf.type_line, ...faces.map(f => f.type_line)].filter(Boolean).join(" // ").toLowerCase();
     const ol = [sf.oracle_text, ...faces.map(f => f.oracle_text)].filter(Boolean).join(" ").toLowerCase();
     return (tl.includes("legendary") && (tl.includes("creature") || tl.includes("planeswalker")))
       || ol.includes("can be your commander");
@@ -952,10 +1092,11 @@
     // `provider` is just the PRIMARY — the other is auto-tried as fallback when set.
     const [apiKeys,  setApiKeys]  = useState({ groq: "", gemini: "" });
     const [aki,      setAKI]      = useState({ groq: "", gemini: "" });   // input-field state
-    const [provider, setProvider] = useState("groq");
+    const [provider, setProvider] = useState("cloudflare");   // built-in default
     const [models,   setModels]   = useState({
-      groq:   PROVIDERS.groq.models[0].id,
-      gemini: PROVIDERS.gemini.models[0].id,
+      cloudflare: PROVIDERS.cloudflare.models[0].id,
+      groq:       PROVIDERS.groq.models[0].id,
+      gemini:     PROVIDERS.gemini.models[0].id,
     });
     // Convenience for places that need the primary's key/model.
     const apiKey = apiKeys[provider] || "";
@@ -978,6 +1119,9 @@
     const [library,    setLibrary]  = useState([]);   // saved deck entries
     const [libSaved,   setLibSaved] = useState(false);// just saved to library
     const [fromSaved,  setFromSaved]= useState(false);// viewing a saved deck
+    // Snapshot of the user's in-progress (unsaved) built deck — preserved when
+    // the user opens a saved deck from Library so we can restore on demand.
+    const [unsavedDeck, setUnsavedDeck] = useState(null); // { deck, selCmd } | null
 
     const [csvInput, setCsv]      = useState("");
     const [activeTab,setTab]      = useState("build");
@@ -987,6 +1131,7 @@
     const [colorFilter, setCF]    = useState([]);
     const [colorMode,   setCM]    = useState("at_least");
     const [colorless,   setCL]    = useState(false);
+    const [cmdrQuery,   setCmdrQuery] = useState("");   // name search in Commanders tab
 
     // ── Build preferences ───────────────────────────────────────────────
     const [bracket,    setBracket]    = useState(3);            // 1-5 (WotC Commander Brackets)
@@ -1043,7 +1188,9 @@
       const groqKey   = localStorage.getItem(LS_KEY_GROQ)   || "";
       const geminiKey = localStorage.getItem(LS_KEY_GEMINI) || "";
       const oldKey    = localStorage.getItem(LS_APIKEY)     || "";
-      const prov      = localStorage.getItem(LS_PROVIDER)   || "groq";
+      // Default primary: built-in Cloudflare AI, so first-time visitors don't
+      // need to configure anything to start using the app.
+      let prov        = localStorage.getItem(LS_PROVIDER)   || "cloudflare";
       const oldModel  = localStorage.getItem(LS_MODEL)      || "";
       let savedModels = {};
       try { savedModels = JSON.parse(localStorage.getItem(LS_MODELS) || "{}"); } catch {}
@@ -1051,14 +1198,20 @@
       const keys = { groq: groqKey, gemini: geminiKey };
 
       // Migrate single-key storage → dual-key storage.
-      if (oldKey && !keys[prov]) {
+      if (oldKey && (prov === "groq" || prov === "gemini") && !keys[prov]) {
         keys[prov] = oldKey;
         localStorage.setItem(prov === "groq" ? LS_KEY_GROQ : LS_KEY_GEMINI, oldKey);
       }
       if (oldKey) localStorage.removeItem(LS_APIKEY);
 
+      // Sanity: if saved primary needs a key it doesn't have, fall back to
+      // built-in. (Prevents "no key configured" on first deploy of this version.)
+      if ((prov === "groq" || prov === "gemini") && !keys[prov]) prov = "cloudflare";
+
       // Migrate single-model storage → per-provider model storage.
-      if (oldModel && !savedModels[prov]) savedModels[prov] = oldModel;
+      if (oldModel && (prov === "groq" || prov === "gemini") && !savedModels[prov]) {
+        savedModels[prov] = oldModel;
+      }
       if (oldModel) localStorage.removeItem(LS_MODEL);
 
       // Validate every saved model ID against the current catalog. Models get
@@ -1069,20 +1222,21 @@
         return list.some(m => m.id === id) ? id : list[0].id;
       };
       const mods = {
-        groq:   validateModel("groq",   savedModels.groq   || PROVIDERS.groq.models[0].id),
-        gemini: validateModel("gemini", savedModels.gemini || PROVIDERS.gemini.models[0].id),
+        cloudflare: validateModel("cloudflare", savedModels.cloudflare || PROVIDERS.cloudflare.models[0].id),
+        groq:       validateModel("groq",       savedModels.groq       || PROVIDERS.groq.models[0].id),
+        gemini:     validateModel("gemini",     savedModels.gemini     || PROVIDERS.gemini.models[0].id),
       };
       // Persist if anything was corrected so we don't keep auto-fixing on every load.
-      if (mods.groq !== savedModels.groq || mods.gemini !== savedModels.gemini) {
-        localStorage.setItem(LS_MODELS, JSON.stringify(mods));
-      }
+      const same = ["cloudflare", "groq", "gemini"].every(k => mods[k] === savedModels[k]);
+      if (!same) localStorage.setItem(LS_MODELS, JSON.stringify(mods));
 
       setProvider(prov);
       setApiKeys(keys);
       setAKI(keys);
       setModels(mods);
 
-      if (!keys.groq && !keys.gemini) { setPhase("setup"); return; }
+      // Built-in is always available, so first-run no longer forces the Settings
+      // panel — friends just hit the app and start importing/building.
 
       const savedCards   = localStorage.getItem(LS_CARDS);
       const savedBinders = localStorage.getItem(LS_BINDERS);
@@ -1157,11 +1311,14 @@
     const saveSettings = () => {
       const groqK = (aki.groq   || "").trim();
       const gemK  = (aki.gemini || "").trim();
-      // At least one valid key required; both is preferred (enables fallback).
       const groqOK = groqK.length >= 20;
       const gemOK  = gemK.length  >= 20;
-      if (!groqOK && !gemOK) {
-        setError("Please enter at least one valid API key (Groq or Gemini).");
+      // Built-in Cloudflare AI is always available, so no minimum-key requirement.
+      // Friends can save Settings with no keys and still use the app.
+      // If they pick Groq or Gemini as primary but didn't paste a key, warn them.
+      if ((provider === "groq"   && !groqOK) ||
+          (provider === "gemini" && !gemOK)) {
+        setError(`${PROVIDERS[provider].label} is selected as primary but no key is set. Paste a key or pick a different primary.`);
         return;
       }
       // Persist whichever keys are present; clear blanks.
@@ -1195,29 +1352,38 @@
     };
 
     // Try the primary provider first; on failure (rate-limit, network, parse error)
-    // fall back to the other provider if its key is configured. Logs every attempt
-    // and switch so users can see which provider actually answered.
+    // fall back to the next configured provider. Cloudflare's built-in is always
+    // "configured" (no key needed). Order: primary → others (built-in always last
+    // unless it's primary, since we want to favour user-supplied higher-quality keys).
     // Returns { text, finishReason, completionTokens, promptTokens, provider }.
     const callAI = async (userText, systemText, maxTokens = 4096) => {
-      const order = [provider, provider === "groq" ? "gemini" : "groq"];
+      const all = ["cloudflare", "groq", "gemini"];
+      const order = [provider, ...all.filter(p => p !== provider)];
+      const usable = order.filter(p =>
+        p === "cloudflare" ? true : !!apiKeys[p]   // built-in needs no key
+      );
+
       let lastErr = null;
-      for (let i = 0; i < order.length; i++) {
-        const p = order[i];
-        if (!apiKeys[p]) continue;
+      for (let i = 0; i < usable.length; i++) {
+        const p = usable[i];
         try {
-          const fn = p === "groq" ? callGroq : callGemini;
-          const result = await fn(apiKeys[p], models[p], userText, systemText, maxTokens);
+          const fn  = p === "groq"   ? callGroq
+                    : p === "gemini" ? callGemini
+                    :                  callCloudflare;
+          const key = apiKeys[p] || "";   // empty for cloudflare; ignored by callCloudflare
+          const mdl = models[p]  || PROVIDERS[p].models[0].id;
+          const result = await fn(key, mdl, userText, systemText, maxTokens);
           if (i > 0) addLog(`✅ Fallback to ${PROVIDERS[p].label} succeeded.`);
           return { ...result, provider: p };
         } catch (e) {
           lastErr = e;
           const msg  = (e.message || "").slice(0, 110);
-          const next = order.slice(i + 1).find(o => apiKeys[o]);
+          const next = usable[i + 1];
           if (next) addLog(`⚠️ ${PROVIDERS[p].label} failed (${msg}). Trying ${PROVIDERS[next].label}…`);
-          else      addLog(`⚠️ ${PROVIDERS[p].label} failed (${msg}). No fallback configured.`);
+          else      addLog(`⚠️ ${PROVIDERS[p].label} failed (${msg}). No fallback available.`);
         }
       }
-      throw lastErr || new Error("No AI provider configured. Open Settings to add a key.");
+      throw lastErr || new Error("No AI provider configured. Open Settings.");
     };
 
     const importCSV = () => {
@@ -1253,7 +1419,7 @@
       setPhase("loading_cmdr"); setLog([]); setProg(0); setError("");
       try {
         addLog(`🔍 Fetching Scryfall data for ${cards.length} cards…`);
-        const all = await fetchAllScryfall(cards, p => setProg(Math.round(p * 0.85)));
+        const all = await fetchAllScryfall(cards, p => setProg(Math.round(p * 0.85)), addLog);
         setEnriched(all);
         addLog(`✅ Enriched ${all.length} of ${cards.length} cards.`);
         // Surface any Scryfall fetch problems so users aren't left wondering
@@ -1338,22 +1504,28 @@
 
     const buildDeck = useCallback(async chosenCmd => {
       setSelCmd(chosenCmd); setPhase("building"); setLog([]); setProg(0);
+      // A fresh build replaces any previously-pushed-aside unsaved deck.
+      setUnsavedDeck(null); setLibSaved(false); setFromSaved(false);
       addLog(`⚒️ Building deck for ${chosenCmd.name}…`);
       try {
         let allCards = enriched;
         if (!allCards.length) {
           addLog("🔍 Loading full card data from Scryfall…");
-          allCards = await fetchAllScryfall(usable, p => setProg(Math.round(p * 0.35)));
+          allCards = await fetchAllScryfall(usable, p => setProg(Math.round(p * 0.35)), addLog);
           setEnriched(allCards);
         }
         setProg(35);
         const ci = chosenCmd.card?.scryfall?.color_identity || [];
+        const beforeFilter = allCards.length;
         let eligible = allCards.filter(c =>
           c.name !== chosenCmd.card?.name &&
-          !/token/i.test(c.scryfall?.type_line || "") &&
+          isEDHLegalCard(c.scryfall || {}) &&
           (c.scryfall?.color_identity || []).every(col => ci.includes(col))
         );
-        addLog(`🎨 Color [${ci.join(",")||"C"}] — ${eligible.length} eligible cards.`);
+        const droppedIllegal = allCards.filter(c =>
+          c.name !== chosenCmd.card?.name && !isEDHLegalCard(c.scryfall || {})
+        ).length;
+        addLog(`🎨 Color [${ci.join(",")||"C"}] — ${eligible.length} eligible cards${droppedIllegal ? ` (${droppedIllegal} excluded: tokens / emblems / Un-cards / non-EDH-legal)` : ""}.`);
 
         // Budget filter: drop individual cards that would blow >25% of total budget.
         const budgetNum = parseFloat(budget) || 0;
@@ -1563,6 +1735,29 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           throw new Error(truncated
             ? `AI response was truncated mid-output, even after a retry. The current model (${PROVIDERS[provider]?.label}) is stopping early on long structured outputs. Try Gemini 2.5 Pro (most reliable for complete decks) or switch primary provider in Settings.`
             : "Could not parse deck — see the build log below for the raw AI response. Try again, switch model, or share the response with the developer.");
+        }
+
+        // Strip the commander itself from the 99-card mainboard if the AI
+        // included it (it lives in the command zone, not the deck). Also
+        // dedupe any other singleton violations from non-basic non-land cards.
+        {
+          const cmdrLower = (chosenCmd.card?.name || "").toLowerCase();
+          let removedCommander = 0;
+          const seenNames = new Set();
+          deckData.categories.forEach(cat => {
+            cat.cards = cat.cards.filter(c => {
+              const nm = (c.name || "").toLowerCase();
+              if (nm === cmdrLower) { removedCommander++; return false; }
+              // Singleton dedupe — basics are exempt (handled by basicSet below).
+              const isBasicName = ["plains","island","swamp","mountain","forest","wastes"].includes(nm);
+              if (!isBasicName) {
+                if (seenNames.has(nm)) return false;
+                seenNames.add(nm);
+              }
+              return true;
+            });
+          });
+          if (removedCommander > 0) addLog(`🛡️ Removed ${removedCommander} stray commander entr${removedCommander===1?"y":"ies"} from the mainboard.`);
         }
 
         // Post-process: ensure exactly 99 cards, with ≤ mech.lands lands.
@@ -1863,95 +2058,102 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       try {
         let token = await ensureToken();
 
-        // 2) Resolve any missing Scryfall ids (basic lands, AI-suggested cards
-        //    not in the user's collection). Fail soft — we'll skip cards we
-        //    can't resolve, but warn afterwards.
-        setArchPushing({ phase: "resolving", done: 0, total });
-        for (const c of allCards) {
-          if (!c.id) c.id = await archResolveCardId(c.name);
-        }
-        const unresolved = allCards.filter(c => !c.id).map(c => c.name);
-
-        // 3) Create the deck WITH categories pre-defined. Archidekt does not
-        //    auto-create categories from per-card POSTs — sending cards into
-        //    undefined categories breaks the frontend renderer.
+        // 2) Create the empty deck. Cards/categories are added separately via
+        //    massDeckEdit — Archidekt's UI uses the same two-step flow.
         setArchPushing({ phase: "creating", done: 0, total });
         const deckName = `${selCmd.card.name} — ${deck.theme || "Commander"}`;
         const desc = (deck.description || "").slice(0, 1500)
           + "\n\n— Generated by Commander Forge.";
-        const catSet  = new Set(["Commander", ...deck.categories.map(c => c.name)]);
-        const archCategories = [...catSet].map(name => ({
-          name,
-          isPremier: name === "Commander",
-          includedInDeck:  true,
-          includedInPrice: name !== "Commander", // commander tracked separately on Archidekt
-        }));
+        const archEdhBracket = (typeof bracket === "number" && bracket >= 1 && bracket <= 5) ? bracket : null;
         let deckId;
         try {
-          deckId = await archCreateDeck(token, { name: deckName, description: desc, categories: archCategories });
+          deckId = await archCreateDeck(token, { name: deckName, description: desc, deckFormat: 3, isPrivate: true, edhBracket: archEdhBracket });
         } catch (e) {
           if (e.status === 401 || e.status === 403) {
             token = await ensureToken(true);
-            deckId = await archCreateDeck(token, { name: deckName, description: desc, categories: archCategories });
+            deckId = await archCreateDeck(token, { name: deckName, description: desc, deckFormat: 3, isPrivate: true, edhBracket: archEdhBracket });
           } else { throw e; }
         }
-        addLog(`✅ Archidekt deck #${deckId} created with ${archCategories.length} categories.`);
+        addLog(`✅ Archidekt deck #${deckId} created.`);
 
-        // 4) Add each resolved card. Continue past per-card failures so we
-        //    end with the maximum-possible deck rather than aborting on the
-        //    first hiccup. Each failure is logged with the upstream message.
+        // 3) Build the Archidekt-format deck-list text, then run a 2-step save:
+        //    a) POST /api/cards/massDeckEdit/ — parses text → cards w/ internal IDs
+        //    b) PATCH /api/decks/{id}/modifyCards/v2/ — persists to deck
+        //    This is exactly what Archidekt's "Import Cards" UI does internally.
+        const tally = new Map();
+        const order = [];
+        const pushCard = (name, category) => {
+          const key = `${name}|${category}`;
+          if (!tally.has(key)) { tally.set(key, 0); order.push({ name, category, key }); }
+          tally.set(key, tally.get(key) + 1);
+        };
+        pushCard(selCmd.card.name, "Commander");
+        deck.categories.forEach(cat => cat.cards.forEach(c => pushCard(c.name, cat.name)));
+        const deckListText = order
+          .map(o => `${tally.get(o.key)} ${o.name} [${o.category}]`)
+          .join("\n");
+
+        // Cache as clipboard fallback in case the save flow fails.
+        try { await navigator.clipboard.writeText(deckListText); } catch {}
+
+        // 3a) Parse text → card objects with Archidekt internal IDs.
         setArchPushing({ phase: "adding", done: 0, total });
-        let added = 0, ok = 0;
-        const cardFailures = [];
-        for (const c of allCards) {
-          added++;
-          if (!c.id) { setArchPushing({ phase: "adding", done: added, total }); continue; }
+        let parsed;
+        try {
           try {
-            try {
-              await archAddCard(token, deckId, { cardId: c.id, quantity: 1, categories: [c.category] });
-            } catch (e) {
-              if (e.status === 401 || e.status === 403) {
-                token = await ensureToken(true);
-                await archAddCard(token, deckId, { cardId: c.id, quantity: 1, categories: [c.category] });
-              } else { throw e; }
-            }
-            ok++;
+            parsed = await archParseDeckText(token, deckListText);
           } catch (e) {
-            cardFailures.push({ name: c.name, msg: (e.message || "").slice(0, 140) });
+            if (e.status === 401 || e.status === 403) {
+              token = await ensureToken(true);
+              parsed = await archParseDeckText(token, deckListText);
+            } else { throw e; }
           }
-          setArchPushing({ phase: "adding", done: added, total });
-          await new Promise(r => setTimeout(r, 80));
+        } catch (e) {
+          addLog(`❌ Parse step failed: ${(e.message || "").slice(0, 200)}`);
+          if (e.body) addLog(`   raw: ${JSON.stringify(e.body).slice(0, 300)}`);
+          throw e;
         }
 
-        // Log up to 5 distinct error patterns from card failures.
-        if (cardFailures.length) {
-          addLog(`⚠️ ${cardFailures.length}/${total} cards failed to add.`);
-          const seen = new Set();
-          for (const f of cardFailures) {
-            if (seen.size >= 5) break;
-            const key = f.msg.slice(0, 60);
-            if (seen.has(key)) continue;
-            seen.add(key);
-            addLog(`   ▸ ${f.name}: ${f.msg}`);
-          }
-          if (cardFailures.length > 5) addLog(`   …(+${cardFailures.length - 5} more)`);
-        }
+        const toAdd        = parsed?.toAdd        || [];
+        const syntaxErrors = parsed?.syntaxErrors || [];
+        const cardErrors   = parsed?.cardErrors   || [];
+        addLog(`✅ Parser: ${toAdd.length} card entries resolved${(syntaxErrors.length || cardErrors.length) ? `, ${syntaxErrors.length + cardErrors.length} couldn't be matched` : ""}.`);
+        [...syntaxErrors, ...cardErrors].slice(0, 5).forEach(e =>
+          addLog(`   ▸ ${(typeof e === "string" ? e : JSON.stringify(e)).slice(0, 140)}`));
 
-        // 5) Done — open the deck page.
+        // 3b) Persist via modifyCards/v2/.
+        if (toAdd.length === 0) {
+          throw new Error("Parser returned no cards — nothing to save. Check syntax/card errors above.");
+        }
+        try {
+          try {
+            await archModifyCards(token, deckId, toAdd);
+          } catch (e) {
+            if (e.status === 401 || e.status === 403) {
+              token = await ensureToken(true);
+              await archModifyCards(token, deckId, toAdd);
+            } else { throw e; }
+          }
+        } catch (e) {
+          addLog(`❌ Save step failed: ${(e.message || "").slice(0, 200)}`);
+          if (e.body) addLog(`   raw: ${JSON.stringify(e.body).slice(0, 300)}`);
+          throw e;
+        }
+        addLog(`✅ Persisted ${toAdd.length} card entries to deck via modifyCards/v2/.`);
+        setArchPushing({ phase: "adding", done: total, total });
+
+        // 4) Done — open the deck page.
         const url = `https://archidekt.com/decks/${deckId}`;
         setArchPushing(false);
-        const failed = cardFailures.length;
+        const skipped = syntaxErrors.length + cardErrors.length;
         setArchResult({
-          kind: failed === total ? "fallback" : "ok",
+          kind: "ok",
           url,
-          msg: failed === 0
-            ? `Deck created with all ${total} cards.`
-            : failed === total
-              ? `Deck created but every card failed to add — see build log for details. Falling back to clipboard.`
-              : `Deck created with ${ok}/${total} cards (${failed} failed${unresolved.length ? `, ${unresolved.length} unresolved` : ""}). See build log.`,
+          msg: skipped > 0
+            ? `Deck created with ${total - skipped}/${total} cards (${skipped} couldn't be matched — see build log).`
+            : `Deck created with all ${total} cards.`,
         });
-        if (failed === total) await archClipboardFallback();
-        else window.open(url, "_blank");
+        window.open(url, "_blank");
       } catch (e) {
         // Any other failure — clipboard fallback so the user can finish manually.
         setArchPushing(false);
@@ -2000,6 +2202,12 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     };
 
     const loadFromLibrary = entry => {
+      // Preserve the user's in-progress built deck if there is one — opening
+      // a saved deck shouldn't silently lose unsaved work. We restore it via
+      // the "↩ Back to your built deck" button in the deck view.
+      if (!fromSaved && deck && selCmd) {
+        setUnsavedDeck({ deck, selCmd });
+      }
       setSelCmd(entry.selCmd);
       setDeck(entry.deck);
       setFromSaved(true);
@@ -2009,11 +2217,21 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setPhase("deck");
     };
 
+    const restoreUnsavedDeck = () => {
+      if (!unsavedDeck) return;
+      setDeck(unsavedDeck.deck);
+      setSelCmd(unsavedDeck.selCmd);
+      setFromSaved(false);
+      setLibSaved(false);
+      setUnsavedDeck(null);
+      setPhase("deck");
+    };
+
     const resetHome = () => {
       setPhase("ready"); setDeck(null); setSelCmd(null);
       setCands([]); setLog([]); setEnriched([]); setDeckSvd(false);
-      setLibSaved(false); setFromSaved(false); setError("");
-      setTab("build");
+      setLibSaved(false); setFromSaved(false); setUnsavedDeck(null);
+      setError(""); setTab("build");
     };
 
     const navToCollection = () => {
@@ -2120,10 +2338,15 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 ${(() => {
                   const groqOK = (apiKeys.groq   || "").length >= 20;
                   const gemOK  = (apiKeys.gemini || "").length >= 20;
+                  const extras = (groqOK ? 1 : 0) + (gemOK ? 1 : 0);
+                  // Built-in is always available, so the messaging shifts:
+                  // 0 keys → "default works, add a key for higher quality"
+                  // 1 key  → "fallback enabled (key + built-in)"
+                  // 2 keys → "all three providers configured, ladder of fallback"
                   const status =
-                    groqOK && gemOK ? { txt:"✓ Both providers configured — automatic fallback enabled.", col:"#1a6a2a", bg:"#e6f4e6" }
-                  : groqOK || gemOK ? { txt:"⚠️ Only one provider configured — add a second key to enable automatic fallback.", col:"#7a4010", bg:"#fff5e8" }
-                  :                   { txt:"Add at least one provider key to continue.", col:"#5a3a1a", bg:"#faf5ee" };
+                    extras === 0 ? { txt:"● Built-in Cloudflare AI is active. Add a Groq / Gemini key for higher-quality decks.", col:"#1a5080", bg:"#e8f0fa" }
+                  : extras === 1 ? { txt:"✓ Built-in + 1 user key — automatic fallback enabled.", col:"#1a6a2a", bg:"#e6f4e6" }
+                  :                { txt:"✓ All three providers configured — full fallback chain (primary → next → built-in).", col:"#1a6a2a", bg:"#e6f4e6" };
                   return html`
                     <div style=${{
                       padding:"8px 12px", borderRadius:8, marginBottom:14,
@@ -2136,6 +2359,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 ${Object.entries(PROVIDERS).map(([pid, p]) => {
                   const isPrimary = provider === pid;
                   const hasKey    = (apiKeys[pid] || "").length >= 20;
+                  const builtIn   = !!p.builtIn;
                   return html`
                     <div key=${pid} style=${{
                       padding:"14px 14px 10px", borderRadius:10, marginBottom:12,
@@ -2154,20 +2378,36 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             padding:"2px 8px", background:"#ead0a0", borderRadius:10,
                           }}>Primary</span>
                         `}
-                        ${hasKey && html`
-                          <span style=${{ fontSize:11, color:"#1a6a2a", fontWeight:600 }}>✓ saved</span>
-                        `}
+                        ${builtIn
+                          ? html`<span style=${{ fontSize:11, color:"#1a5080", fontWeight:600 }}>● no key required</span>`
+                          : hasKey && html`<span style=${{ fontSize:11, color:"#1a6a2a", fontWeight:600 }}>✓ saved</span>`}
                         <span style=${{ marginLeft:"auto", fontSize:11, color:"#7a5a3a" }}>
-                          Get a free key at <a href=${"https://" + p.keyUrl} target="_blank" rel="noopener"
-                            style=${{ color:"#7a2e0e", textDecoration:"underline" }}>${p.keyUrl}</a>
+                          ${builtIn
+                            ? html`<a href=${"https://" + p.keyUrl} target="_blank" rel="noopener"
+                                style=${{ color:"#7a2e0e", textDecoration:"underline" }}>About this model</a>`
+                            : html`Get a free key at <a href=${"https://" + p.keyUrl} target="_blank" rel="noopener"
+                                style=${{ color:"#7a2e0e", textDecoration:"underline" }}>${p.keyUrl}</a>`}
                         </span>
                       </div>
 
-                      <input type="password" placeholder=${p.keyHint}
-                        value=${aki[pid] || ""}
-                        onInput=${e => setAKI(prev => ({ ...prev, [pid]: e.target.value }))}
-                        onKeyDown=${e => e.key === "Enter" && saveSettings()}
-                        style=${inp} />
+                      ${builtIn
+                        ? html`
+                          <div style=${{ fontSize:12, color:"#3a4a6a", lineHeight:1.6,
+                            padding:"8px 12px", background:"#f0f7ff",
+                            border:"1px solid #b8d0e8", borderRadius:8 }}>
+                            Runs on the host's free Cloudflare quota — about
+                            <strong>~10,000 neurons/day</strong> shared across all visitors.
+                            Quality is lower than Groq / Gemini for complex deck building;
+                            paste your own key below for higher-quality output if you want.
+                          </div>
+                        `
+                        : html`
+                          <input type="password" placeholder=${p.keyHint}
+                            value=${aki[pid] || ""}
+                            onInput=${e => setAKI(prev => ({ ...prev, [pid]: e.target.value }))}
+                            onKeyDown=${e => e.key === "Enter" && saveSettings()}
+                            style=${inp} />
+                        `}
 
                       <div style=${{ marginTop:8 }}>
                         <span style=${{ ...label, marginBottom:4 }}>Model</span>
@@ -2690,15 +2930,43 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               <!-- Commanders tab -->
               ${activeTab === "commanders" && (() => {
                 const anyFilter = colorFilter.length > 0 || colorless;
-                const filtered = anyFilter ? cmdrs.filter(c => {
+                const q = (cmdrQuery || "").trim().toLowerCase();
+                const colorFiltered = anyFilter ? cmdrs.filter(c => {
                   const ci = c.scryfall?.color_identity || [];
                   if (colorless && ci.length === 0) return true;
                   if (colorFilter.length === 0) return false;
                   if (colorMode === "at_least") return colorFilter.every(col => ci.includes(col));
                   return ci.length === colorFilter.length && colorFilter.every(col => ci.includes(col));
                 }) : cmdrs;
+                const filtered = q
+                  ? colorFiltered.filter(c => (c.name || "").toLowerCase().includes(q))
+                  : colorFiltered;
+                const anyActiveFilter = anyFilter || !!q;
                 return html`
                   <div>
+                    <!-- Search by name -->
+                    <div class="card" style=${{ marginBottom:12, padding:"10px 14px" }}>
+                      <div style=${{ display:"flex", gap:8, alignItems:"center" }}>
+                        <span style=${{ fontSize:16 }}>🔎</span>
+                        <input type="search" placeholder="Search commanders by name…"
+                          value=${cmdrQuery}
+                          onInput=${e => setCmdrQuery(e.target.value)}
+                          style=${{
+                            flex:1, padding:"7px 10px", fontSize:13,
+                            border:"1px solid #d8c090", borderRadius:8,
+                            background:"#fffdf8", color:"#3a1a00",
+                          }} />
+                        ${q && html`
+                          <button onClick=${() => setCmdrQuery("")}
+                            style=${{ background:"transparent", border:"none",
+                              color:"#8a4010", fontSize:12, fontFamily:"inherit",
+                              cursor:"pointer", textDecoration:"underline", padding:"0 4px" }}>
+                            Clear
+                          </button>
+                        `}
+                      </div>
+                    </div>
+
                     <!-- Colour filter -->
                     <div class="card" style=${{ marginBottom:16 }}>
                       <span style=${label}>Filter by Commander Colour Identity</span>
@@ -2769,13 +3037,17 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     </div>
 
                     <p style=${{ fontSize:13, color:"#5a3a1a", marginBottom:16 }}>
-                      Showing <strong>${filtered.length}</strong> of ${cmdrs.length} possible commanders${anyFilter ? " (filtered)" : ""}.
+                      Showing <strong>${filtered.length}</strong> of ${cmdrs.length} possible commanders${anyActiveFilter ? " (filtered)" : ""}.
                       Click any to build a deck directly.
                     </p>
 
                     ${filtered.length === 0
                       ? html`<div style=${{ textAlign:"center", padding:"40px 20px", color:"#8a6a4a" }}>
-                          No commanders match your filter. Try broader settings.
+                          No commanders match ${q && anyFilter ? "your search and colour filter" : q ? `"${cmdrQuery}"` : "your colour filter"}.
+                          ${" "}<button onClick=${() => { setCmdrQuery(""); setCF([]); setCL(false); }}
+                            style=${{ background:"transparent", border:"none", color:"#8a4010",
+                              fontSize:13, fontFamily:"inherit", cursor:"pointer",
+                              textDecoration:"underline" }}>Clear filters</button>
                         </div>`
                       : html`<div style=${{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(320px,1fr))", gap:14 }}>
                           ${filtered.map(cand => html`
@@ -3135,6 +3407,14 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     style=${{ ...btnSec, padding:"6px 14px", fontSize:11 }}>
                     ${fromSaved ? "← Library" : "↩ Re-pick"}
                   </button>
+                  ${fromSaved && unsavedDeck && html`
+                    <button onClick=${restoreUnsavedDeck}
+                      title="Return to the freshly-built deck you had before opening this saved one."
+                      style=${{ ...btn, padding:"6px 14px", fontSize:11,
+                        background:"linear-gradient(135deg,#5a3a10,#a06030)" }}>
+                      ↪ Back to your unsaved deck
+                    </button>
+                  `}
                 </div>
               </div>
 
@@ -3528,6 +3808,24 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   </p>
                 </div>
               </div>
+
+              ${(unsavedDeck || (deck && selCmd && !libSaved && !fromSaved)) && html`
+                <div style=${{
+                  background:"#fff5e8", border:"1px solid #e8b070", borderRadius:10,
+                  padding:"10px 14px", marginBottom:18, fontSize:12, color:"#7a4010",
+                  display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
+                  <span style=${{ fontSize:16 }}>⚠️</span>
+                  <div style=${{ flex:1, lineHeight:1.6 }}>
+                    You have an <strong>unsaved deck</strong> — opening a library entry won't lose it.
+                    ${" "}<button onClick=${() => unsavedDeck ? restoreUnsavedDeck() : setPhase("deck")}
+                      style=${{ background:"transparent", border:"none", color:"#7a2e0e",
+                        textDecoration:"underline", cursor:"pointer", fontFamily:"inherit",
+                        fontSize:12, fontWeight:600, padding:0 }}>
+                      Open it now →
+                    </button>
+                  </div>
+                </div>
+              `}
 
               ${library.length > 0 && html`
                 <div style=${{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(340px, 1fr))", gap:16 }}>

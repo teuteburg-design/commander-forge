@@ -1,0 +1,27 @@
+# Cloudflare Workers config for Commander Forge.
+#
+# Two bindings:
+#   ASSETS — serves static files from ./public  (commander-forge.html, index.html)
+#   AI     — Workers AI inference, called from worker/index.js for the /api/ai endpoint
+#
+# Deployed automatically by Cloudflare's git integration on push to main.
+
+name = "commander-forge"
+main = "worker/index.js"
+compatibility_date = "2025-04-01"
+workers_dev = true
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[ai]
+binding = "AI"
+
+# Notes
+# - The AI binding has no daily limit configured here; Cloudflare's account-level
+#   free tier (~10 000 neurons/day) applies. Upgrade to a paid plan if friends
+#   collectively exceed it.
+# - `not_found_handling = "single-page-application"` means unknown paths fall
+#   through to /index.html so the SPA's hash routing keeps working.
