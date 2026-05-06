@@ -1210,7 +1210,17 @@
     };
     const hideTooltip = () => { clearTimeout(tooltipTimer.current); setCardTooltip(null); };
 
-    const addLog = msg => setLog(l => [...l, msg]);
+    // Lines starting with "   …" are progress updates — if the previous log
+    // line was also "   …", REPLACE it instead of appending. Keeps the long
+    // Scryfall batch fetch as a single animating line, not 20 stacked ones.
+    const addLog = msg => setLog(l => {
+      if (typeof msg === "string" && msg.startsWith("   …")
+          && l.length > 0 && typeof l[l.length-1] === "string"
+          && l[l.length-1].startsWith("   …")) {
+        return [...l.slice(0, -1), msg];
+      }
+      return [...l, msg];
+    });
 
     useEffect(() => {
       // ── Load + migrate AI provider configuration ────────────────────────
@@ -1379,6 +1389,15 @@
       return order.filter(p => !exclude.includes(p) && !!apiKeys[p]);
     };
 
+    // Per-provider max_tokens caps. Callers ask for an upper bound (e.g. 16384
+    // for deck builds), but each provider has its own ceiling on the FREE tier:
+    //   - Groq Llama 3.3 70B free tier: ~8192 per request before "Request too
+    //     large" rejection.
+    //   - Gemini 2.5 Flash: up to 65536, comfortably handles 16384.
+    // Capping at the provider level lets us request a generous budget without
+    // breaking smaller-quota providers — they just get their own ceiling.
+    const PROVIDER_MAX_TOKENS = { groq: 8192, gemini: 16384 };
+
     // Run a prompt on a single, specific provider. Throws on API failure.
     // Used by callAI (which adds rotation on failure) and by buildDeck's
     // multi-provider retry loop (which rotates on PARSE failure too).
@@ -1386,8 +1405,10 @@
       const fn  = p === "groq" ? callGroq : callGemini;
       const key = apiKeys[p] || "";
       const mdl = models[p]   || PROVIDERS[p].models[0].id;
-      const result = await fn(key, mdl, userText, systemText, maxTokens);
-      return { ...result, provider: p };
+      const cap = PROVIDER_MAX_TOKENS[p] || maxTokens;
+      const max = Math.min(maxTokens, cap);
+      const result = await fn(key, mdl, userText, systemText, max);
+      return { ...result, provider: p, maxTokens: max };
     };
 
     // Try the primary provider first; on API-level failure (rate-limit, network,
@@ -1789,16 +1810,14 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         }
 
         if (!deckData?.categories) {
-          // Use the last attempted response for diagnostic output.
-          const last    = tried[tried.length - 1];
-          const raw     = safeParse.lastRaw || "";
-          const len     = raw.length;
-          const snippet = raw.slice(0, 800).replace(/\s+/g, " ");
-          const truncated = !raw.trimEnd().endsWith("}");
-          const triedLabels = tried.map(t => PROVIDERS[t.provider]?.label || t.provider).join(", ");
-          addLog(`❌ All providers failed (${triedLabels}). Last response: ${len} chars${truncated ? " (truncated)" : ""}.`);
-          addLog(`📝 First 800 chars: ${snippet || "(empty response)"}`);
-          if (len > 800) addLog(`…(full response stashed for the error screen)`);
+          // Distinguish two failure modes:
+          //  - API errors (every `tried` entry has .error and no .replyObj):
+          //    nothing was returned, so showing "(truncated)" / "(empty response)"
+          //    is misleading. The user needs to fix their key/quota/request size.
+          //  - Parse errors (some `tried` entry has .replyObj): the model
+          //    DID respond but emitted garbage; show the raw output snippet.
+          const allApiErrors = tried.every(t => t.error && !t.replyObj);
+          const triedLabels  = tried.map(t => PROVIDERS[t.provider]?.label || t.provider).join(", ");
 
           // Build a recommendation tailored to what the user actually has saved.
           const hasGroq = !!apiKeys.groq, hasGemini = !!apiKeys.gemini;
@@ -1806,12 +1825,33 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           if (!hasGroq && !hasGemini) {
             suggestion = "Open ⚙ Settings and paste at least one API key (free Gemini key from aistudio.google.com is recommended).";
           } else if (hasGroq && !hasGemini) {
-            suggestion = "Groq's free tier sometimes truncates long deck JSON. Add a free Gemini key in Settings (aistudio.google.com) — it has a much larger output budget and is the most reliable provider for this task.";
+            suggestion = "Groq's free tier rejects large deck-build requests. Add a free Gemini key in Settings (aistudio.google.com) — it has a much larger per-request budget and reliably handles 99-card decks.";
           } else if (hasGemini && !hasGroq) {
             suggestion = "Try switching the Gemini model in Settings to gemini-2.5-pro (slower but emits longer JSON reliably), or add a Groq key as fallback.";
           } else {
-            suggestion = "Both providers responded but neither produced parseable JSON. Try switching to gemini-2.5-pro in Settings, or retry — this is usually transient.";
+            suggestion = "Try switching to gemini-2.5-pro in Settings, or retry — this is usually transient.";
           }
+
+          if (allApiErrors) {
+            // No provider returned anything — show the API errors directly.
+            const errs = tried.map(t =>
+              `  • ${PROVIDERS[t.provider]?.label || t.provider}: ${(t.error || "unknown").slice(0, 200)}`
+            ).join("\n");
+            addLog(`❌ All providers rejected the request (${triedLabels}). No response to parse.`);
+            tried.forEach(t =>
+              addLog(`   ↳ ${PROVIDERS[t.provider]?.label || t.provider}: ${(t.error || "unknown").slice(0, 200)}`)
+            );
+            throw new Error(`${triedLabels} rejected the request. ${suggestion}`);
+          }
+
+          // Some provider DID respond — diagnose the parse failure.
+          const raw     = safeParse.lastRaw || "";
+          const len     = raw.length;
+          const snippet = raw.slice(0, 800).replace(/\s+/g, " ");
+          const truncated = len > 0 && !raw.trimEnd().endsWith("}");
+          addLog(`❌ All providers failed (${triedLabels}). Last response: ${len} chars${truncated ? " (truncated)" : ""}.`);
+          if (len > 0) addLog(`📝 First 800 chars: ${snippet}`);
+          if (len > 800) addLog(`…(full response stashed for the error screen)`);
 
           throw new Error(truncated
             ? `${triedLabels} returned a truncated response. ${suggestion}`
