@@ -1759,6 +1759,14 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         const tried        = [];
         const aiOrder      = aiUsableProviders();   // local: provider rotation order
 
+        // Pre-flight: if no provider has a key, fail immediately with a clear
+        // message instead of running the loop zero times and producing a
+        // confusing "All providers failed (). No response to parse." error.
+        if (aiOrder.length === 0) {
+          addLog("❌ No AI provider configured. Open ⚙ Settings and paste a Groq or Gemini API key.");
+          throw new Error("No AI provider has a key configured. Open ⚙ Settings and paste a Groq or Gemini API key, then try again.");
+        }
+
         // Gemini 2.5 Flash supports up to 65536 output tokens; Llama 3.3 70B on
         // Groq supports 32768. A 99-card deck with concise reasons fits in
         // ~6-10K tokens, but verbose models (especially Gemini in non-thinking
@@ -2511,6 +2519,24 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         onInput=${e => setAKI(prev => ({ ...prev, [pid]: e.target.value }))}
                         onKeyDown=${e => e.key === "Enter" && saveSettings()}
                         style=${inp} />
+
+                      ${pid === "gemini" && html`
+                        <div style=${{
+                          marginTop:8, padding:"8px 12px",
+                          background:"#fff8ee", border:"1px solid #e0c890",
+                          borderRadius:8, fontSize:11, color:"#5a3a1a", lineHeight:1.7,
+                        }}>
+                          <strong style=${{ color:"#7a2e0e" }}>⚠ Important:</strong> after generating
+                          a Gemini key, Google requires you to <strong>set up a billing
+                          profile</strong> at <a href="https://console.cloud.google.com/billing"
+                          target="_blank" rel="noopener"
+                          style=${{ color:"#7a2e0e", textDecoration:"underline" }}>console.cloud.google.com/billing</a>.
+                          The key won't return any results until billing is enabled — even on
+                          the free tier. You won't be charged unless you exceed the free
+                          quota (~1M tokens/day, far above normal use), but the billing
+                          profile must exist.
+                        </div>
+                      `}
 
                       <div style=${{ marginTop:8 }}>
                         <span style=${{ ...label, marginBottom:4 }}>Model</span>
