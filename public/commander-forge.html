@@ -1391,12 +1391,13 @@
 
     // Per-provider max_tokens caps. Callers ask for an upper bound (e.g. 16384
     // for deck builds), but each provider has its own ceiling on the FREE tier:
-    //   - Groq Llama 3.3 70B free tier: ~8192 per request before "Request too
-    //     large" rejection.
-    //   - Gemini 2.5 Flash: up to 65536, comfortably handles 16384.
-    // Capping at the provider level lets us request a generous budget without
-    // breaking smaller-quota providers — they just get their own ceiling.
-    const PROVIDER_MAX_TOKENS = { groq: 8192, gemini: 16384 };
+    //   - Groq Llama 3.3 70B free tier: 12 000 TPM (tokens per minute, total
+    //     for input + reserved output). With ~4-5 K input we cap at 7 000 so
+    //     a single request fits comfortably (input + 7 000 ≈ 11-12 K). NOTE:
+    //     two attempts within the same minute will still blow TPM, so
+    //     buildDeck skips its focused-prompt retry on Groq (see comment there).
+    //   - Gemini 2.5 Flash: up to 65 536 output, comfortably handles 16 384.
+    const PROVIDER_MAX_TOKENS = { groq: 7000, gemini: 16384 };
 
     // Run a prompt on a single, specific provider. Throws on API failure.
     // Used by callAI (which adds rotation on failure) and by buildDeck's
@@ -1796,6 +1797,20 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             : reason1 === "stop"
               ? "model stopped early or returned bad JSON"
               : `finish_reason=${reason1}`;
+
+          // Groq has a 12 000 TPM (tokens per minute) cap on the free tier.
+          // A single full-prompt + max_tokens request consumes nearly all of
+          // it — a second request in the same minute is guaranteed to be
+          // 429-rejected. Skip the focused retry on Groq and rotate
+          // immediately to the next provider (typically Gemini).
+          if (p === "groq") {
+            addLog(`⚠️ ${PROVIDERS[p].label}: ${raw0.length} chars (${r1.completionTokens ?? "?"} tokens), ${why}. Skipping focused retry — Groq's TPM cap doesn't allow 2 attempts/min.`);
+            tried.push({ provider: p, replyObj: r1 });
+            const next = aiOrder[aiOrder.indexOf(p) + 1];
+            if (next) addLog(`⚠️ Falling back to ${PROVIDERS[next].label}…`);
+            continue;
+          }
+
           addLog(`⚠️ ${PROVIDERS[p].label}: ${raw0.length} chars (${r1.completionTokens ?? "?"} tokens), ${why}. Retrying focused prompt on same provider…`);
 
           let r2;
