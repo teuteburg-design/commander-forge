@@ -2832,76 +2832,188 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setPhase("deck");
     };
 
-    // Open an imported Manabox/Moxfield deck in the Deck view. Imported decks
-    // are flat card lists with no Scryfall enrichment of their own, so we
-    // synthesize a deck object on the fly:
-    //   - Commander: looked up in `enriched` for its Scryfall record. If the
-    //     enrichment hasn't run yet for this collection, the commander card
-    //     renders with name-only (no art) — still navigable.
-    //   - Categories: one synthetic "Cards" category with all 99 mainboard
-    //     entries, enriched from `enriched` for per-card image/cmc/type so
-    //     the mana curve and type breakdown still work.
-    // Back button returns to Library (we're opening from there).
-    const openImportedDeck = (rawDeck, returnTo = "library") => {
-      const enrichMap = new Map();
-      enriched.forEach(c => enrichMap.set(c.name.toLowerCase(), c));
+    // ── Imported-deck enrichment ───────────────────────────────────────────
+    // Run the same enrichment pipeline used by buildDeck (Scryfall + EDHRec +
+    // Commander Spellbook) over a raw imported deck so it appears in the Deck
+    // view with full visuals: commander art, type-line categories, mana curve,
+    // EDHRec acquire-suggestions, and any combos achievable from the deck's
+    // cards. Result is cached on the deck entry (entry.deckData / entry.selCmd /
+    // entry.enrichedAt) so subsequent opens are instant and the cache syncs
+    // via the same KV mechanism that handles all of groups.decks.
+    const enrichImportedDeck = async (rawDeck) => {
+      const cmdrName = rawDeck.commanderName || "";
+      const uniq     = new Set([cmdrName, ...rawDeck.cards.map(c => c.name)].filter(Boolean));
+      const reqList  = [...uniq].map(n => ({ name: n, qty: 1, id: "" }));
 
-      const cmdrName  = rawDeck.commanderName || rawDeck.cards?.[0]?.name || "Commander";
-      const cmdrEnr   = enrichMap.get(cmdrName.toLowerCase());
+      addLog(`🔍 Looking up ${uniq.size} unique card${uniq.size === 1 ? "" : "s"} on Scryfall…`);
+      const sfResults = await fetchAllScryfall(reqList,
+        p => setProg(Math.min(60, Math.round(p * 0.6))),
+        msg => addLog("   " + msg),
+      );
+      const sfByName = new Map(sfResults.map(c => [c.name.toLowerCase(), c]));
+
+      // Commander selCmd object — shape matches what loadCollectionDeck/
+      // loadFromLibrary expect, so the Deck view renders correctly.
+      const cmdrEnr   = sfByName.get(cmdrName.toLowerCase());
       const selCmdObj = {
-        name:    cmdrName,
-        theme:   "Imported deck",
-        reason:  "",
-        strategy:"",
-        card:    cmdrEnr || { name: cmdrName, scryfall: {} },
+        name:     cmdrName,
+        theme:    "Imported",
+        reason:   "Imported from collection",
+        strategy: "",
+        card:     cmdrEnr || { name: cmdrName, scryfall: {} },
       };
 
-      // Build per-card rendering objects (mirrors the post-mapping shape
-      // from buildDeck so the Deck view's existing renderer just works).
+      // Categorise cards by type_line so the Deck view's category-pills,
+      // mana-curve and type-breakdown all light up correctly.
       const BASICS = new Set(["Plains","Island","Swamp","Mountain","Forest","Wastes"]);
-      const enrichedCards = (rawDeck.cards || [])
-        .filter(c => c.name !== cmdrName)   // commander is in command zone, not mainboard
-        .flatMap(c => {
-          const e  = enrichMap.get(c.name.toLowerCase());
-          const sf = e?.scryfall;
-          const isBasic = BASICS.has(c.name);
-          const tl = sf?.type_line || (isBasic ? `Basic Land — ${c.name}` : "");
-          const card = {
-            name:           c.name,
-            reason:         "",
-            img:            sf?.image_uris?.small || sf?.card_faces?.[0]?.image_uris?.small || BASIC_IMG[c.name] || null,
-            mana_cost:      sf?.mana_cost || sf?.card_faces?.[0]?.mana_cost || "",
-            cmc:            typeof sf?.cmc === "number" ? sf.cmc : 0,
-            type_line:      tl,
-            color_identity: sf?.color_identity ||
-                            ({ Plains:["W"], Island:["U"], Swamp:["B"], Mountain:["R"], Forest:["G"], Wastes:[] }[c.name] || []),
-            isLand:         /land/i.test(tl),
-          };
-          // Repeat the entry for each copy (basics typically have qty > 1).
-          return Array.from({ length: c.qty || 1 }, () => ({ ...card }));
-        });
-
-      const totalCards = enrichedCards.length;
-      const syntheticDeck = {
-        theme:       rawDeck.name,
-        description: `Imported deck · ${totalCards} cards` +
-                    (totalCards < 99 ? ` (only ${totalCards} mainboard cards exported — full deck would be 99 + commander).` : "."),
-        warnings:    [],
-        categories:  [{ name: "Cards", cards: enrichedCards }],
+      const BASIC_CI = { Plains:["W"], Island:["U"], Swamp:["B"], Mountain:["R"], Forest:["G"], Wastes:[] };
+      const CAT_ORDER = ["Lands","Creatures","Instants","Sorceries","Enchantments","Artifacts","Planeswalkers","Battles","Other"];
+      const byCat = Object.fromEntries(CAT_ORDER.map(c => [c, []]));
+      const categorise = tl => {
+        const t = (tl || "").toLowerCase();
+        if (/\bland\b/.test(t))         return "Lands";
+        if (/creature/.test(t))         return "Creatures";
+        if (/instant/.test(t))          return "Instants";
+        if (/sorcery/.test(t))          return "Sorceries";
+        if (/enchantment/.test(t))      return "Enchantments";
+        if (/artifact/.test(t))         return "Artifacts";
+        if (/planeswalker/.test(t))     return "Planeswalkers";
+        if (/battle/.test(t))           return "Battles";
+        return "Other";
       };
 
-      // Preserve unsaved built deck (same as loadFromLibrary).
-      if (!fromSaved && !fromCollection && deck && selCmd) {
-        setUnsavedDeck({ deck, selCmd });
+      for (const raw of (rawDeck.cards || [])) {
+        if (raw.name === cmdrName) continue;   // commander stays in the command zone
+        const sfEntry = sfByName.get(raw.name.toLowerCase());
+        const sf      = sfEntry?.scryfall || {};
+        const isBasic = BASICS.has(raw.name);
+        const tl      = sf.type_line || (isBasic ? `Basic Land — ${raw.name}` : "");
+        const card = {
+          name:           raw.name,
+          reason:         "",
+          img:            sf.image_uris?.small || sf.card_faces?.[0]?.image_uris?.small || BASIC_IMG[raw.name] || null,
+          mana_cost:      sf.mana_cost || sf.card_faces?.[0]?.mana_cost || "",
+          cmc:            typeof sf.cmc === "number" ? sf.cmc : 0,
+          type_line:      tl,
+          color_identity: sf.color_identity || (isBasic ? BASIC_CI[raw.name] : []) || [],
+          isLand:         /\bland\b/i.test(tl) || isBasic,
+        };
+        const cat = categorise(tl);
+        for (let i = 0; i < (raw.qty || 1); i++) byCat[cat].push({ ...card });
       }
-      setSelCmd(selCmdObj);
-      setDeck(syntheticDeck);
-      setFromSaved(returnTo === "library");
-      setFromCollection(returnTo === "collection");
-      setLibSaved(true);    // not actionable for imported decks
-      setDeckSvd(true);     // not actionable for imported decks
-      setError("");
-      setPhase("deck");
+      const categories = CAT_ORDER
+        .map(name => ({ name, cards: byCat[name] }))
+        .filter(c => c.cards.length > 0);
+
+      // ── EDHRec synergy suggestions ──
+      setProg(70);
+      addLog("🌐 Fetching EDHRec synergy data…");
+      let edhrecSuggestions = [];
+      try {
+        const result = await fetchEDHRec(cmdrEnr?.scryfall || cmdrName);
+        if (result?.status === "ok" && result.suggestions?.length) {
+          const inDeck = new Set([...uniq].map(n => n.toLowerCase()));
+          edhrecSuggestions = result.suggestions
+            .filter(c => !inDeck.has(c.name.toLowerCase()) && !BASICS.has(c.name))
+            .slice(0, 20);
+          addLog(`✅ EDHRec: ${edhrecSuggestions.length} cards-to-acquire suggested.`);
+        } else if (result?.status) {
+          addLog(`ℹ️ EDHRec unavailable (${result.status}).`);
+        }
+      } catch (e) {
+        addLog(`ℹ️ EDHRec fetch failed: ${(e?.message || e).toString().slice(0, 80)}.`);
+      }
+
+      // ── Commander Spellbook combos ──
+      setProg(85);
+      addLog("💥 Querying Commander Spellbook for combos…");
+      let combosHave = [], combosAlmost = [];
+      try {
+        const cspb = await fetchCommanderSpellbook(cmdrName, [...uniq]);
+        if (cspb?.status === "ok") {
+          combosHave   = cspb.have   || [];
+          combosAlmost = cspb.almost || [];
+          addLog(`✅ Spellbook: ${combosHave.length} ready combo(s), ${combosAlmost.length} one-card-away.`);
+        } else if (cspb?.status) {
+          addLog(`ℹ️ Spellbook unavailable (${cspb.status}).`);
+        }
+      } catch (e) {
+        addLog(`ℹ️ Spellbook fetch failed: ${(e?.message || e).toString().slice(0, 80)}.`);
+      }
+
+      setProg(95);
+      const totalRendered = categories.reduce((s, c) => s + c.cards.length, 0);
+      const enrichedDeck = {
+        theme:       rawDeck.name,
+        description: `Imported deck — ${totalRendered} cards categorised by type.` +
+                     (cmdrEnr ? "" : " (Commander not found in Scryfall — basic name only.)"),
+        warnings:    [],
+        categories,
+        edhrecSuggestions,
+        combosHave,
+        combosAlmost,
+      };
+
+      return { selCmd: selCmdObj, deck: enrichedDeck };
+    };
+
+    // Open an imported deck. If we've already enriched it (deckData cached on
+    // the entry), we open instantly. Otherwise we run the enrichment pipeline
+    // first, surface progress via the standard loading UI, then cache the
+    // result on the entry so the next open is instant.
+    const openImportedDeck = async (rawDeck, returnTo = "library") => {
+      // Cache hit — open immediately.
+      if (rawDeck.deckData && rawDeck.selCmd) {
+        if (!fromSaved && !fromCollection && deck && selCmd) {
+          setUnsavedDeck({ deck, selCmd });
+        }
+        setSelCmd(rawDeck.selCmd);
+        setDeck(rawDeck.deckData);
+        setFromSaved(returnTo === "library");
+        setFromCollection(returnTo === "collection");
+        setLibSaved(true);
+        setDeckSvd(true);
+        setError("");
+        setPhase("deck");
+        return;
+      }
+
+      // Cache miss — enrich. Use the existing loading screen.
+      setPhase("enriching");
+      setLog([]); setProg(0); setError("");
+      addLog(`📦 Enriching imported deck "${rawDeck.name}"…`);
+
+      try {
+        const { selCmd: enrSel, deck: enrDeck } = await enrichImportedDeck(rawDeck);
+
+        // Persist back to groups.decks so subsequent opens are instant + cloud-synced.
+        const updatedDecks = groups.decks.map(d =>
+          d.name === rawDeck.name
+            ? { ...d, deckData: enrDeck, selCmd: enrSel, enrichedAt: Date.now() }
+            : d
+        );
+        const nextGroups = { ...groups, decks: updatedDecks };
+        setGroups(nextGroups);
+        localStorage.setItem(LS_BINDERS, JSON.stringify({ groups: nextGroups, deckInc, binInc }));
+
+        setProg(100);
+        addLog(`✅ Ready — opening "${rawDeck.name}".`);
+
+        // Preserve unsaved built deck if any.
+        if (!fromSaved && !fromCollection && deck && selCmd) {
+          setUnsavedDeck({ deck, selCmd });
+        }
+        setSelCmd(enrSel);
+        setDeck(enrDeck);
+        setFromSaved(returnTo === "library");
+        setFromCollection(returnTo === "collection");
+        setLibSaved(true);
+        setDeckSvd(true);
+        setPhase("deck");
+      } catch (e) {
+        setError(`Couldn't enrich deck: ${e?.message || e}`);
+        setPhase("error");
+      }
     };
 
     // Open a saved-to-collection deck in the full Deck view (the same one used
@@ -2949,9 +3061,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     };
 
     // ── Shared loading screen ────────────────────────────────────────────────
-    const isLoading = ["loading_cmdr","analyzing","building"].includes(phase);
+    const isLoading = ["loading_cmdr","analyzing","building","enriching"].includes(phase);
     const loadingTitle = phase === "loading_cmdr" ? "Scanning collection for commanders…"
       : phase === "analyzing"  ? "AI is picking commanders…"
+      : phase === "enriching"  ? "Enriching imported deck — Scryfall · EDHRec · Spellbook…"
       : `Building deck for ${selCmd?.name || "…"}`;
 
     // ── Render ───────────────────────────────────────────────────────────────
@@ -4785,32 +4898,42 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     const isLibrary  = kind === "library";
                     const isGen      = kind === "collection-gen";
                     const isImported = kind === "collection-imported";
+                    // Imported decks become "rich" once the user has opened
+                    // them once (enrichImportedDeck caches deckData + selCmd
+                    // on the entry). After that, render them with the same
+                    // mana curve / categories as generated decks.
+                    const isEnriched = isImported && entry.deckData && entry.selCmd;
 
                     // selCmd + deckData: library and gen-collection always have
-                    // them. Imported decks fall back to lookup in `enriched`.
+                    // them. Imported decks: cached enrichment if available,
+                    // else fall back to lookup in `enriched`.
                     const selCmdHere = isImported
-                      ? null
+                      ? (entry.selCmd || null)
                       : (isLibrary ? entry.selCmd : entry.selCmd);
                     const deckDataHere = isImported
-                      ? null
+                      ? (entry.deckData || null)
                       : (isLibrary ? entry.deck : entry.deckData);
 
-                    // For imported decks: look up commander in enriched (best-effort).
+                    // For imported decks without cached enrichment: look up
+                    // commander in `enriched` (best-effort) for the thumbnail.
                     let importedCmdr = null;
-                    if (isImported && entry.commanderName) {
+                    if (isImported && !isEnriched && entry.commanderName) {
                       importedCmdr = enriched.find(c =>
                         c.name.toLowerCase() === entry.commanderName.toLowerCase()
                       );
                     }
-                    const sf = isImported
-                      ? (importedCmdr?.scryfall || {})
-                      : (selCmdHere?.card?.scryfall || {});
+                    const sf = isEnriched
+                      ? (selCmdHere?.card?.scryfall || {})
+                      : isImported
+                        ? (importedCmdr?.scryfall || {})
+                        : (selCmdHere?.card?.scryfall || {});
                     const img = sf.image_uris?.normal || sf.card_faces?.[0]?.image_uris?.normal;
                     const ci  = sf.color_identity || [];
 
-                    // Card totals + mana-curve buckets.
+                    // Card totals + mana-curve buckets. Enriched imported decks
+                    // get the same treatment as generated/library decks.
                     let total, lands, nonLand, buckets;
-                    if (isImported) {
+                    if (isImported && !isEnriched) {
                       total = (entry.cards || []).reduce((s, c) => s + (c.qty || 1), 0);
                       lands = 0;        // unknown without enrichment
                       nonLand = [];
@@ -4901,24 +5024,25 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                   fontFamily:"monospace" }}>${sf.mana_cost}</span>
                               `}
                             </div>
-                            ${!isImported && html`
+                            ${(!isImported || isEnriched) && html`
                               <div style=${{ fontSize:11, color:"#5a2a08", fontStyle:"italic", marginBottom:3 }}>
-                                ${isLibrary ? (entry.deck?.theme || "") : (entry.deckData?.theme || entry.name)}
+                                ${isLibrary ? (entry.deck?.theme || "")
+                                  : (deckDataHere?.theme || entry.name)}
                               </div>
                             `}
-                            ${isImported && entry.commanderName && html`
+                            ${isImported && !isEnriched && entry.commanderName && html`
                               <div style=${{ fontSize:11, color:"#5a2a08", fontStyle:"italic", marginBottom:3 }}>
                                 Commander: ${entry.commanderName}
                               </div>
                             `}
                             <div style=${{ fontSize:11, color:"#9a7a5a" }}>
-                              ${total} cards${!isImported ? ` · ${lands} lands` : ""}${date ? " · " + date : ""}
+                              ${total} cards${(!isImported || isEnriched) ? ` · ${lands} lands` : ""}${date ? " · " + date : ""}
                             </div>
                           </div>
                         </div>
 
-                        ${!isImported && html`
-                          <!-- Mini mana curve (only available for decks with enriched data) -->
+                        ${(!isImported || isEnriched) && html`
+                          <!-- Mini mana curve (available once deckData exists) -->
                           <div style=${{ borderTop:"1px solid #e8d8b8", paddingTop:10 }}>
                             <div style=${{ fontSize:9, letterSpacing:2, color:"#8a5010",
                               textTransform:"uppercase", fontWeight:700, marginBottom:6 }}>Mana Curve</div>
@@ -4943,7 +5067,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
                           <!-- Category chip list -->
                           <div style=${{ display:"flex", gap:5, flexWrap:"wrap", marginTop:10 }}>
-                            ${((isLibrary ? entry.deck?.categories : entry.deckData?.categories) || []).map(cat => html`
+                            ${(deckDataHere?.categories || []).map(cat => html`
                               <span key=${cat.name} style=${{
                                 fontSize:10, padding:"2px 8px", borderRadius:10,
                                 background:"#f0e4d0", color:"#6a3a10",
@@ -4953,14 +5077,16 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           </div>
                         `}
 
-                        ${isImported && html`
-                          <!-- Imported decks have no mana curve; show a brief hint -->
+                        ${isImported && !isEnriched && html`
+                          <!-- Imported decks not yet enriched — show a hint that
+                               clicking will pull Scryfall + EDHRec + Spellbook data. -->
                           <div style=${{
                             borderTop:"1px solid #e8d8b8", paddingTop:10, marginTop:4,
-                            fontSize:11, color:"#7a5a3a", lineHeight:1.6, fontStyle:"italic",
+                            fontSize:11, color:"#5a7a3a", lineHeight:1.6,
                           }}>
-                            Imported decks don't have AI-generated category breakdowns or reasons.
-                            Click to view the card list with Scryfall enrichment.
+                            ✨ <strong>Click to enrich</strong> — fetches Scryfall card data,
+                            EDHRec synergy suggestions, and Commander Spellbook combos.
+                            Cached after first open.
                           </div>
                         `}
 
