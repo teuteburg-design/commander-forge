@@ -29,9 +29,9 @@ not_found_handling = "single-page-application"
 # See docs/SYNC_SETUP.md for the full walkthrough. While disabled, the Worker
 # returns 503 from /api/state and the client falls back to localStorage-only.
 #
-# [[kv_namespaces]]
-# binding = "STATE"
-# id = "PASTE_REAL_KV_NAMESPACE_ID_HERE"
+[[kv_namespaces]]
+binding = "STATE"
+id = "87d006da67f64ce19eaab1865c674174"
 # preview_id = "PASTE_PREVIEW_KV_NAMESPACE_ID_HERE"   # only needed for `wrangler dev`
 
 # Note
