@@ -1058,6 +1058,238 @@
     "Lands matter","Stax","Group Hug","Politics","Ramp","Big Mana",
   ];
 
+  // ── Collection detail components ────────────────────────────────────────────
+  // Pretty rendering for a deck or binder when the user clicks one in the
+  // Select Sources screen. Generated decks (with deckData attached) get the
+  // full Library-style treatment; imported decks fall back to a card list.
+
+  function DeckHeader({ title, badge, total, included, onToggle, complete }) {
+    return html`
+      <div style=${{
+        display:"flex", alignItems:"flex-start", gap:12, marginBottom:14,
+        flexWrap:"wrap",
+      }}>
+        <div style=${{ flex:1, minWidth:0 }}>
+          <div style=${{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap", marginBottom:4 }}>
+            <h3 style=${{ margin:0, fontSize:17, color:"#3a1a00", lineHeight:1.25 }}>${title}</h3>
+            ${badge && html`<span style=${{
+              padding:"1px 7px", borderRadius:10, fontSize:10, fontWeight:700, letterSpacing:0.5,
+              background:"#7a3010", color:"#fff8f0",
+            }}>${badge}</span>`}
+            ${complete && html`<span style=${{
+              padding:"1px 7px", borderRadius:10, fontSize:10, fontWeight:600,
+              background:"#cde8c8", color:"#2a6a2a",
+            }}>✓ complete</span>`}
+          </div>
+          <div style=${{ fontSize:12, color:"#8a6a4a" }}>${total} cards</div>
+        </div>
+        <label style=${{
+          display:"flex", alignItems:"center", gap:7, cursor:"pointer", flexShrink:0,
+          padding:"7px 12px", borderRadius:18, fontSize:12, fontWeight:600,
+          background: included ? "#7a2e0e" : "#e8d8c0",
+          color:      included ? "#fff"    : "#5a3a1a",
+          userSelect:"none",
+        }}>
+          <input type="checkbox" checked=${!!included} onChange=${onToggle} style=${{ margin:0 }} />
+          ${included ? "In eligible pool" : "Reserved (excluded)"}
+        </label>
+      </div>
+    `;
+  }
+
+  function ManaCurveChart({ cards }) {
+    const nonLand = cards.filter(c => !c.isLand);
+    if (nonLand.length === 0) return null;
+    const buckets = [0,0,0,0,0,0,0,0];
+    nonLand.forEach(c => {
+      const cmc = Math.max(0, Math.floor(c.cmc || 0));
+      buckets[Math.min(cmc, 7)]++;
+    });
+    const maxB = Math.max(1, ...buckets);
+    const labels = ["0","1","2","3","4","5","6","7+"];
+    return html`
+      <div style=${{ background:"#fff8f0", border:"1px solid #e0c890",
+        borderRadius:10, padding:"14px 18px" }}>
+        <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:10 }}>
+          <div style=${{ fontSize:10, letterSpacing:3, color:"#8a4010",
+            textTransform:"uppercase", fontWeight:700 }}>Mana Curve</div>
+          <div style=${{ fontSize:11, color:"#8a6a4a" }}>${nonLand.length} non-land</div>
+        </div>
+        <div style=${{ display:"flex", gap:5, alignItems:"flex-end", height:70 }}>
+          ${buckets.map((n, i) => html`
+            <div key=${i} style=${{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:3 }}>
+              <div style=${{ fontSize:9, color:"#5a3a1a", fontWeight:600,
+                visibility: n > 0 ? "visible" : "hidden" }}>${n}</div>
+              <div style=${{
+                width:"100%",
+                height: `${Math.round((n / maxB) * 50)}px`,
+                minHeight: n > 0 ? 4 : 0,
+                borderRadius:"3px 3px 0 0",
+                background:"linear-gradient(180deg,#c05020,#7a2e0e)",
+              }}></div>
+              <div style=${{ fontSize:10, color:"#7a5a3a", fontWeight:600 }}>${labels[i]}</div>
+            </div>
+          `)}
+        </div>
+        <div style=${{ marginTop:6, fontSize:10, color:"#9a7a5a", textAlign:"center" }}>
+          Average CMC: ${(nonLand.reduce((s,c) => s+(c.cmc||0),0) / Math.max(1,nonLand.length)).toFixed(2)}
+        </div>
+      </div>
+    `;
+  }
+
+  // Detail view for a deck entry in the Collection list.
+  // Generated decks (those with a full deckData payload from buildDeck) get
+  // commander art + mana curve + category list. Imported decks (no deckData)
+  // fall back to a sortable flat card list.
+  function DeckDetailView({ deckEntry: d, included, onToggle, sort, setSort }) {
+    const cardTotal = d.cards.reduce((s, c) => s + (c.qty || 1), 0);
+    const complete  = cardTotal >= 99 && cardTotal <= 100;
+    const isGen     = d.source === "generated";
+    const dd        = d.deckData;
+    const sf        = d.selCmd?.card?.scryfall || {};
+    const cmdrImg   = sf.image_uris?.normal || sf.card_faces?.[0]?.image_uris?.normal;
+
+    return html`
+      <div style=${{
+        background:"#fff", border:"1px solid #e0d0b0", borderRadius:12,
+        padding:"18px 20px", boxShadow:"0 2px 10px rgba(0,0,0,0.06)",
+      }}>
+        <${DeckHeader} title=${d.name} badge=${isGen ? "GENERATED" : null}
+          total=${cardTotal} included=${included} onToggle=${onToggle}
+          complete=${complete} />
+
+        ${isGen && dd && html`
+          <!-- Generated deck: pretty Library-style view -->
+          ${cmdrImg && html`
+            <div style=${{ display:"flex", gap:14, marginBottom:14, alignItems:"flex-start" }}>
+              <img src=${cmdrImg} alt=${d.commanderName}
+                style=${{ width:120, borderRadius:8, flexShrink:0,
+                  boxShadow:"0 3px 10px rgba(0,0,0,0.2)" }} />
+              <div style=${{ flex:1, minWidth:0 }}>
+                <div style=${{ fontSize:10, letterSpacing:3, color:"#8a4010",
+                  textTransform:"uppercase", fontWeight:700, marginBottom:3 }}>Commander</div>
+                <div style=${{ fontSize:14, fontWeight:700, color:"#3a1a00", marginBottom:3 }}>${d.commanderName}</div>
+                ${dd.theme && html`<div style=${{ fontSize:12, color:"#5a2a08", fontStyle:"italic", marginBottom:5 }}>${dd.theme}</div>`}
+                ${dd.description && html`<div style=${{ fontSize:11, color:"#5a3a1a", lineHeight:1.6 }}>${dd.description}</div>`}
+              </div>
+            </div>
+          `}
+
+          <div style=${{ marginBottom:12 }}>
+            <${ManaCurveChart} cards=${dd.categories.flatMap(c => c.cards)} />
+          </div>
+
+          <div style=${{ fontSize:10, letterSpacing:3, color:"#8a4010",
+            textTransform:"uppercase", fontWeight:700, marginBottom:6 }}>Categories</div>
+          <div style=${{ display:"flex", gap:5, flexWrap:"wrap", marginBottom:12 }}>
+            ${dd.categories.map(cat => html`
+              <span key=${cat.name} style=${{
+                fontSize:10, padding:"2px 8px", borderRadius:10,
+                background:"#f0e4d0", color:"#6a3a10", border:"1px solid #d8c0a0",
+              }}>${cat.name} ${cat.cards.length}</span>
+            `)}
+          </div>
+        `}
+
+        <!-- Card list (sortable). Always shown — generated decks use category
+             structure if available, imported decks just list. -->
+        <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+          <div style=${{ fontSize:10, letterSpacing:3, color:"#8a4010",
+            textTransform:"uppercase", fontWeight:700 }}>Cards</div>
+          <div style=${{ display:"flex", gap:5, fontSize:10 }}>
+            <button onClick=${() => setSort("name")}
+              style=${{
+                padding:"2px 8px", borderRadius:10, cursor:"pointer", fontFamily:"inherit",
+                border:"1px solid " + (sort === "name" ? "#7a2e0e" : "#d8c090"),
+                background: sort === "name" ? "#7a2e0e" : "#fff",
+                color: sort === "name" ? "#fff8f0" : "#7a5a3a",
+              }}>Name</button>
+            <button onClick=${() => setSort("qty")}
+              style=${{
+                padding:"2px 8px", borderRadius:10, cursor:"pointer", fontFamily:"inherit",
+                border:"1px solid " + (sort === "qty" ? "#7a2e0e" : "#d8c090"),
+                background: sort === "qty" ? "#7a2e0e" : "#fff",
+                color: sort === "qty" ? "#fff8f0" : "#7a5a3a",
+              }}>Qty</button>
+          </div>
+        </div>
+        <div style=${{
+          background:"#fffdf8", borderTop:"1px solid #e8d8b8",
+          padding:"10px 0 0", maxHeight:360, overflowY:"auto", fontSize:11,
+          color:"#3a2010", display:"grid",
+          gridTemplateColumns:"repeat(auto-fill, minmax(200px, 1fr))", gap:"4px 14px",
+        }}>
+          ${[...d.cards].sort((a, b) =>
+            sort === "qty"
+              ? (b.qty || 1) - (a.qty || 1) || a.name.localeCompare(b.name)
+              : a.name.localeCompare(b.name)
+          ).map(c => html`
+            <div key=${c.name} style=${{ display:"flex", justifyContent:"space-between", gap:6,
+              padding:"2px 6px", borderRadius:4 }}>
+              <span style=${{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                ${c.name === d.commanderName ? "👑 " : ""}${c.name}
+              </span>
+              <strong style=${{ color:"#7a3010", flexShrink:0 }}>×${c.qty || 1}</strong>
+            </div>
+          `)}
+        </div>
+      </div>
+    `;
+  }
+
+  function BinderDetailView({ binder: b, included, onToggle, sort, setSort }) {
+    const total = b.cards.reduce((s, c) => s + (c.qty || 1), 0);
+    return html`
+      <div style=${{
+        background:"#fff", border:"1px solid #e0d0b0", borderRadius:12,
+        padding:"18px 20px", boxShadow:"0 2px 10px rgba(0,0,0,0.06)",
+      }}>
+        <${DeckHeader} title=${b.name} total=${total}
+          included=${included} onToggle=${onToggle} />
+
+        <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+          <div style=${{ fontSize:10, letterSpacing:3, color:"#8a4010",
+            textTransform:"uppercase", fontWeight:700 }}>Cards (${b.cards.length} unique)</div>
+          <div style=${{ display:"flex", gap:5, fontSize:10 }}>
+            <button onClick=${() => setSort("name")}
+              style=${{
+                padding:"2px 8px", borderRadius:10, cursor:"pointer", fontFamily:"inherit",
+                border:"1px solid " + (sort === "name" ? "#7a2e0e" : "#d8c090"),
+                background: sort === "name" ? "#7a2e0e" : "#fff",
+                color: sort === "name" ? "#fff8f0" : "#7a5a3a",
+              }}>Name</button>
+            <button onClick=${() => setSort("qty")}
+              style=${{
+                padding:"2px 8px", borderRadius:10, cursor:"pointer", fontFamily:"inherit",
+                border:"1px solid " + (sort === "qty" ? "#7a2e0e" : "#d8c090"),
+                background: sort === "qty" ? "#7a2e0e" : "#fff",
+                color: sort === "qty" ? "#fff8f0" : "#7a5a3a",
+              }}>Qty</button>
+          </div>
+        </div>
+        <div style=${{
+          background:"#fffdf8", borderTop:"1px solid #e8d8b8",
+          padding:"10px 0 0", maxHeight:440, overflowY:"auto", fontSize:11,
+          color:"#3a2010", display:"grid",
+          gridTemplateColumns:"repeat(auto-fill, minmax(200px, 1fr))", gap:"4px 14px",
+        }}>
+          ${[...b.cards].sort((a, b) =>
+            sort === "qty"
+              ? (b.qty || 1) - (a.qty || 1) || a.name.localeCompare(b.name)
+              : a.name.localeCompare(b.name)
+          ).map(c => html`
+            <div key=${c.name} style=${{ display:"flex", justifyContent:"space-between", gap:6,
+              padding:"2px 6px" }}>
+              <span style=${{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>${c.name}</span>
+              <strong style=${{ color:"#7a3010", flexShrink:0 }}>×${c.qty || 1}</strong>
+            </div>
+          `)}
+        </div>
+      </div>
+    `;
+  }
+
   function BuildPrefs({ bracket, setBracket, archetypes, setArchetypes, budget, setBudget, mech, setMech, showMech, setShowMech }) {
     const toggleArch = a => setArchetypes(prev =>
       prev.includes(a) ? prev.filter(x => x !== a)
@@ -1264,6 +1496,10 @@
     const [binInc,   setBinInc]   = useState({});
     const [parseStats, setParseStats] = useState(null);
     const [expanded, setExpanded] = useState({}); // key: "deck::Name" or "binder::Name"
+    // Collection-browser state — which deck/binder is open in the detail panel,
+    // and what sort order is applied to its cards.
+    const [collectionView, setCollectionView] = useState(null); // null | { type:"deck"|"binder", name }
+    const [collectionSort, setCollectionSort]  = useState("name"); // "name" | "qty"
 
     const [usable,   setUsable]   = useState([]);
     const [enriched, setEnriched] = useState([]);
@@ -2703,6 +2939,98 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setUsable(remaining); setDeckSvd(true);
     };
 
+    // Save the freshly-generated deck back into the Collection as a navigable
+    // deck entry (just like a Manabox-imported deck). Cards are claimed from
+    // the user's binders qty-by-qty so the pool reflects what's still free.
+    //
+    // Behaviour:
+    //   - Adds groups.decks[<title>] with source="generated", full deck object
+    //     preserved so the preview later can render commander art / mana curve.
+    //   - For each non-basic card in the deck: decrements 1 from the first
+    //     binder/deck that still has stock. Basics are unlimited so we don't
+    //     touch them.
+    //   - Sets deckInc[title]=false so the deck is excluded from the eligible
+    //     pool by default (the cards are reserved). User can toggle ON later
+    //     to release them.
+    const saveDeckToCollection = () => {
+      const basics    = new Set([...Object.values(BASIC_LAND), "Wastes"]);
+      const cmdrName  = selCmd?.card?.name || "Commander";
+      const themePart = (deck?.theme || "").trim();
+      const baseTitle = themePart
+        ? `Forge: ${cmdrName} · ${themePart}`
+        : `Forge: ${cmdrName}`;
+      // Avoid collisions if user saves multiple decks for the same commander.
+      let title = baseTitle, counter = 2;
+      while (groups.decks.some(d => d.name === title)) {
+        title = `${baseTitle} (${counter++})`;
+      }
+
+      // Build the card list for this saved-deck entry (flatten categories).
+      const deckCards = deck.categories.flatMap(cat =>
+        cat.cards.map(c => ({ name: c.name, qty: 1, id: "" }))
+      );
+      // Merge duplicates (e.g. basic lands appearing multiple times).
+      const merged = new Map();
+      for (const c of deckCards) {
+        if (merged.has(c.name)) merged.get(c.name).qty += c.qty;
+        else merged.set(c.name, { ...c });
+      }
+      // Add commander itself (it's the 100th card; lives in the same deck row).
+      if (!merged.has(cmdrName)) merged.set(cmdrName, { name: cmdrName, qty: 1, id: "" });
+
+      // Subtract non-basic cards from binders. We mutate copies of the binder
+      // entries to keep the original `groups` object untouched until we apply
+      // the new state at the end.
+      const nextDecks   = [...groups.decks];
+      const nextBinders = groups.binders.map(b => ({
+        ...b, cards: b.cards.map(c => ({ ...c })),   // deep-ish copy
+      }));
+      for (const card of merged.values()) {
+        if (basics.has(card.name)) continue;   // unlimited
+        if (card.name === cmdrName) continue;  // commander not necessarily in binder
+        let needed = card.qty;
+        for (const bin of nextBinders) {
+          if (needed <= 0) break;
+          const entry = bin.cards.find(c => c.name === card.name && (c.qty || 0) > 0);
+          if (!entry) continue;
+          const take = Math.min(entry.qty, needed);
+          entry.qty -= take;
+          needed    -= take;
+        }
+        // Trim zero-qty entries so the binder view stays clean.
+      }
+      for (const bin of nextBinders) {
+        bin.cards = bin.cards.filter(c => (c.qty || 0) > 0);
+      }
+
+      const newEntry = {
+        name: title,
+        type: "deck",
+        cards: [...merged.values()],
+        commanderName: cmdrName,
+        source: "generated",
+        savedAt: Date.now(),
+        // Preserve the full deck object so the Collection preview can render
+        // mana curve / categories / commander art identically to the Library.
+        deckData: deck,
+        selCmd: selCmd,
+      };
+      nextDecks.push(newEntry);
+
+      const nextGroups  = { decks: nextDecks, binders: nextBinders };
+      const nextDeckInc = { ...deckInc, [title]: false };
+      const nextUsable  = computeUsable(nextGroups, nextDeckInc, binInc);
+
+      setGroups(nextGroups);
+      setDeckInc(nextDeckInc);
+      setUsable(nextUsable);
+      localStorage.setItem(LS_BINDERS, JSON.stringify({
+        groups: nextGroups, deckInc: nextDeckInc, binInc,
+      }));
+      localStorage.setItem(LS_CARDS, JSON.stringify(nextUsable));
+      setDeckSvd(true);
+    };
+
     const saveDeckToLibrary = () => {
       const entry = {
         id: Date.now(),
@@ -3309,158 +3637,159 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 `}
               </div>
 
-              <div style=${{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(360px, 1fr))", gap:24, marginBottom:22 }}>
+              <!-- ── Browser layout: list (left) + detail panel (right) ─── -->
+              <div style=${{
+                display:"grid",
+                gridTemplateColumns: wideEnough ? "minmax(280px, 360px) 1fr" : "1fr",
+                gap:20, marginBottom:22, alignItems:"flex-start",
+              }}>
 
-                <!-- Decks column -->
-                <div>
-                  <div style=${label}>
-                    Decks ${groups.decks.length > 0 && html`<span style=${{ color:"#b0906a", fontWeight:400 }}>· ${groups.decks.length} (locked by default)</span>`}
-                  </div>
-                  ${groups.decks.length === 0
-                    ? html`<div style=${{ fontSize:12, color:"#a08868", fontStyle:"italic" }}>No decks found in this CSV.</div>`
-                    : html`<div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
-                        ${sortedDecks.map(d => {
-                          const total = cardTotal(d.cards);
-                          // Commander deck = 100 cards (99 mainboard + 1 commander).
-                          // Manabox sometimes exports just the 99 mainboard, so treat 99-100 as complete.
-                          const complete = total >= 99 && total <= 100;
-                          const badge = total === 100 ? "✓ 100/100"
-                            : total === 99 ? "✓ 99 + cmdr"
-                            : `${total}/100`;
-                          const expKey = `deck::${d.name}`;
-                          const isExp  = !!expanded[expKey];
-                          const sortedCards = [...d.cards].sort((a,b) => a.name.localeCompare(b.name));
-                          return html`
-                            <div key=${d.name} style=${{
-                              borderRadius:10, transition:"all .15s",
-                              background: deckInc[d.name] ? "#fff0e0" : "#fff",
-                              border: deckInc[d.name] ? "1px solid #c07030" : "1px solid #ddd0b8",
-                              boxShadow:"0 1px 4px rgba(0,0,0,0.05)", overflow:"hidden",
-                            }}>
-                              <div onClick=${() => setDeckInc(di => ({ ...di, [d.name]: !di[d.name] }))}
-                                style=${{ display:"flex", alignItems:"center", gap:12, padding:"11px 14px", cursor:"pointer" }}>
-                                <span style=${{ fontSize:20, width:24, textAlign:"center", flexShrink:0 }}>
-                                  ${deckInc[d.name] ? "🔓" : "🔒"}
-                                </span>
-                                <div style=${{ flex:1, minWidth:0 }}>
-                                  <div style=${{ fontSize:13, fontWeight:600, color:"#2a1000",
-                                    whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>${d.name}</div>
-                                  <div style=${{ fontSize:11, color:"#8a6a4a", display:"flex", gap:6, alignItems:"center" }}>
-                                    <span>Deck · ${total} cards (${d.cards.length} unique)</span>
-                                    <span style=${{
-                                      fontSize:10, padding:"1px 7px", borderRadius:10, fontWeight:600,
-                                      background: complete ? "#cde8c8" : "#f5d8c0",
-                                      color: complete ? "#2a6a2a" : "#a04010",
-                                    }}>
-                                      ${badge}
-                                    </span>
-                                  </div>
-                                </div>
+                <!-- ── LEFT: Folder list ── -->
+                <div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
+                  ${groups.decks.length > 0 && html`
+                    <div style=${{ ...label, marginTop:0 }}>
+                      Decks <span style=${{ color:"#b0906a", fontWeight:400 }}>· ${groups.decks.length} (excluded by default)</span>
+                    </div>
+                    ${sortedDecks.map(d => {
+                      const isGen   = d.source === "generated";
+                      const total   = cardTotal(d.cards);
+                      const open    = collectionView?.type === "deck" && collectionView.name === d.name;
+                      const inc     = deckInc[d.name];
+                      const complete = total >= 99 && total <= 100;
+                      return html`
+                        <div key=${d.name}
+                          onClick=${() => setCollectionView({ type:"deck", name:d.name })}
+                          style=${{
+                            display:"flex", alignItems:"center", gap:10,
+                            padding:"9px 11px", borderRadius:9, cursor:"pointer",
+                            background: open ? "#fff8ee" : (inc ? "#fff0e0" : "#fff"),
+                            border: open ? "2px solid #7a2e0e" : (inc ? "1px solid #c07030" : "1px solid #e0d0b0"),
+                            boxShadow: open ? "0 2px 8px rgba(122,46,14,0.18)" : "0 1px 3px rgba(0,0,0,0.04)",
+                            transition: "all .12s",
+                          }}>
+                          <span style=${{ fontSize:16, width:22, textAlign:"center", flexShrink:0 }}>
+                            ${isGen ? "🃏" : "📑"}
+                          </span>
+                          <div style=${{ flex:1, minWidth:0 }}>
+                            <div style=${{ fontSize:12, fontWeight:600, color:"#2a1000",
+                              whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>${d.name}</div>
+                            <div style=${{ fontSize:10, color:"#8a6a4a", display:"flex", gap:5, alignItems:"center", marginTop:1 }}>
+                              ${isGen && html`
                                 <span style=${{
-                                  padding:"3px 10px", borderRadius:20, fontSize:11, fontWeight:600, flexShrink:0,
-                                  background: deckInc[d.name] ? "#7a2e0e" : "#e8d8c0",
-                                  color: deckInc[d.name] ? "#fff" : "#8a6a4a",
-                                }}>
-                                  ${deckInc[d.name] ? "Included" : "Excluded"}
-                                </span>
-                                <button onClick=${e => { e.stopPropagation(); setExpanded(x => ({ ...x, [expKey]: !x[expKey] })); }}
-                                  style=${{
-                                    background:"transparent", border:"1px solid #d0b880", borderRadius:6,
-                                    padding:"3px 8px", fontSize:11, color:"#7a5a3a", cursor:"pointer",
-                                    fontFamily:"inherit", flexShrink:0,
-                                  }}>
-                                  ${isExp ? "▲ Hide" : "▼ Cards"}
-                                </button>
-                              </div>
-                              ${isExp && html`
-                                <div style=${{
-                                  background:"#fffdf8", borderTop:"1px solid #e8d8b8",
-                                  padding:"10px 14px", maxHeight:260, overflowY:"auto", fontSize:11,
-                                  color:"#3a2010", display:"grid",
-                                  gridTemplateColumns:"repeat(auto-fill, minmax(180px, 1fr))", gap:"4px 12px",
-                                }}>
-                                  ${sortedCards.map(c => html`
-                                    <div key=${c.name} style=${{ display:"flex", justifyContent:"space-between", gap:6 }}>
-                                      <span style=${{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>${c.name}</span>
-                                      <strong style=${{ color:"#7a3010", flexShrink:0 }}>×${c.qty}</strong>
-                                    </div>
-                                  `)}
-                                </div>
+                                  padding:"0 5px", borderRadius:9, fontSize:9, fontWeight:700, letterSpacing:0.3,
+                                  background:"#7a3010", color:"#fff8f0",
+                                }}>GENERATED</span>
                               `}
+                              <span>${total} cards${complete ? " · complete" : ""}</span>
                             </div>
-                          `;
-                        })}
-                      </div>`
-                  }
+                          </div>
+                          <label
+                            onClick=${e => e.stopPropagation()}
+                            style=${{
+                              display:"flex", alignItems:"center", gap:5, flexShrink:0,
+                              padding:"3px 8px", borderRadius:14, cursor:"pointer", fontSize:10, fontWeight:600,
+                              background: inc ? "#7a2e0e" : "#e8d8c0",
+                              color: inc ? "#fff" : "#8a6a4a",
+                              userSelect:"none",
+                            }}>
+                            <input type="checkbox" checked=${!!inc}
+                              onChange=${() => setDeckInc(di => ({ ...di, [d.name]: !di[d.name] }))}
+                              style=${{ margin:0 }} />
+                            ${inc ? "In pool" : "Reserved"}
+                          </label>
+                        </div>
+                      `;
+                    })}
+                  `}
+
+                  ${groups.binders.length > 0 && html`
+                    <div style=${{ ...label, marginTop: groups.decks.length > 0 ? 14 : 0 }}>
+                      Binders <span style=${{ color:"#b0906a", fontWeight:400 }}>· ${groups.binders.length} (included by default)</span>
+                    </div>
+                    ${sortedBinders.map(b => {
+                      const total = cardTotal(b.cards);
+                      const open  = collectionView?.type === "binder" && collectionView.name === b.name;
+                      const inc   = binInc[b.name];
+                      return html`
+                        <div key=${b.name}
+                          onClick=${() => setCollectionView({ type:"binder", name:b.name })}
+                          style=${{
+                            display:"flex", alignItems:"center", gap:10,
+                            padding:"9px 11px", borderRadius:9, cursor:"pointer",
+                            background: open ? "#fff8ee" : (inc ? "#fff0e0" : "#fff"),
+                            border: open ? "2px solid #7a2e0e" : (inc ? "1px solid #c07030" : "1px solid #e0d0b0"),
+                            boxShadow: open ? "0 2px 8px rgba(122,46,14,0.18)" : "0 1px 3px rgba(0,0,0,0.04)",
+                            transition: "all .12s",
+                          }}>
+                          <span style=${{ fontSize:16, width:22, textAlign:"center", flexShrink:0 }}>📦</span>
+                          <div style=${{ flex:1, minWidth:0 }}>
+                            <div style=${{ fontSize:12, fontWeight:600, color:"#2a1000",
+                              whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>${b.name}</div>
+                            <div style=${{ fontSize:10, color:"#8a6a4a" }}>${total} cards (${b.cards.length} unique)</div>
+                          </div>
+                          <label
+                            onClick=${e => e.stopPropagation()}
+                            style=${{
+                              display:"flex", alignItems:"center", gap:5, flexShrink:0,
+                              padding:"3px 8px", borderRadius:14, cursor:"pointer", fontSize:10, fontWeight:600,
+                              background: inc ? "#7a2e0e" : "#e8d8c0",
+                              color: inc ? "#fff" : "#8a6a4a",
+                              userSelect:"none",
+                            }}>
+                            <input type="checkbox" checked=${!!inc}
+                              onChange=${() => setBinInc(bi => ({ ...bi, [b.name]: !bi[b.name] }))}
+                              style=${{ margin:0 }} />
+                            ${inc ? "Included" : "Excluded"}
+                          </label>
+                        </div>
+                      `;
+                    })}
+                  `}
+
+                  ${groups.decks.length === 0 && groups.binders.length === 0 && html`
+                    <div style=${{ fontSize:12, color:"#a08868", fontStyle:"italic" }}>
+                      No decks or binders found. Import a CSV to get started.
+                    </div>
+                  `}
                 </div>
 
-                <!-- Binders column -->
-                <div>
-                  <div style=${label}>
-                    Binders ${groups.binders.length > 0 && html`<span style=${{ color:"#b0906a", fontWeight:400 }}>· ${groups.binders.length} (included by default)</span>`}
-                  </div>
-                  ${groups.binders.length === 0
-                    ? html`<div style=${{ fontSize:12, color:"#a08868", fontStyle:"italic" }}>No binders found in this CSV.</div>`
-                    : html`<div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
-                        ${sortedBinders.map(b => {
-                          const total = cardTotal(b.cards);
-                          const expKey = `binder::${b.name}`;
-                          const isExp  = !!expanded[expKey];
-                          const sortedCards = [...b.cards].sort((a,b) => a.name.localeCompare(b.name));
-                          return html`
-                            <div key=${b.name} style=${{
-                              borderRadius:10, transition:"all .15s",
-                              background: binInc[b.name] ? "#fff0e0" : "#fff",
-                              border: binInc[b.name] ? "1px solid #c07030" : "1px solid #ddd0b8",
-                              boxShadow:"0 1px 4px rgba(0,0,0,0.05)", overflow:"hidden",
-                            }}>
-                              <div onClick=${() => setBinInc(bi => ({ ...bi, [b.name]: !bi[b.name] }))}
-                                style=${{ display:"flex", alignItems:"center", gap:12, padding:"11px 14px", cursor:"pointer" }}>
-                                <span style=${{ fontSize:18, width:24, textAlign:"center", flexShrink:0 }}>
-                                  ${binInc[b.name] ? "✅" : "⬜"}
-                                </span>
-                                <div style=${{ flex:1, minWidth:0 }}>
-                                  <div style=${{ fontSize:13, fontWeight:600, color:"#2a1000",
-                                    whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>${b.name}</div>
-                                  <div style=${{ fontSize:11, color:"#8a6a4a" }}>Binder · ${total} cards (${b.cards.length} unique)</div>
-                                </div>
-                                <span style=${{
-                                  padding:"3px 10px", borderRadius:20, fontSize:11, fontWeight:600, flexShrink:0,
-                                  background: binInc[b.name] ? "#7a2e0e" : "#e8d8c0",
-                                  color: binInc[b.name] ? "#fff" : "#8a6a4a",
-                                }}>
-                                  ${binInc[b.name] ? "Included" : "Excluded"}
-                                </span>
-                                <button onClick=${e => { e.stopPropagation(); setExpanded(x => ({ ...x, [expKey]: !x[expKey] })); }}
-                                  style=${{
-                                    background:"transparent", border:"1px solid #d0b880", borderRadius:6,
-                                    padding:"3px 8px", fontSize:11, color:"#7a5a3a", cursor:"pointer",
-                                    fontFamily:"inherit", flexShrink:0,
-                                  }}>
-                                  ${isExp ? "▲ Hide" : "▼ Cards"}
-                                </button>
-                              </div>
-                              ${isExp && html`
-                                <div style=${{
-                                  background:"#fffdf8", borderTop:"1px solid #e8d8b8",
-                                  padding:"10px 14px", maxHeight:260, overflowY:"auto", fontSize:11,
-                                  color:"#3a2010", display:"grid",
-                                  gridTemplateColumns:"repeat(auto-fill, minmax(180px, 1fr))", gap:"4px 12px",
-                                }}>
-                                  ${sortedCards.map(c => html`
-                                    <div key=${c.name} style=${{ display:"flex", justifyContent:"space-between", gap:6 }}>
-                                      <span style=${{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>${c.name}</span>
-                                      <strong style=${{ color:"#7a3010", flexShrink:0 }}>×${c.qty}</strong>
-                                    </div>
-                                  `)}
-                                </div>
-                              `}
-                            </div>
-                          `;
-                        })}
-                      </div>`
+                <!-- ── RIGHT: Detail panel for the selected item ── -->
+                ${(() => {
+                  if (!collectionView) {
+                    return html`
+                      <div style=${{
+                        padding:"40px 20px", textAlign:"center",
+                        background:"#fff8ee", borderRadius:10, border:"1px dashed #d8c090",
+                        color:"#8a6a4a", fontSize:13, lineHeight:1.7,
+                      }}>
+                        ${groups.decks.length + groups.binders.length === 0
+                          ? "Import a collection CSV first."
+                          : html`<div>👈 Pick a <strong>deck</strong> or <strong>binder</strong> on the left to see its contents here.</div>`}
+                      </div>
+                    `;
                   }
-                </div>
+
+                  if (collectionView.type === "deck") {
+                    const d = groups.decks.find(x => x.name === collectionView.name);
+                    if (!d) return html`<div>Deck not found.</div>`;
+                    return html`<${DeckDetailView}
+                      deckEntry=${d}
+                      included=${!!deckInc[d.name]}
+                      onToggle=${() => setDeckInc(di => ({ ...di, [d.name]: !di[d.name] }))}
+                      sort=${collectionSort} setSort=${setCollectionSort} />`;
+                  }
+
+                  if (collectionView.type === "binder") {
+                    const b = groups.binders.find(x => x.name === collectionView.name);
+                    if (!b) return html`<div>Binder not found.</div>`;
+                    return html`<${BinderDetailView}
+                      binder=${b}
+                      included=${!!binInc[b.name]}
+                      onToggle=${() => setBinInc(bi => ({ ...bi, [b.name]: !bi[b.name] }))}
+                      sort=${collectionSort} setSort=${setCollectionSort} />`;
+                  }
+                  return null;
+                })()}
 
               </div>
 
@@ -4261,12 +4590,16 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               <div style=${{ marginBottom:18, display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
                 ${deckSaved
                   ? html`<span style=${{ fontSize:13, color:"#2a6a2a", fontWeight:600 }}>
-                      ✅ Cards removed from pool.
+                      ✅ Saved to Collection — cards reserved for this deck.
                     </span>`
-                  : html`<button onClick=${saveDeck} style=${{ ...btnSec, fontSize:12, padding:"7px 16px" }}>
-                      🗂 Remove cards from pool
-                    </button>`
-                }
+                  : html`
+                    <button onClick=${saveDeckToCollection}
+                      style=${{ ...btnSec, fontSize:12, padding:"7px 16px",
+                        borderColor:"#7a3010", color:"#7a3010" }}
+                      title="Saves the deck as a new entry under Collection → Decks, and removes its non-basic cards from the eligible pool so they aren't reused in future builds.">
+                      📦 Save deck to Collection
+                    </button>
+                  `}
               </div>
 
               <div style=${{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:22 }}>
