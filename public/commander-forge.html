@@ -2609,14 +2609,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   textTransform:"uppercase", marginBottom:2 }}>Commander Forge</div>
                 <h1 style=${{ margin:0, fontSize:22, color:"#fff8f0", fontWeight:700 }}>MTG Deck Builder</h1>
               </div>
-              ${showNav && (() => {
-                // During Select, show the in-progress selection so counts track what the user is toggling.
-                const live = phase === "select"
-                  ? computeUsable(groups, deckInc, binInc)
-                  : usable;
-                const total = live.reduce((s, c) => s + (c.qty || 1), 0);
-
-                // Sync status chip — colour-coded for at-a-glance state.
+              ${(() => {
+                // Sync chip is ALWAYS visible (even during setup) so users can see
+                // login + sync state at a glance. Card-count summary is conditional
+                // because it has no meaning before the collection's imported.
                 const cs = cloudSync;
                 let syncDot, syncLine;
                 if (cs.status === "init" || cs.status === "checking" || cs.status === "pulling") {
@@ -2639,17 +2635,30 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   syncLine = "Local only";
                 }
 
-                return html`
-                  <div style=${{ fontSize:11, color:"rgba(255,255,255,0.65)", textAlign:"right" }}>
+                // Card-count summary (only when showNav).
+                let countsBlock = null;
+                if (showNav) {
+                  const live = phase === "select"
+                    ? computeUsable(groups, deckInc, binInc)
+                    : usable;
+                  const total = live.reduce((s, c) => s + (c.qty || 1), 0);
+                  countsBlock = html`
                     <div>${total.toLocaleString()} cards (${live.length.toLocaleString()} unique)</div>
                     <div>
                       ${phase === "select"
                         ? html`<span style=${{ color:"#f0c080" }}>pending — confirm to update</span>`
                         : html`${cmdrs.length} commanders`}
                     </div>
+                  `;
+                }
+
+                return html`
+                  <div style=${{ fontSize:11, color:"rgba(255,255,255,0.65)", textAlign:"right" }}>
+                    ${countsBlock}
                     <div title=${syncLine} style=${{
                       display:"inline-flex", alignItems:"center", gap:6,
-                      marginTop:4, padding:"3px 9px", borderRadius:12,
+                      marginTop: countsBlock ? 4 : 0,
+                      padding:"3px 9px", borderRadius:12,
                       background:"rgba(0,0,0,0.18)", fontSize:10,
                     }}>
                       <span style=${{
