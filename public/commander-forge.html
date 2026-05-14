@@ -2841,9 +2841,12 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // entry.enrichedAt) so subsequent opens are instant and the cache syncs
     // via the same KV mechanism that handles all of groups.decks.
     const enrichImportedDeck = async (rawDeck) => {
-      const cmdrName = rawDeck.commanderName || "";
-      const uniq     = new Set([cmdrName, ...rawDeck.cards.map(c => c.name)].filter(Boolean));
-      const reqList  = [...uniq].map(n => ({ name: n, qty: 1, id: "" }));
+      // Manabox doesn't always include a commander flag, and Moxfield never
+      // does (its "Haves" export is a flat collection). We start with
+      // whatever's in the CSV, then auto-detect below if missing.
+      let cmdrName  = rawDeck.commanderName || "";
+      const uniq    = new Set([cmdrName, ...rawDeck.cards.map(c => c.name)].filter(Boolean));
+      const reqList = [...uniq].map(n => ({ name: n, qty: 1, id: "" }));
 
       addLog(`🔍 Looking up ${uniq.size} unique card${uniq.size === 1 ? "" : "s"} on Scryfall…`);
       const sfResults = await fetchAllScryfall(reqList,
@@ -2852,15 +2855,50 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       );
       const sfByName = new Map(sfResults.map(c => [c.name.toLowerCase(), c]));
 
+      // ── Commander auto-detection ────────────────────────────────────────
+      // If the CSV didn't tell us which card is the commander, scan the deck
+      // for legal commanders (legendary creatures + planeswalkers/cards with
+      // "can be your commander" text — using the same isCommander() helper
+      // that the Commanders list uses). Pick the most popular one by
+      // edhrec_rank as a sensible default.
+      let autoDetected = false;
+      let allCandidates = [];
+      if (!cmdrName) {
+        allCandidates = sfResults.filter(c => isCommander(c.scryfall || {}));
+        if (allCandidates.length > 0) {
+          // Sort by EDHRec popularity (lower rank = more popular). Cards
+          // without a rank go last.
+          allCandidates.sort((a, b) => {
+            const ra = a.scryfall?.edhrec_rank ?? Infinity;
+            const rb = b.scryfall?.edhrec_rank ?? Infinity;
+            return ra - rb;
+          });
+          cmdrName = allCandidates[0].name;
+          autoDetected = true;
+          if (allCandidates.length === 1) {
+            addLog(`👑 Commander auto-detected: ${cmdrName} (only legendary in the deck).`);
+          } else {
+            addLog(`👑 Commander auto-detected: ${cmdrName} ` +
+                   `(top of ${allCandidates.length} candidates by EDHRec rank).`);
+          }
+        } else {
+          addLog(`ℹ️ No commander flagged in the CSV and no legal commanders found in the deck — ` +
+                 `rendering without a commander. (You can re-export from Manabox with the "Commander" column filled in.)`);
+        }
+      }
+
       // Commander selCmd object — shape matches what loadCollectionDeck/
       // loadFromLibrary expect, so the Deck view renders correctly.
       const cmdrEnr   = sfByName.get(cmdrName.toLowerCase());
       const selCmdObj = {
         name:     cmdrName,
-        theme:    "Imported",
+        theme:    autoDetected ? "Imported (commander auto-detected)" : "Imported",
         reason:   "Imported from collection",
         strategy: "",
-        card:     cmdrEnr || { name: cmdrName, scryfall: {} },
+        card:     cmdrEnr || (cmdrName ? { name: cmdrName, scryfall: {} } : null),
+        // Save the full candidate list so we can show a picker later if the
+        // user wants to pick a different commander from the same deck.
+        commanderCandidates: allCandidates.map(c => c.name),
       };
 
       // Categorise cards by type_line so the Deck view's category-pills,
@@ -2987,9 +3025,17 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         const { selCmd: enrSel, deck: enrDeck } = await enrichImportedDeck(rawDeck);
 
         // Persist back to groups.decks so subsequent opens are instant + cloud-synced.
+        // If the commander was auto-detected (no commanderName in the CSV), also
+        // bake the detected commander name into the deck entry so it sticks.
         const updatedDecks = groups.decks.map(d =>
           d.name === rawDeck.name
-            ? { ...d, deckData: enrDeck, selCmd: enrSel, enrichedAt: Date.now() }
+            ? {
+                ...d,
+                deckData:      enrDeck,
+                selCmd:        enrSel,
+                enrichedAt:    Date.now(),
+                commanderName: d.commanderName || enrSel?.name || null,
+              }
             : d
         );
         const nextGroups = { ...groups, decks: updatedDecks };
