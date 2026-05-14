@@ -793,6 +793,67 @@
     return rows.filter(r => r.length > 1 || (r[0] && r[0].trim()));
   }
 
+  // Detect which collection-tracker emitted a given CSV by inspecting headers.
+  // Returns one of "manabox" | "moxfield" | "unknown".
+  // Heuristics:
+  //   Manabox  → has `binder type` or `binder name` columns
+  //   Moxfield → has `tradelist count` (specifically Haves export) OR
+  //              the combination of `name`+`edition`+`collector number`
+  //              with NO binder columns
+  function detectCSVFormat(text) {
+    const rows = parseCSV(text);
+    if (rows.length < 1) return "unknown";
+    const hdr = rows[0].map(h => h.toLowerCase().trim());
+    const has = name => hdr.includes(name);
+    if (has("binder type") || has("binder name") || has("binder_type")) return "manabox";
+    if (has("tradelist count")) return "moxfield";
+    // Moxfield's deck export uses Name + CMC + Type + … without "tradelist count".
+    if (has("name") && has("edition") && has("collector number") && !has("binder type")) return "moxfield";
+    return "unknown";
+  }
+
+  // Moxfield "Haves" CSV — a flat collection list with no binder/deck structure.
+  // Columns: Count, Tradelist Count, Name, Edition, Condition, Language, Foil,
+  // Tags, Last Modified, Collector Number, Alter, Proxy, Purchase Price.
+  // We collapse everything into a single virtual binder so the existing
+  // selection/enrichment flow works without changes.
+  function parseMoxfield(text) {
+    const rows = parseCSV(text);
+    const stats = { totalRows: 0, included: 0, skippedNoName: 0 };
+    if (rows.length < 2) return { decks: [], binders: [], stats };
+    const hdr = rows[0].map(h => h.toLowerCase().trim());
+    const iName = hdr.findIndex(h => h === "name");
+    const iQty  = hdr.findIndex(h => h === "count");
+    if (iName < 0) return { decks: [], binders: [], stats };
+
+    const cards = new Map();
+    for (let i = 1; i < rows.length; i++) {
+      const cols = rows[i];
+      stats.totalRows++;
+      const name = (cols[iName] || "").trim();
+      if (!name) { stats.skippedNoName++; continue; }
+      const qty = parseInt((cols[iQty] || "").trim()) || 1;
+      if (cards.has(name)) cards.get(name).qty += qty;
+      else cards.set(name, { name, qty, id: "" });   // Moxfield CSV doesn't expose Scryfall IDs
+      stats.included++;
+    }
+    const binder = {
+      name: "Moxfield Collection",
+      type: "binder",
+      cards: [...cards.values()],
+      commanderName: null,
+    };
+    return { decks: [], binders: [binder], stats };
+  }
+
+  // Dispatcher that picks the right parser based on header detection.
+  function parseCollectionCSV(text) {
+    const format = detectCSVFormat(text);
+    if (format === "moxfield") return { format, ...parseMoxfield(text) };
+    if (format === "manabox")  return { format, ...parseManabox(text) };
+    return { format: "unknown", decks: [], binders: [], stats: { totalRows: 0, included: 0, skippedNoName: 0 } };
+  }
+
   function parseManabox(text) {
     const rows = parseCSV(text);
     const stats = { totalRows: 0, included: 0, skippedNoName: 0 };
@@ -1740,15 +1801,21 @@
 
     const importCSV = () => {
       if (!csvInput.trim()) return;
-      const parsed = parseManabox(csvInput);
+      const parsed = parseCollectionCSV(csvInput);
+      if (parsed.format === "unknown") {
+        setError("Couldn't identify this CSV. Expected Manabox or Moxfield columns (e.g. Name + Quantity / Count). Headers detected: " +
+          (csvInput.split("\n")[0] || "").slice(0, 120));
+        return;
+      }
       if (!parsed.decks.length && !parsed.binders.length) {
-        setError("No cards found. Paste the full Manabox CSV export."); return;
+        const src = parsed.format === "moxfield" ? "Moxfield" : "Manabox";
+        setError(`No cards found in the ${src} CSV. Make sure you exported the full collection.`); return;
       }
       const di = {}; parsed.decks.forEach(d => { di[d.name] = false; });
       const bi = {}; parsed.binders.forEach(b => { bi[b.name] = true; });
       setGroups({ decks: parsed.decks, binders: parsed.binders });
       setDeckInc(di); setBinInc(bi);
-      setParseStats(parsed.stats);
+      setParseStats({ ...parsed.stats, format: parsed.format });
       setError(""); setCsv("");
       setPhase("select");
     };
@@ -3068,10 +3135,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             <div style=${{ maxWidth:680, margin:"0 auto" }}>
               <div style=${{ background:"#fff8f0", border:"1px solid #d8c090", borderRadius:10,
                 padding:"12px 16px", marginBottom:14, fontSize:12, color:"#5a3a1a", lineHeight:2 }}>
-                <strong style=${{ color:"#7a2e0e" }}>Export from Manabox:</strong>
-                Collection → ⋯ menu → Export → CSV → drag the file onto the box below,
-                use <em>Choose file…</em>, or paste the text. Decks and binders are
-                shown separately so you can choose what to include.
+                <strong style=${{ color:"#7a2e0e" }}>Import your collection</strong> from
+                <strong>Manabox</strong> (Collection → ⋯ → Export → CSV) or
+                <strong>Moxfield</strong> (Collection → ⋯ → Export → CSV).
+                Drag the .csv file onto the box, use <em>Choose file…</em>, or paste the text.
+                The format is auto-detected.
               </div>
 
               <!-- Drag-and-drop zone wrapping the textarea -->
@@ -3120,6 +3188,24 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 }} />
 
               ${error && html`<div style=${{ color:"#c03020", fontSize:12, marginTop:8 }}>${error}</div>`}
+
+              ${csvInput.trim().length > 80 && (() => {
+                // Live format detection — gives the user immediate feedback that
+                // the file they just dropped is something the app recognises.
+                const fmt = detectCSVFormat(csvInput);
+                const label =
+                  fmt === "manabox"  ? { txt:"✓ Manabox CSV detected",  bg:"#e6f4e6", col:"#1a6a2a", brd:"#9bc89b" }
+                : fmt === "moxfield" ? { txt:"✓ Moxfield CSV detected", bg:"#eaf3ff", col:"#1a5080", brd:"#9bbce5" }
+                :                      { txt:"⚠ Unknown CSV format — expected Manabox or Moxfield columns", bg:"#fff5e8", col:"#7a4010", brd:"#e0c890" };
+                return html`
+                  <div style=${{
+                    marginTop:8, padding:"6px 10px", borderRadius:8,
+                    background: label.bg, color: label.col, fontSize:11, fontWeight:600,
+                    border:"1px solid " + label.brd, display:"inline-block",
+                  }}>${label.txt}</div>
+                `;
+              })()}
+
               <div style=${{ marginTop:12, display:"flex", gap:10, flexWrap:"wrap", alignItems:"center" }}>
                 <button onClick=${importCSV} style=${btn}>Import & Select Sources →</button>
                 <button onClick=${() => csvFileRef.current?.click()} style=${btnSec}>📁 Choose file…</button>
@@ -3200,14 +3286,25 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 </div>
                 ${parseStats && html`
                   <div style=${{ fontSize:11, color:"#8a6a4a", marginTop:6, lineHeight:1.6 }}>
+                    ${parseStats.format && html`
+                      <span style=${{
+                        display:"inline-block", padding:"1px 8px", borderRadius:10, fontWeight:700,
+                        fontSize:10, letterSpacing:0.5, marginRight:6,
+                        background: parseStats.format === "moxfield" ? "#eaf3ff" : "#f7ecdc",
+                        color:      parseStats.format === "moxfield" ? "#1a5080" : "#7a3a10",
+                        border:"1px solid " + (parseStats.format === "moxfield" ? "#9bbce5" : "#d8b870"),
+                      }}>${parseStats.format === "moxfield" ? "MOXFIELD" : "MANABOX"}</span>
+                    `}
                     Parsed <strong>${parseStats.included.toLocaleString()}</strong> rows from your CSV
                     (${parseStats.totalRows.toLocaleString()} data rows;
                     ${parseStats.skippedNoName > 0
                       ? html`<span style=${{ color:"#b04020" }}>skipped ${parseStats.skippedNoName} with empty name</span>`
                       : html`none skipped`}).
-                    Cards with the same name in the same binder/deck are merged — total = sum of <em>quantity</em>
-                    across rows. If your Manabox export reports more, the difference is usually rows with no name
-                    or duplicate exports of the same physical card.
+                    Cards with the same name ${parseStats.format === "moxfield" ? "" : "in the same binder/deck"} are merged — total = sum of <em>quantity</em>
+                    across rows.
+                    ${parseStats.format === "moxfield"
+                      ? html` Moxfield exports the whole collection as one flat list — it appears below as a single virtual binder.`
+                      : html` If your Manabox export reports more, the difference is usually rows with no name or duplicate exports of the same physical card.`}
                   </div>
                 `}
               </div>
