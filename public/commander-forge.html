@@ -197,9 +197,10 @@
       edhrec_rank: sf.edhrec_rank,    // popularity rank on EDHRec (lower = more popular)
       // Legality + provenance — used to reject Unfinity/silver-border/emblem cards.
       border_color: sf.border_color,  // "black" | "silver" (un-set) | "gold" (promo) | "white"
-      set:          (sf.set || "").toLowerCase(),  // 3-letter set code, e.g. "unf"
-      set_name:     sf.set_name,      // full set name, e.g. "Commander 2021"
-      set_type:     sf.set_type,      // "funny" = Unfinity / Un-sets
+      set:               (sf.set || "").toLowerCase(),  // 3-letter set code, e.g. "unf"
+      set_name:          sf.set_name,      // full set name, e.g. "Commander 2021"
+      set_type:          sf.set_type,      // "funny" = Unfinity / Un-sets
+      collector_number:  sf.collector_number,  // per-printing identifier — used to push the EXACT version to Archidekt
       commander_legal: sf.legalities?.commander === "legal",
     };
     if (sf.image_uris)
@@ -2603,6 +2604,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               type_line: sf?.type_line || (isBasic ? `Basic Land — ${dc.name}` : ""),
               color_identity: sf?.color_identity || (isBasic ? basicCi : []),
               isLand: /land/i.test(sf?.type_line || (isBasic ? "Land" : "")),
+              // Specific printing — used to push the EXACT version to Archidekt
+              // instead of letting Archidekt pick its default.
+              set:              sf?.set || null,
+              collector_number: sf?.collector_number || null,
             };
           }),
         }));
@@ -2794,17 +2799,37 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         //    a) POST /api/cards/massDeckEdit/ — parses text → cards w/ internal IDs
         //    b) PATCH /api/decks/{id}/modifyCards/v2/ — persists to deck
         //    This is exactly what Archidekt's "Import Cards" UI does internally.
+        // Each entry tracks the SPECIFIC printing the user owns (set code +
+        // collector number from Scryfall) so Archidekt pulls in that exact
+        // version instead of falling back to its default printing. Cards
+        // grouped by (name, category, set, collector_number) — distinct
+        // printings of the same card stay separate.
         const tally = new Map();
         const order = [];
-        const pushCard = (name, category) => {
-          const key = `${name}|${category}`;
-          if (!tally.has(key)) { tally.set(key, 0); order.push({ name, category, key }); }
+        const pushCard = (name, category, set, cn) => {
+          const key = `${name}|${category}|${set || ""}|${cn || ""}`;
+          if (!tally.has(key)) {
+            tally.set(key, 0);
+            order.push({ name, category, set, cn, key });
+          }
           tally.set(key, tally.get(key) + 1);
         };
-        pushCard(selCmd.card.name, "Commander");
-        deck.categories.forEach(cat => cat.cards.forEach(c => pushCard(c.name, cat.name)));
+        // Commander: take its specific printing from selCmd.
+        const cmdrSF = selCmd.card?.scryfall || {};
+        pushCard(selCmd.card.name, "Commander", cmdrSF.set || null, cmdrSF.collector_number || null);
+        deck.categories.forEach(cat =>
+          cat.cards.forEach(c => pushCard(c.name, cat.name, c.set || null, c.collector_number || null))
+        );
+        // Archidekt-accepted format: "QTY Card Name (set) cn [Category]".
+        // The set+cn block is optional — Archidekt's parser falls back to
+        // the default printing when missing, so cards without a known
+        // printing still import (just with whatever Archidekt picks).
         const deckListText = order
-          .map(o => `${tally.get(o.key)} ${o.name} [${o.category}]`)
+          .map(o => {
+            const qty   = tally.get(o.key);
+            const setCn = (o.set && o.cn) ? ` (${o.set.toUpperCase()}) ${o.cn}` : "";
+            return `${qty} ${o.name}${setCn} [${o.category}]`;
+          })
           .join("\n");
 
         // Cache as clipboard fallback in case the save flow fails.
@@ -3160,14 +3185,18 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         const isBasic = BASICS.has(raw.name);
         const tl      = sf.type_line || (isBasic ? `Basic Land — ${raw.name}` : "");
         const card = {
-          name:           raw.name,
-          reason:         "",
-          img:            sf.image_uris?.small || sf.card_faces?.[0]?.image_uris?.small || BASIC_IMG[raw.name] || null,
-          mana_cost:      sf.mana_cost || sf.card_faces?.[0]?.mana_cost || "",
-          cmc:            typeof sf.cmc === "number" ? sf.cmc : 0,
-          type_line:      tl,
-          color_identity: sf.color_identity || (isBasic ? BASIC_CI[raw.name] : []) || [],
-          isLand:         /\bland\b/i.test(tl) || isBasic,
+          name:             raw.name,
+          reason:           "",
+          img:              sf.image_uris?.small || sf.card_faces?.[0]?.image_uris?.small || BASIC_IMG[raw.name] || null,
+          mana_cost:        sf.mana_cost || sf.card_faces?.[0]?.mana_cost || "",
+          cmc:              typeof sf.cmc === "number" ? sf.cmc : 0,
+          type_line:        tl,
+          color_identity:   sf.color_identity || (isBasic ? BASIC_CI[raw.name] : []) || [],
+          isLand:           /\bland\b/i.test(tl) || isBasic,
+          // Specific printing for Archidekt push (keeps user's exact version).
+          id:               sf.id || null,
+          set:              sf.set || null,
+          collector_number: sf.collector_number || null,
         };
         const cat = categorise(tl);
         for (let i = 0; i < (raw.qty || 1); i++) byCat[cat].push({ ...card });
