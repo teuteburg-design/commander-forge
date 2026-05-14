@@ -1354,6 +1354,11 @@
     });
     // Internals that don't need re-render: last pushed hash, last server lastModified, timer id.
     const syncRef = useRef({ lastPushedHash: "", lastModified: 0 });
+    // One-shot guard for the localStorage→React init effect. Without it the
+    // effect re-fires on every cloudSync.status change (e.g. "ready"→"active"
+    // after the first push) and resets `phase` back to "ready", yanking the
+    // user out of whatever screen they're on.
+    const didInitRef = useRef(false);
 
     // ── Shared-Gemini-key state ──────────────────────────────────────────
     // The host can expose a pre-paid Gemini key with a per-user daily cap so
@@ -1482,7 +1487,15 @@
     useEffect(() => {
       // ── Load + migrate AI provider configuration ────────────────────────
       // Gated on cloud sync completion so cloud data is in LS before we read it.
+      // The one-shot guard is critical: cloudSync.status transitions multiple
+      // times during a normal session (init → checking → pulling → ready →
+      // active after first push). Without the guard, every transition would
+      // re-run this effect and call setPhase("ready"/"import") — yanking the
+      // user back to Home from wherever they navigated. didInit.current
+      // ensures we hydrate React state from localStorage exactly once.
       if (cloudSync.status === "init" || cloudSync.status === "checking" || cloudSync.status === "pulling") return;
+      if (didInitRef.current) return;
+      didInitRef.current = true;
 
       const groqKey   = localStorage.getItem(LS_KEY_GROQ)   || "";
       const geminiKey = localStorage.getItem(LS_KEY_GEMINI) || "";
