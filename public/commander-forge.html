@@ -2430,7 +2430,7 @@
       setSelCmd(chosenCmd); setPhase("building"); setLog([]); setProg(0);
       // A fresh build replaces any previously-pushed-aside unsaved deck.
       setUnsavedDeck(null); setLibSaved(false); setFromSaved(false);
-      setFromCollection(false); setDeckSvd(false);
+      setFromCollection(false); setDeckSvd(false); setArchResult(null);
       addLog(`⚒️ Building deck for ${chosenCmd.name}…`);
       try {
         let allCards = enriched;
@@ -3221,14 +3221,54 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           addLog(`ℹ️ Couldn't fetch deck insights: ${(e?.message || e).toString().slice(0, 120)}.`);
         }
 
-        setArchResult({
-          kind: "ok",
+        const msg = skipped > 0
+          ? `Deck created with ${total - skipped}/${total} cards (${skipped} couldn't be matched — see build log).`
+          : `Deck created with all ${total} cards.`;
+
+        // Persist push info onto the deck object itself so it survives page
+        // refreshes and travels with the deck across devices (via cloud sync
+        // of groups.decks / library entries). The Insights panel re-hydrates
+        // from deck.archidekt whenever the deck is reopened later.
+        const archInfo = {
+          deckId,
           url,
-          msg: skipped > 0
-            ? `Deck created with ${total - skipped}/${total} cards (${skipped} couldn't be matched — see build log).`
-            : `Deck created with all ${total} cards.`,
           insights,
+          pushedAt: Date.now(),
+          msg,
+        };
+        setDeck(d => d ? { ...d, archidekt: archInfo } : d);
+
+        // If this deck is already saved to the Collection (source="generated"
+        // with deckData living in groups.decks), update the persisted entry
+        // too so reopening from Library/Collection shows the panel.
+        if (selCmd?.card?.name) {
+          const updated = groups.decks.map(de => {
+            if (de.deckData === deck) {
+              return { ...de, deckData: { ...de.deckData, archidekt: archInfo } };
+            }
+            return de;
+          });
+          if (updated.some((u, i) => u !== groups.decks[i])) {
+            const nextGroups = { ...groups, decks: updated };
+            setGroups(nextGroups);
+            localStorage.setItem(LS_BINDERS, JSON.stringify({
+              groups: nextGroups, deckInc, binInc,
+            }));
+          }
+        }
+        // And if this deck is in the Library, update that entry too.
+        const updatedLib = library.map(le => {
+          if (le.deck === deck) {
+            return { ...le, deck: { ...le.deck, archidekt: archInfo } };
+          }
+          return le;
         });
+        if (updatedLib.some((u, i) => u !== library[i])) {
+          setLibrary(updatedLib);
+          localStorage.setItem(LS_LIBRARY, JSON.stringify(updatedLib));
+        }
+
+        setArchResult({ kind: "ok", url, msg, insights });
         window.open(url, "_blank");
       } catch (e) {
         // Any other failure — clipboard fallback so the user can finish manually.
@@ -3369,6 +3409,22 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       localStorage.setItem(LS_LIBRARY, JSON.stringify(updated));
     };
 
+    // Re-hydrate the Insights panel from a deck's persisted archidekt info,
+    // if any. Called by every deck-opener (library / collection / imported).
+    const restoreArchResult = (deckObj) => {
+      const a = deckObj?.archidekt;
+      if (a && a.url) {
+        setArchResult({
+          kind:     "ok",
+          url:      a.url,
+          msg:      a.msg || "Previously pushed to Archidekt.",
+          insights: a.insights || null,
+        });
+      } else {
+        setArchResult(null);
+      }
+    };
+
     const loadFromLibrary = entry => {
       // Preserve the user's in-progress built deck if there is one — opening
       // a saved deck shouldn't silently lose unsaved work. We restore it via
@@ -3382,6 +3438,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setLibSaved(true);   // already saved — no need to offer again
       setDeckSvd(false);
       setError("");
+      restoreArchResult(entry.deck);
       setPhase("deck");
     };
 
@@ -3617,6 +3674,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         setLibSaved(true);
         setDeckSvd(true);
         setError("");
+        restoreArchResult(rawDeck.deckData);
         setPhase("deck");
         return;
       }
@@ -3660,6 +3718,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         setFromCollection(returnTo === "collection");
         setLibSaved(true);
         setDeckSvd(true);
+        restoreArchResult(enrDeck);
         setPhase("deck");
       } catch (e) {
         setError(`Couldn't enrich deck: ${e?.message || e}`);
@@ -3685,6 +3744,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setLibSaved(false);    // collection-saved decks aren't necessarily in Library
       setDeckSvd(true);      // already in Collection — hide that button
       setError("");
+      restoreArchResult(d.deckData);
       setPhase("deck");
     };
 
