@@ -2832,6 +2832,78 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setPhase("deck");
     };
 
+    // Open an imported Manabox/Moxfield deck in the Deck view. Imported decks
+    // are flat card lists with no Scryfall enrichment of their own, so we
+    // synthesize a deck object on the fly:
+    //   - Commander: looked up in `enriched` for its Scryfall record. If the
+    //     enrichment hasn't run yet for this collection, the commander card
+    //     renders with name-only (no art) — still navigable.
+    //   - Categories: one synthetic "Cards" category with all 99 mainboard
+    //     entries, enriched from `enriched` for per-card image/cmc/type so
+    //     the mana curve and type breakdown still work.
+    // Back button returns to Library (we're opening from there).
+    const openImportedDeck = (rawDeck, returnTo = "library") => {
+      const enrichMap = new Map();
+      enriched.forEach(c => enrichMap.set(c.name.toLowerCase(), c));
+
+      const cmdrName  = rawDeck.commanderName || rawDeck.cards?.[0]?.name || "Commander";
+      const cmdrEnr   = enrichMap.get(cmdrName.toLowerCase());
+      const selCmdObj = {
+        name:    cmdrName,
+        theme:   "Imported deck",
+        reason:  "",
+        strategy:"",
+        card:    cmdrEnr || { name: cmdrName, scryfall: {} },
+      };
+
+      // Build per-card rendering objects (mirrors the post-mapping shape
+      // from buildDeck so the Deck view's existing renderer just works).
+      const BASICS = new Set(["Plains","Island","Swamp","Mountain","Forest","Wastes"]);
+      const enrichedCards = (rawDeck.cards || [])
+        .filter(c => c.name !== cmdrName)   // commander is in command zone, not mainboard
+        .flatMap(c => {
+          const e  = enrichMap.get(c.name.toLowerCase());
+          const sf = e?.scryfall;
+          const isBasic = BASICS.has(c.name);
+          const tl = sf?.type_line || (isBasic ? `Basic Land — ${c.name}` : "");
+          const card = {
+            name:           c.name,
+            reason:         "",
+            img:            sf?.image_uris?.small || sf?.card_faces?.[0]?.image_uris?.small || BASIC_IMG[c.name] || null,
+            mana_cost:      sf?.mana_cost || sf?.card_faces?.[0]?.mana_cost || "",
+            cmc:            typeof sf?.cmc === "number" ? sf.cmc : 0,
+            type_line:      tl,
+            color_identity: sf?.color_identity ||
+                            ({ Plains:["W"], Island:["U"], Swamp:["B"], Mountain:["R"], Forest:["G"], Wastes:[] }[c.name] || []),
+            isLand:         /land/i.test(tl),
+          };
+          // Repeat the entry for each copy (basics typically have qty > 1).
+          return Array.from({ length: c.qty || 1 }, () => ({ ...card }));
+        });
+
+      const totalCards = enrichedCards.length;
+      const syntheticDeck = {
+        theme:       rawDeck.name,
+        description: `Imported deck · ${totalCards} cards` +
+                    (totalCards < 99 ? ` (only ${totalCards} mainboard cards exported — full deck would be 99 + commander).` : "."),
+        warnings:    [],
+        categories:  [{ name: "Cards", cards: enrichedCards }],
+      };
+
+      // Preserve unsaved built deck (same as loadFromLibrary).
+      if (!fromSaved && !fromCollection && deck && selCmd) {
+        setUnsavedDeck({ deck, selCmd });
+      }
+      setSelCmd(selCmdObj);
+      setDeck(syntheticDeck);
+      setFromSaved(returnTo === "library");
+      setFromCollection(returnTo === "collection");
+      setLibSaved(true);    // not actionable for imported decks
+      setDeckSvd(true);     // not actionable for imported decks
+      setError("");
+      setPhase("deck");
+    };
+
     // Open a saved-to-collection deck in the full Deck view (the same one used
     // for freshly-built decks and Library entries). Generated decks carry both
     // `selCmd` and `deckData`, so we can reconstruct the view identically.
@@ -2968,22 +3040,20 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               })()}
             </div>
             ${showNav && html`
+              <!-- Top-level nav: 4 destinations.  Commanders / AI Suggest /
+                   Deck used to live here but are now sub-views of Home,
+                   reachable via the contextual sub-nav rendered below. -->
               <div style=${{ display:"flex", gap:0, marginTop:10, flexWrap:"wrap" }}>
                 ${[
-                  { label:"🏠 Home",        active: phase==="ready",
+                  // "Home" is active for any phase that ISN'T a top-level
+                  // destination — pick/deck/building all show inside Home.
+                  { label:"🏠 Home",
+                    active: ["ready", "pick", "deck", "building", "analyzing", "loading_cmdr"].includes(phase),
                     onClick: resetHome },
-                  { label:"📋 Collection",  active: phase==="select"||phase==="import",
+                  { label:"📋 Collection",
+                    active: phase==="select"||phase==="import",
                     onClick: navToCollection },
-                  { label:"👑 Commanders",  active: phase==="ready" && activeTab==="commanders",
-                    onClick: () => { setPhase("ready"); setTab("commanders"); },
-                    disabled: cmdrs.length === 0 },
-                  { label:"⚔️ AI Suggest",  active: phase==="pick",
-                    onClick: () => cands.length && setPhase("pick"),
-                    disabled: cands.length === 0 },
-                  { label:"🃏 Deck",        active: phase==="deck",
-                    onClick: () => deck && setPhase("deck"),
-                    disabled: !deck },
-                  { label:`📚 Library${library.length > 0 ? " ("+library.length+")" : ""}`,
+                  { label:`📚 Library${(library.length + (groups.decks?.length || 0)) > 0 ? " ("+(library.length + (groups.decks?.length || 0))+")" : ""}`,
                     active: phase==="saved_list",
                     onClick: () => setPhase("saved_list") },
                   { label:"⚙ Settings",    active: phase==="setup",
@@ -2995,7 +3065,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       border:"none", borderBottom: item.active ? "3px solid #f0c080" : "3px solid transparent",
                       color: item.disabled ? "rgba(255,255,255,0.25)"
                         : item.active ? "#f0d080" : "rgba(255,255,255,0.72)",
-                      borderRadius:"4px 4px 0 0", padding:"7px 14px", fontSize:12,
+                      borderRadius:"4px 4px 0 0", padding:"7px 14px", fontSize:13, fontWeight:600,
                       fontFamily:"inherit", cursor: item.disabled ? "default" : "pointer",
                       marginBottom:"-1px", transition:"all .15s",
                     }}>
@@ -3003,6 +3073,46 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   </button>
                 `)}
               </div>
+
+              <!-- Contextual sub-nav for Home: the deck-building flow lives
+                   here. Visible only while you're inside Home (any phase
+                   that's part of the build flow). The sub-items navigate
+                   between Commanders list, AI Suggestions, and the Deck
+                   view without leaving Home. -->
+              ${["ready", "pick", "deck", "building", "analyzing", "loading_cmdr"].includes(phase) && html`
+                <div style=${{
+                  display:"flex", gap:0, marginTop:6, paddingLeft:6, flexWrap:"wrap",
+                  borderTop:"1px solid rgba(255,255,255,0.08)",
+                }}>
+                  ${[
+                    { label:"👑 Commanders",
+                      active: phase==="ready" && activeTab==="commanders",
+                      onClick: () => { setPhase("ready"); setTab("commanders"); },
+                      disabled: cmdrs.length === 0 },
+                    { label:"⚔️ AI Suggest",
+                      active: phase==="pick",
+                      onClick: () => cands.length && setPhase("pick"),
+                      disabled: cands.length === 0 },
+                    { label:"🃏 Deck",
+                      active: phase==="deck",
+                      onClick: () => deck && setPhase("deck"),
+                      disabled: !deck },
+                  ].map(item => html`
+                    <button key=${item.label} disabled=${!!item.disabled} onClick=${item.onClick}
+                      style=${{
+                        background: item.active ? "rgba(0,0,0,0.18)" : "transparent",
+                        border:"none", borderBottom: item.active ? "2px solid #f0c080" : "2px solid transparent",
+                        color: item.disabled ? "rgba(255,255,255,0.22)"
+                          : item.active ? "#f0d080" : "rgba(255,255,255,0.55)",
+                        borderRadius:"4px 4px 0 0", padding:"6px 12px", fontSize:11,
+                        fontFamily:"inherit", cursor: item.disabled ? "default" : "pointer",
+                        marginBottom:"-1px", transition:"all .15s",
+                      }}>
+                      ${item.label}
+                    </button>
+                  `)}
+                </div>
+              `}
             `}
           </div>
         </div>
@@ -4618,15 +4728,34 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           `}
 
           <!-- ── SAVED LIBRARY ────────────────────────────────────────── -->
-          ${phase === "saved_list" && html`
+          ${phase === "saved_list" && (() => {
+            // Library shows EVERY deck the user has access to:
+            //   - kind="library"       : AI-built decks the user clicked "Save to Library"
+            //   - kind="collection-gen": AI-built decks the user clicked "Save to Collection"
+            //                            (also lives in groups.decks with full Scryfall data)
+            //   - kind="collection-imported": Decks from Manabox/Moxfield CSV import
+            //                            (no Scryfall — lookup at open time via `enriched`).
+            // Sorted newest-first; imported decks (no savedAt) sink to the bottom.
+            const libraryDecks   = library.map(e => ({ kind:"library", entry:e, savedAt:e.savedAt||0 }));
+            const collectionGen  = (groups.decks || [])
+              .filter(d => d.source === "generated")
+              .map(d => ({ kind:"collection-gen", entry:d, savedAt:d.savedAt||0 }));
+            const collectionImp  = (groups.decks || [])
+              .filter(d => d.source !== "generated")
+              .map(d => ({ kind:"collection-imported", entry:d, savedAt:0 }));
+            const unifiedDecks   = [...libraryDecks, ...collectionGen, ...collectionImp]
+              .sort((a, b) => b.savedAt - a.savedAt);
+            return html`
             <div>
               <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:22 }}>
                 <div>
                   <h2 style=${{ fontSize:18, color:"#3a1a00", margin:"0 0 4px" }}>📚 Deck Library</h2>
                   <p style=${{ fontSize:13, color:"#7a5a3a" }}>
-                    ${library.length === 0
-                      ? "No decks saved yet — build a deck and click \"Save to Library\"."
-                      : `${library.length} saved deck${library.length > 1 ? "s" : ""}. Click any to view.`}
+                    ${unifiedDecks.length === 0
+                      ? "No decks yet — build one, or import a Manabox / Moxfield CSV with deck data."
+                      : `${unifiedDecks.length} deck${unifiedDecks.length > 1 ? "s" : ""}. ` +
+                        `(${libraryDecks.length} saved · ${collectionGen.length} from Collection · ${collectionImp.length} imported.) ` +
+                        "Click any to view."}
                   </p>
                 </div>
               </div>
@@ -4649,47 +4778,120 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 </div>
               `}
 
-              ${library.length > 0 && html`
+              ${unifiedDecks.length > 0 && html`
                 <div style=${{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(340px, 1fr))", gap:16 }}>
-                  ${library.map(entry => {
-                    const sf   = entry.selCmd?.card?.scryfall || {};
-                    const img  = sf.image_uris?.normal || sf.card_faces?.[0]?.image_uris?.normal;
-                    const ci   = sf.color_identity || [];
-                    const total = entry.deck?.categories?.reduce((s, c) => s + c.cards.length, 0) ?? 0;
-                    const lands = entry.deck?.categories?.flatMap(c => c.cards).filter(c => c.isLand).length ?? 0;
-                    const date  = new Date(entry.savedAt).toLocaleDateString(undefined, { year:"numeric", month:"short", day:"numeric" });
-                    const allCards = entry.deck?.categories?.flatMap(c => c.cards) ?? [];
-                    const nonLand  = allCards.filter(c => !c.isLand);
-                    const buckets  = [0,0,0,0,0,0,0,0];
-                    nonLand.forEach(c => { const n = Math.min(Math.max(0,Math.floor(c.cmc||0)),7); buckets[n]++; });
+                  ${unifiedDecks.map(({ kind, entry, savedAt }, idx) => {
+                    // ── Normalise per kind so the render code can stay flat ──
+                    const isLibrary  = kind === "library";
+                    const isGen      = kind === "collection-gen";
+                    const isImported = kind === "collection-imported";
+
+                    // selCmd + deckData: library and gen-collection always have
+                    // them. Imported decks fall back to lookup in `enriched`.
+                    const selCmdHere = isImported
+                      ? null
+                      : (isLibrary ? entry.selCmd : entry.selCmd);
+                    const deckDataHere = isImported
+                      ? null
+                      : (isLibrary ? entry.deck : entry.deckData);
+
+                    // For imported decks: look up commander in enriched (best-effort).
+                    let importedCmdr = null;
+                    if (isImported && entry.commanderName) {
+                      importedCmdr = enriched.find(c =>
+                        c.name.toLowerCase() === entry.commanderName.toLowerCase()
+                      );
+                    }
+                    const sf = isImported
+                      ? (importedCmdr?.scryfall || {})
+                      : (selCmdHere?.card?.scryfall || {});
+                    const img = sf.image_uris?.normal || sf.card_faces?.[0]?.image_uris?.normal;
+                    const ci  = sf.color_identity || [];
+
+                    // Card totals + mana-curve buckets.
+                    let total, lands, nonLand, buckets;
+                    if (isImported) {
+                      total = (entry.cards || []).reduce((s, c) => s + (c.qty || 1), 0);
+                      lands = 0;        // unknown without enrichment
+                      nonLand = [];
+                      buckets = [0,0,0,0,0,0,0,0];
+                    } else {
+                      total = deckDataHere?.categories?.reduce((s, c) => s + c.cards.length, 0) ?? 0;
+                      lands = deckDataHere?.categories?.flatMap(c => c.cards).filter(c => c.isLand).length ?? 0;
+                      nonLand = (deckDataHere?.categories?.flatMap(c => c.cards) ?? []).filter(c => !c.isLand);
+                      buckets = [0,0,0,0,0,0,0,0];
+                      nonLand.forEach(c => { const n = Math.min(Math.max(0,Math.floor(c.cmc||0)),7); buckets[n]++; });
+                    }
                     const maxB = Math.max(1, ...buckets);
 
-                    return html`
-                      <div key=${entry.id} class="card" style=${{ position:"relative", overflow:"hidden" }}>
+                    const date = savedAt
+                      ? new Date(savedAt).toLocaleDateString(undefined, { year:"numeric", month:"short", day:"numeric" })
+                      : null;
 
-                        <!-- Delete button -->
-                        <button onClick=${e => { e.stopPropagation(); deleteFromLibrary(entry.id); }}
-                          title="Remove from library"
-                          style=${{
-                            position:"absolute", top:10, right:10, zIndex:2,
-                            background:"transparent", border:"none", cursor:"pointer",
-                            fontSize:16, color:"#c09070", lineHeight:1, padding:4,
-                          }}
-                          onMouseOver=${e => { e.currentTarget.style.color="#a03010"; }}
-                          onMouseOut=${e  => { e.currentTarget.style.color="#c09070"; }}>✕</button>
+                    // Click handler dispatches to the right opener per kind.
+                    const onOpen = () => {
+                      if (isLibrary)  return loadFromLibrary(entry);
+                      if (isGen)      return loadCollectionDeck(entry);
+                      if (isImported) return openImportedDeck(entry, "library");
+                    };
+
+                    // Top-right badge identifying the source.
+                    const badge = isLibrary  ? { txt:"💾 LIBRARY",   bg:"#cde8c8", col:"#1a5a2a" }
+                                : isGen      ? { txt:"🃏 FORGE",     bg:"#f5d8c0", col:"#7a2e0e" }
+                                :              { txt:"📦 IMPORTED",  bg:"#dee9f4", col:"#1a4a7a" };
+
+                    const cmdrLabel = isImported
+                      ? (entry.commanderName || "(no commander)")
+                      : (selCmdHere?.card?.name || "");
+                    const titleLabel = isLibrary
+                      ? (entry.deck?.theme || cmdrLabel)
+                      : entry.name;
+
+                    return html`
+                      <div key=${kind + ":" + (entry.id || entry.name || idx)} class="card" style=${{ position:"relative", overflow:"hidden" }}>
+
+                        <!-- Source badge -->
+                        <div style=${{
+                          position:"absolute", top:10, right: isLibrary ? 36 : 12, zIndex:1,
+                          padding:"2px 8px", borderRadius:10, fontSize:9, fontWeight:700, letterSpacing:0.5,
+                          background: badge.bg, color: badge.col,
+                        }}>${badge.txt}</div>
+
+                        ${isLibrary && html`
+                          <button onClick=${e => { e.stopPropagation(); deleteFromLibrary(entry.id); }}
+                            title="Remove from library"
+                            style=${{
+                              position:"absolute", top:10, right:10, zIndex:2,
+                              background:"transparent", border:"none", cursor:"pointer",
+                              fontSize:16, color:"#c09070", lineHeight:1, padding:4,
+                            }}
+                            onMouseOver=${e => { e.currentTarget.style.color="#a03010"; }}
+                            onMouseOut=${e  => { e.currentTarget.style.color="#c09070"; }}>✕</button>
+                        `}
 
                         <!-- Commander row -->
-                        <div style=${{ display:"flex", gap:12, marginBottom:12, cursor:"pointer" }}
-                          onClick=${() => loadFromLibrary(entry)}>
-                          ${img && html`<img src=${img} alt=${entry.selCmd?.card?.name}
-                            style=${{ width:80, borderRadius:8, flexShrink:0,
-                              boxShadow:"0 2px 10px rgba(0,0,0,0.18)" }} />`}
+                        <div style=${{ display:"flex", gap:12, marginBottom:12, cursor:"pointer", marginTop:12 }}
+                          onClick=${onOpen}>
+                          ${img
+                            ? html`<img src=${img} alt=${cmdrLabel}
+                                style=${{ width:80, borderRadius:8, flexShrink:0,
+                                  boxShadow:"0 2px 10px rgba(0,0,0,0.18)" }} />`
+                            : html`<div style=${{
+                                width:80, height:112, borderRadius:8, flexShrink:0,
+                                background:"#f0e4d0", border:"1px solid #d8c090",
+                                display:"flex", alignItems:"center", justifyContent:"center",
+                                fontSize:24, color:"#a08868",
+                              }}>${isImported ? "📦" : "🃏"}</div>`}
                           <div style=${{ flex:1, minWidth:0 }}>
                             <div style=${{ fontSize:9, letterSpacing:3, color:"#8a5010",
-                              textTransform:"uppercase", fontWeight:700, marginBottom:3 }}>Commander</div>
-                            <div style=${{ fontSize:15, fontWeight:700, color:"#3a1a00",
-                              lineHeight:1.3, marginBottom:4 }}>
-                              ${entry.selCmd?.card?.name}
+                              textTransform:"uppercase", fontWeight:700, marginBottom:3 }}>
+                              ${isImported ? "Imported Deck" : "Commander"}
+                            </div>
+                            <div style=${{ fontSize:14, fontWeight:700, color:"#3a1a00",
+                              lineHeight:1.3, marginBottom:4,
+                              whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+                              paddingRight: isLibrary ? 0 : 60 }}>
+                              ${isImported ? titleLabel : cmdrLabel}
                             </div>
                             <div style=${{ display:"flex", gap:4, flexWrap:"wrap", alignItems:"center", marginBottom:5 }}>
                               ${ci.map(c => html`<${Pip} key=${c} c=${c} />`)}
@@ -4699,51 +4901,70 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                   fontFamily:"monospace" }}>${sf.mana_cost}</span>
                               `}
                             </div>
-                            <div style=${{ fontSize:11, color:"#5a2a08", fontStyle:"italic", marginBottom:3 }}>
-                              ${entry.deck?.theme}
-                            </div>
+                            ${!isImported && html`
+                              <div style=${{ fontSize:11, color:"#5a2a08", fontStyle:"italic", marginBottom:3 }}>
+                                ${isLibrary ? (entry.deck?.theme || "") : (entry.deckData?.theme || entry.name)}
+                              </div>
+                            `}
+                            ${isImported && entry.commanderName && html`
+                              <div style=${{ fontSize:11, color:"#5a2a08", fontStyle:"italic", marginBottom:3 }}>
+                                Commander: ${entry.commanderName}
+                              </div>
+                            `}
                             <div style=${{ fontSize:11, color:"#9a7a5a" }}>
-                              ${total} cards · ${lands} lands · Saved ${date}
+                              ${total} cards${!isImported ? ` · ${lands} lands` : ""}${date ? " · " + date : ""}
                             </div>
                           </div>
                         </div>
 
-                        <!-- Mini mana curve -->
-                        <div style=${{ borderTop:"1px solid #e8d8b8", paddingTop:10 }}>
-                          <div style=${{ fontSize:9, letterSpacing:2, color:"#8a5010",
-                            textTransform:"uppercase", fontWeight:700, marginBottom:6 }}>Mana Curve</div>
-                          <div style=${{ display:"flex", gap:4, alignItems:"flex-end", height:48 }}>
-                            ${buckets.map((n, i) => html`
-                              <div key=${i} style=${{ flex:1, display:"flex", flexDirection:"column",
-                                alignItems:"center", gap:2 }}>
-                                <div style=${{ fontSize:9, color:"#5a3a1a",
-                                  visibility: n > 0 ? "visible" : "hidden" }}>${n}</div>
-                                <div style=${{
-                                  width:"100%",
-                                  height: `${Math.round((n / maxB) * 36)}px`,
-                                  minHeight: n > 0 ? 3 : 0,
-                                  borderRadius:"3px 3px 0 0",
-                                  background:"linear-gradient(180deg,#c05020,#7a2e0e)",
-                                }}></div>
-                                <div style=${{ fontSize:9, color:"#9a7a5a" }}>${i < 7 ? i : "7+"}</div>
-                              </div>
+                        ${!isImported && html`
+                          <!-- Mini mana curve (only available for decks with enriched data) -->
+                          <div style=${{ borderTop:"1px solid #e8d8b8", paddingTop:10 }}>
+                            <div style=${{ fontSize:9, letterSpacing:2, color:"#8a5010",
+                              textTransform:"uppercase", fontWeight:700, marginBottom:6 }}>Mana Curve</div>
+                            <div style=${{ display:"flex", gap:4, alignItems:"flex-end", height:48 }}>
+                              ${buckets.map((n, i) => html`
+                                <div key=${i} style=${{ flex:1, display:"flex", flexDirection:"column",
+                                  alignItems:"center", gap:2 }}>
+                                  <div style=${{ fontSize:9, color:"#5a3a1a",
+                                    visibility: n > 0 ? "visible" : "hidden" }}>${n}</div>
+                                  <div style=${{
+                                    width:"100%",
+                                    height: `${Math.round((n / maxB) * 36)}px`,
+                                    minHeight: n > 0 ? 3 : 0,
+                                    borderRadius:"3px 3px 0 0",
+                                    background:"linear-gradient(180deg,#c05020,#7a2e0e)",
+                                  }}></div>
+                                  <div style=${{ fontSize:9, color:"#9a7a5a" }}>${i < 7 ? i : "7+"}</div>
+                                </div>
+                              `)}
+                            </div>
+                          </div>
+
+                          <!-- Category chip list -->
+                          <div style=${{ display:"flex", gap:5, flexWrap:"wrap", marginTop:10 }}>
+                            ${((isLibrary ? entry.deck?.categories : entry.deckData?.categories) || []).map(cat => html`
+                              <span key=${cat.name} style=${{
+                                fontSize:10, padding:"2px 8px", borderRadius:10,
+                                background:"#f0e4d0", color:"#6a3a10",
+                                border:"1px solid #d8c0a0",
+                              }}>${cat.name} ${cat.cards.length}</span>
                             `)}
                           </div>
-                        </div>
+                        `}
 
-                        <!-- Category chip list -->
-                        <div style=${{ display:"flex", gap:5, flexWrap:"wrap", marginTop:10 }}>
-                          ${(entry.deck?.categories ?? []).map(cat => html`
-                            <span key=${cat.name} style=${{
-                              fontSize:10, padding:"2px 8px", borderRadius:10,
-                              background:"#f0e4d0", color:"#6a3a10",
-                              border:"1px solid #d8c0a0",
-                            }}>${cat.name} ${cat.cards.length}</span>
-                          `)}
-                        </div>
+                        ${isImported && html`
+                          <!-- Imported decks have no mana curve; show a brief hint -->
+                          <div style=${{
+                            borderTop:"1px solid #e8d8b8", paddingTop:10, marginTop:4,
+                            fontSize:11, color:"#7a5a3a", lineHeight:1.6, fontStyle:"italic",
+                          }}>
+                            Imported decks don't have AI-generated category breakdowns or reasons.
+                            Click to view the card list with Scryfall enrichment.
+                          </div>
+                        `}
 
-                        <!-- View button -->
-                        <button onClick=${() => loadFromLibrary(entry)}
+                        <button onClick=${onOpen}
                           style=${{ ...btn, width:"100%", marginTop:12, padding:"9px", fontSize:12 }}>
                           View Full Deck →
                         </button>
@@ -4753,7 +4974,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 </div>
               `}
             </div>
-          `}
+          `;
+          })()}
 
           <!-- ── ERROR ─────────────────────────────────────────────────── -->
           ${phase === "error" && html`
