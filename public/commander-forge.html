@@ -1617,11 +1617,11 @@
       const gemK  = (aki.gemini || "").trim();
       const groqOK = groqK.length >= 20;
       const gemOK  = gemK.length  >= 20;
-      const sharedAvailable = sharedQuota.hasHostKey && useSharedGemini;
-      // Need at least ONE path to make AI calls: own Groq key, own Gemini key,
-      // or the shared host Gemini key (enabled + quota remaining).
-      if (!groqOK && !gemOK && !sharedAvailable) {
-        setError("Add at least one API key, or enable the shared host key (if available) to continue.");
+      // In freeAIMode the user has explicitly opted into the host's shared
+      // Gemini key — no own key required to proceed.
+      const inFreeAIMode = useSharedGemini && sharedQuota.hasHostKey;
+      if (!inFreeAIMode && !groqOK && !gemOK) {
+        setError("Add at least one API key, or toggle on \"Use the free AI\" to continue.");
         return;
       }
       // Persist whichever keys are present; clear blanks.
@@ -1654,26 +1654,25 @@
       else setPhase("import");
     };
 
-    // Is the shared-Gemini path effectively available for this user right now?
-    //   - Host key is exposed (sharedQuota.hasHostKey)
-    //   - User has opted in (useSharedGemini)
-    //   - User hasn't burned their daily cap
-    const sharedGeminiUsable = (
-      sharedQuota.hasHostKey &&
-      useSharedGemini &&
-      sharedQuota.remaining > 0
-    );
+    // Two mutually-exclusive modes, picked by the user via the "Use free AI"
+    // toggle in Settings:
+    //   freeAIMode    → ONLY the host's shared Gemini key is usable; ignore
+    //                   anything the user might have pasted in the provider
+    //                   panels (they were hidden anyway).
+    //   ownKeysMode   → ONLY the user's own keys are tried; shared is OFF.
+    // This matches the simplified UX where the panels are visibly hidden
+    // when "Use free AI" is on, so it would be confusing if Groq/Gemini own
+    // keys still silently fired in the background.
+    const freeAIMode       = useSharedGemini && sharedQuota.hasHostKey;
+    const sharedGeminiUsable = freeAIMode && sharedQuota.remaining > 0;
 
-    // Compute the provider order (primary first, other after, only those with
-    // a key configured — or, for Gemini, the shared-host-key path).
     const aiUsableProviders = (exclude = []) => {
+      if (freeAIMode) {
+        return sharedGeminiUsable && !exclude.includes("gemini") ? ["gemini"] : [];
+      }
       const all = ["groq", "gemini"];
       const order = [provider, ...all.filter(p => p !== provider)];
-      return order.filter(p => {
-        if (exclude.includes(p)) return false;
-        if (p === "gemini") return !!apiKeys.gemini || sharedGeminiUsable;
-        return !!apiKeys[p];
-      });
+      return order.filter(p => !exclude.includes(p) && !!apiKeys[p]);
     };
 
     // Per-provider max_tokens caps. Callers ask for an upper bound (e.g. 16384
@@ -1687,25 +1686,20 @@
     const PROVIDER_MAX_TOKENS = { groq: 7000, gemini: 16384 };
 
     // Run a prompt on a single, specific provider. Throws on API failure.
-    // Used by callAI (which adds rotation on failure) and by buildDeck's
-    // multi-provider retry loop (which rotates on PARSE failure too).
-    //
-    // For Gemini specifically: if the user has NO Gemini key of their own but
-    // has opted into the shared host key (and has quota left), route through
-    // /api/ai/gemini instead of hitting Google directly.
+    // In freeAIMode the only allowed provider is Gemini-via-shared (own keys
+    // are ignored). In ownKeysMode the user's own key is used directly.
     const callAIOn = async (p, userText, systemText, maxTokens) => {
       const cap = PROVIDER_MAX_TOKENS[p] || maxTokens;
       const max = Math.min(maxTokens, cap);
       const mdl = models[p] || PROVIDERS[p].models[0].id;
 
-      if (p === "gemini" && !apiKeys.gemini && sharedGeminiUsable) {
+      if (freeAIMode && p === "gemini") {
         const result = await callSharedGemini("", mdl, userText, systemText, max);
-        // Update local quota mirror so the UI reflects the new total without
-        // round-tripping /api/quota.
+        // Mirror server quota into local state so the UI updates immediately.
         if (typeof result.quotaRemaining === "number") {
           setSharedQuota(s => ({
             ...s,
-            used: result.quotaUsed ?? s.used + 1,
+            used:      result.quotaUsed ?? s.used + 1,
             remaining: result.quotaRemaining,
           }));
         }
@@ -2836,31 +2830,63 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           ${phase === "setup" && html`
             <div style=${{ maxWidth:560, margin:"0 auto" }}>
               <div class="card">
-                <div style=${label}>AI Providers</div>
-                <p style=${{ fontSize:12, color:"#6a4a2a", lineHeight:1.7, marginBottom:14 }}>
-                  Add keys for either or both providers. With both keys saved,
-                  <strong style=${{ color:"#7a2e0e" }}>automatic fallback</strong> kicks in
-                  when one is rate-limited or unavailable. The
-                  <strong>primary</strong> is tried first.
-                </p>
+                <div style=${label}>AI</div>
 
-                ${(() => {
-                  const groqOK = (apiKeys.groq   || "").length >= 20;
-                  const gemOK  = (apiKeys.gemini || "").length >= 20;
-                  const status =
-                    groqOK && gemOK ? { txt:"✓ Both providers configured — automatic fallback enabled.", col:"#1a6a2a", bg:"#e6f4e6" }
-                  : groqOK || gemOK ? { txt:"⚠️ Only one provider configured — add a second key to enable automatic fallback.", col:"#7a4010", bg:"#fff5e8" }
-                  :                   { txt:"Add at least one provider key to continue.", col:"#5a3a1a", bg:"#faf5ee" };
-                  return html`
-                    <div style=${{
-                      padding:"8px 12px", borderRadius:8, marginBottom:14,
-                      background:status.bg, color:status.col, fontSize:12, fontWeight:600,
-                      border:"1px solid " + status.col + "33",
-                    }}>${status.txt}</div>
-                  `;
-                })()}
+                <!-- ── Free-AI master toggle ─────────────────────────────────
+                     When the host has exposed GEMINI_API_KEY this is the
+                     primary path: ON by default, hides the per-provider
+                     key inputs entirely. Toggling OFF reveals Groq/Gemini
+                     panels for users who want their own quota / models. -->
+                ${sharedQuota.hasHostKey && html`
+                  <div style=${{
+                    padding:"14px 16px", borderRadius:10, marginBottom: useSharedGemini ? 6 : 16,
+                    background: useSharedGemini ? "#eaf3ff" : "#f4f8fc",
+                    border: useSharedGemini ? "2px solid #5a8ac0" : "1px solid #c8d8e8",
+                    transition: "all .15s",
+                  }}>
+                    <label style=${{ display:"flex", alignItems:"flex-start", gap:10, cursor:"pointer" }}>
+                      <input type="checkbox"
+                        checked=${useSharedGemini}
+                        onChange=${e => setUseSharedGemini(e.target.checked)}
+                        style=${{ marginTop:3, width:18, height:18, accentColor:"#1a5080", cursor:"pointer" }} />
+                      <div style=${{ flex:1 }}>
+                        <div style=${{ fontSize:15, fontWeight:700, color:"#1a4070", marginBottom:4 }}>
+                          Use the free AI ${useSharedGemini ? "✓" : ""}
+                        </div>
+                        ${useSharedGemini
+                          ? html`
+                            <div style=${{ fontSize:12, color:"#1a4070", lineHeight:1.65 }}>
+                              <span style=${{ fontWeight:700, fontSize:14 }}>${sharedQuota.remaining}</span>
+                              of <strong>${sharedQuota.cap}</strong> deck builds remaining today
+                              ${sharedQuota.remaining === 0
+                                ? html`<span style=${{ color:"#a04010", display:"block", marginTop:4, fontWeight:600 }}>
+                                    Daily limit reached — resets at UTC midnight. Toggle this off and add your own key to keep building today.
+                                  </span>`
+                                : ""}
+                              <div style=${{ fontSize:11, color:"#3a6090", marginTop:6, fontStyle:"italic" }}>
+                                Want unlimited builds or different models? Toggle off to add your own API keys.
+                              </div>
+                            </div>
+                          `
+                          : html`
+                            <div style=${{ fontSize:12, color:"#3a5a80", lineHeight:1.65 }}>
+                              Toggle on to use the host's shared Gemini key (capped at <strong>${sharedQuota.cap}</strong> builds/day per user). No key signup needed.
+                            </div>
+                          `}
+                      </div>
+                    </label>
+                  </div>
+                `}
 
-                ${Object.entries(PROVIDERS).map(([pid, p]) => {
+                ${(!sharedQuota.hasHostKey || !useSharedGemini) && html`
+                  <p style=${{ fontSize:12, color:"#6a4a2a", lineHeight:1.7, marginBottom:14, marginTop: sharedQuota.hasHostKey ? 8 : 0 }}>
+                    ${sharedQuota.hasHostKey
+                      ? "Add your own API key(s) for unlimited builds. Saving both enables automatic fallback if one is rate-limited."
+                      : html`Add keys for either or both providers. With both keys saved, <strong style=${{ color:"#7a2e0e" }}>automatic fallback</strong> kicks in when one is rate-limited or unavailable. The <strong>primary</strong> is tried first.`}
+                  </p>
+                `}
+
+                ${(!sharedQuota.hasHostKey || !useSharedGemini) && Object.entries(PROVIDERS).map(([pid, p]) => {
                   const isPrimary = provider === pid;
                   const hasKey    = (apiKeys[pid] || "").length >= 20;
                   return html`
@@ -2895,37 +2921,6 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         onInput=${e => setAKI(prev => ({ ...prev, [pid]: e.target.value }))}
                         onKeyDown=${e => e.key === "Enter" && saveSettings()}
                         style=${inp} />
-
-                      ${pid === "gemini" && sharedQuota.hasHostKey && html`
-                        <!-- Shared-host-key panel: friend can opt to use the
-                             host's pre-paid Gemini key with a daily cap. -->
-                        <div style=${{
-                          marginTop:10, padding:"10px 12px",
-                          background:"#eaf3ff", border:"1px solid #99bce5",
-                          borderRadius:8, fontSize:12, color:"#1a4070", lineHeight:1.7,
-                        }}>
-                          <label style=${{ display:"flex", alignItems:"flex-start", gap:8, cursor:"pointer" }}>
-                            <input type="checkbox"
-                              checked=${useSharedGemini}
-                              onChange=${e => setUseSharedGemini(e.target.checked)}
-                              style=${{ marginTop:3 }} />
-                            <span>
-                              <strong>Use the host's shared key</strong>
-                              ${hasKey && html`<span style=${{ fontSize:10, color:"#5a7a9a", marginLeft:6 }}>(your own key above takes priority when set)</span>`}
-                              <div style=${{ fontSize:11, marginTop:4, color:"#3a5a80" }}>
-                                ${useSharedGemini
-                                  ? html`
-                                    <span style=${{ fontWeight:600 }}>${sharedQuota.remaining}</span>
-                                    of <strong>${sharedQuota.cap}</strong> deck builds remaining today.
-                                    ${sharedQuota.remaining === 0
-                                      ? html`<span style=${{ color:"#a04010", display:"block", marginTop:3 }}>Daily cap reached — resets at UTC midnight. Paste your own key above to keep going.</span>`
-                                      : ""}`
-                                  : "Disabled — using only your own key above."}
-                              </div>
-                            </span>
-                          </label>
-                        </div>
-                      `}
 
                       ${pid === "gemini" && html`
                         <div style=${{
