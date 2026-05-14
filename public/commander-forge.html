@@ -51,6 +51,51 @@
   // Direct calls to archidekt.com from a browser origin are blocked.
   const ARCH_API      = "/archidekt/api";
 
+  // ── Cloud sync ──────────────────────────────────────────────────────────────
+  // localStorage keys to push to the cloud KV store. Deliberately excludes
+  // LS_SF_CACHE (huge, per-browser, regenerable) and LS_COMMANDERS (rebuilt
+  // per-collection by Load Commanders). Everything else makes the user
+  // experience portable across devices.
+  const SYNC_KEYS = [
+    LS_KEY_GROQ, LS_KEY_GEMINI, LS_PROVIDER, LS_MODELS,
+    LS_CARDS, LS_BINDERS, LS_PREFS, LS_LIBRARY,
+    LS_ARCH_CREDS, LS_ARCH_TOKEN,
+  ];
+  // Push interval — debounce window for batching rapid changes (typing in
+  // Settings, scrolling through preferences). 5 s gives a responsive feel
+  // without spamming KV writes when only one thing changed.
+  const SYNC_PUSH_INTERVAL_MS = 5000;
+
+  function readSyncSnapshot() {
+    const out = {};
+    for (const k of SYNC_KEYS) {
+      const v = localStorage.getItem(k);
+      if (v !== null) out[k] = v;
+    }
+    return out;
+  }
+  function applySyncSnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== "object") return 0;
+    let changed = 0;
+    for (const k of SYNC_KEYS) {
+      const incoming = snapshot[k];
+      const current  = localStorage.getItem(k);
+      if (incoming === undefined || incoming === null) {
+        if (current !== null) { localStorage.removeItem(k); changed++; }
+      } else if (incoming !== current) {
+        localStorage.setItem(k, incoming);
+        changed++;
+      }
+    }
+    return changed;
+  }
+  // Order-insensitive "is this snapshot equivalent to that snapshot" check.
+  function snapshotHash(snapshot) {
+    if (!snapshot) return "";
+    const keys = Object.keys(snapshot).sort();
+    return keys.map(k => `${k}=${snapshot[k]}`).join("\x1e");
+  }
+
   // Scryfall set codes for Magic's "joke" sets, none of which are legal in EDH.
   //   ugl = Unglued · unh = Unhinged · ust = Unstable · und = Unsanctioned
   //   unf = Unfinity · h17 = Heroes of the Realm
@@ -1190,6 +1235,24 @@
     const [wideEnough,   setWideEnough]   = useState(() => window.innerWidth >= 860);
     const [headerH,      setHeaderH]      = useState(0);
     const [sfCacheVer,   setSFCacheVer]   = useState(0); // bumped to refresh cache display
+
+    // ── Cloud-sync state ───────────────────────────────────────────────────
+    // status flow:
+    //   "init"     → component mounted, haven't checked auth yet
+    //   "checking" → fetching /api/me
+    //   "unauth"   → Access not configured or user not logged in (LS-only mode)
+    //   "pulling"  → fetching /api/state on first load
+    //   "ready"    → pull complete, local state hydrated, periodic push armed
+    //   "active"   → at least one push succeeded (lastSync is fresh)
+    //   "error"    → something went wrong, show details
+    // The existing init useEffect (reads localStorage → React state) is gated
+    // on this so cloud data lands in localStorage BEFORE the React state is
+    // hydrated. Without the gate, the first render would use stale local data.
+    const [cloudSync, setCloudSync] = useState({
+      status: "init", email: null, lastSync: 0, error: null, pending: false,
+    });
+    // Internals that don't need re-render: last pushed hash, last server lastModified, timer id.
+    const syncRef = useRef({ lastPushedHash: "", lastModified: 0 });
     const tooltipTimer = useRef(null);
     const headerRef    = useRef(null);
 
@@ -1222,8 +1285,69 @@
       return [...l, msg];
     });
 
+    // ── Cloud sync: auth-check + initial pull, runs ONCE on mount ─────────
+    // Must complete before the local-init effect below reads localStorage,
+    // so the cloud snapshot has a chance to overwrite local data first.
+    useEffect(() => {
+      let cancelled = false;
+      (async () => {
+        setCloudSync(s => ({ ...s, status: "checking" }));
+
+        // Step 1 — whoami
+        let meResp;
+        try {
+          const r = await fetch("/api/me");
+          meResp = await r.json();
+        } catch (e) {
+          // /api/me unreachable (local dev with python http.server, old Worker,
+          // or a network blip). Fall through to LS-only mode.
+          if (!cancelled) setCloudSync({ status: "unauth", email: null, lastSync: 0, error: null, pending: false });
+          return;
+        }
+
+        if (!meResp?.authenticated) {
+          if (!cancelled) setCloudSync({ status: "unauth", email: null, lastSync: 0, error: null, pending: false });
+          return;
+        }
+
+        // Step 2 — pull state from KV
+        if (!cancelled) setCloudSync({ status: "pulling", email: meResp.email, lastSync: 0, error: null, pending: false });
+
+        try {
+          const r = await fetch("/api/state");
+          if (r.status === 503) {
+            // Auth OK but KV not configured server-side. Still useful to show
+            // the user as "signed in" but mark sync as disabled.
+            if (!cancelled) setCloudSync({ status: "unauth", email: meResp.email, lastSync: 0, error: "Cloud sync isn't set up on this deployment yet.", pending: false });
+            return;
+          }
+          if (!r.ok) {
+            if (!cancelled) setCloudSync({ status: "error", email: meResp.email, lastSync: 0, error: `HTTP ${r.status} pulling state`, pending: false });
+            return;
+          }
+          const data = await r.json();
+          if (data?.state) {
+            const changed = applySyncSnapshot(data.state);
+            if (changed > 0) {
+              // Existing localStorage has been overwritten — but the local-init
+              // effect below hasn't run yet because it's gated on cloudSync.status.
+            }
+            syncRef.current.lastModified = data.lastModified || 0;
+          }
+          syncRef.current.lastPushedHash = snapshotHash(readSyncSnapshot());
+          if (!cancelled) setCloudSync({ status: "ready", email: meResp.email, lastSync: Date.now(), error: null, pending: false });
+        } catch (e) {
+          if (!cancelled) setCloudSync({ status: "error", email: meResp.email, lastSync: 0, error: e.message || "pull failed", pending: false });
+        }
+      })();
+      return () => { cancelled = true; };
+    }, []);
+
     useEffect(() => {
       // ── Load + migrate AI provider configuration ────────────────────────
+      // Gated on cloud sync completion so cloud data is in LS before we read it.
+      if (cloudSync.status === "init" || cloudSync.status === "checking" || cloudSync.status === "pulling") return;
+
       const groqKey   = localStorage.getItem(LS_KEY_GROQ)   || "";
       const geminiKey = localStorage.getItem(LS_KEY_GEMINI) || "";
       const oldKey    = localStorage.getItem(LS_APIKEY)     || "";
@@ -1318,7 +1442,81 @@
       if (savedTok) setArchToken(savedTok);
 
       if (savedCards) setPhase("ready"); else setPhase("import");
-    }, []);
+    }, [cloudSync.status]);   // re-runs once cloud-sync finishes (or fails)
+
+    // ── Cloud sync: periodic push (debounced) ──────────────────────────────
+    // Polls localStorage every SYNC_PUSH_INTERVAL_MS. When the syncable
+    // snapshot's hash differs from what we last pushed, PUT it to /api/state.
+    // No-op when sync isn't ready (LS-only mode or auth failure).
+    // Also flushes on tab close via fetch keepalive.
+    useEffect(() => {
+      if (cloudSync.status !== "ready" && cloudSync.status !== "active") return;
+
+      let cancelled = false;
+
+      const pushNow = async (opts = {}) => {
+        const snap = readSyncSnapshot();
+        const hash = snapshotHash(snap);
+        if (hash === syncRef.current.lastPushedHash && !opts.force) return;
+
+        if (!cancelled) setCloudSync(s => ({ ...s, pending: true }));
+        try {
+          const r = await fetch("/api/state", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              state: snap,
+              expectedLastModified: syncRef.current.lastModified,
+            }),
+            keepalive: !!opts.keepalive,
+          });
+          if (r.status === 409) {
+            // Server has newer data. The cleanest recovery is to reload so the
+            // init effect re-pulls. Show an explanatory error in the meantime.
+            if (!cancelled) setCloudSync(s => ({
+              ...s, pending: false,
+              error: "Another device saved newer data — reload to merge.",
+            }));
+            return;
+          }
+          if (!r.ok) {
+            const errData = await r.json().catch(() => ({}));
+            if (!cancelled) setCloudSync(s => ({
+              ...s, pending: false,
+              error: errData.error || `Push failed (HTTP ${r.status})`,
+            }));
+            return;
+          }
+          const data = await r.json();
+          syncRef.current.lastModified   = data.lastModified || Date.now();
+          syncRef.current.lastPushedHash = hash;
+          if (!cancelled) setCloudSync(s => ({
+            ...s, status: "active", lastSync: Date.now(),
+            pending: false, error: null,
+          }));
+        } catch (e) {
+          if (!cancelled) setCloudSync(s => ({ ...s, pending: false, error: e.message || "push failed" }));
+        }
+      };
+
+      const intervalId = setInterval(pushNow, SYNC_PUSH_INTERVAL_MS);
+
+      // Best-effort flush on tab close. fetch with keepalive survives unload
+      // (where sendBeacon would, but sendBeacon only supports POST not PUT).
+      const flushOnExit = () => pushNow({ keepalive: true });
+      window.addEventListener("beforeunload", flushOnExit);
+      // Also flush when the tab becomes hidden — covers mobile background
+      // and tab-switch cases where beforeunload doesn't always fire.
+      const onVis = () => { if (document.visibilityState === "hidden") flushOnExit(); };
+      document.addEventListener("visibilitychange", onVis);
+
+      return () => {
+        cancelled = true;
+        clearInterval(intervalId);
+        window.removeEventListener("beforeunload", flushOnExit);
+        document.removeEventListener("visibilitychange", onVis);
+      };
+    }, [cloudSync.status]);
 
     // Persist build preferences whenever they change.
     useEffect(() => {
@@ -2417,6 +2615,30 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   ? computeUsable(groups, deckInc, binInc)
                   : usable;
                 const total = live.reduce((s, c) => s + (c.qty || 1), 0);
+
+                // Sync status chip — colour-coded for at-a-glance state.
+                const cs = cloudSync;
+                let syncDot, syncLine;
+                if (cs.status === "init" || cs.status === "checking" || cs.status === "pulling") {
+                  syncDot  = { bg:"#f0c080", glow:"rgba(240,192,128,0.55)" };
+                  syncLine = "Syncing…";
+                } else if (cs.error) {
+                  syncDot  = { bg:"#e85040", glow:"rgba(232,80,64,0.5)" };
+                  syncLine = cs.error;
+                } else if (cs.status === "active" || cs.status === "ready") {
+                  syncDot  = { bg:"#5ac870", glow:"rgba(90,200,112,0.5)" };
+                  const ago = cs.lastSync ? Math.max(0, Math.floor((Date.now() - cs.lastSync) / 1000)) : -1;
+                  syncLine = cs.pending
+                    ? "Saving…"
+                    : ago < 10 ? "Saved · just now"
+                    : ago < 60 ? `Saved · ${ago}s ago`
+                    : `Saved · ${Math.floor(ago / 60)}m ago`;
+                } else {
+                  // unauth: either Access not set up, KV not configured, or local dev
+                  syncDot  = { bg:"#888", glow:"none" };
+                  syncLine = "Local only";
+                }
+
                 return html`
                   <div style=${{ fontSize:11, color:"rgba(255,255,255,0.65)", textAlign:"right" }}>
                     <div>${total.toLocaleString()} cards (${live.length.toLocaleString()} unique)</div>
@@ -2424,6 +2646,22 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       ${phase === "select"
                         ? html`<span style=${{ color:"#f0c080" }}>pending — confirm to update</span>`
                         : html`${cmdrs.length} commanders`}
+                    </div>
+                    <div title=${syncLine} style=${{
+                      display:"inline-flex", alignItems:"center", gap:6,
+                      marginTop:4, padding:"3px 9px", borderRadius:12,
+                      background:"rgba(0,0,0,0.18)", fontSize:10,
+                    }}>
+                      <span style=${{
+                        width:8, height:8, borderRadius:"50%",
+                        background: syncDot.bg,
+                        boxShadow: syncDot.glow !== "none" ? `0 0 6px ${syncDot.glow}` : "none",
+                      }}></span>
+                      ${cs.email
+                        ? html`<span style=${{ color:"rgba(255,255,255,0.85)" }}>${cs.email}</span>
+                               <span style=${{ color:"rgba(255,255,255,0.45)" }}>·</span>`
+                        : ""}
+                      <span style=${{ color:"rgba(255,255,255,0.55)" }}>${syncLine}</span>
                     </div>
                   </div>
                 `;
