@@ -2790,10 +2790,14 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     }, [enriched, usable, apiKeys, provider, models, bracket, archetypes, budget, mech]);
 
     const exportDeck = () => {
-      const txt = `// Commander Forge — ${selCmd.card.name}\nCommander: 1 ${selCmd.card.name}\n\n`
-        + deck.categories.map(cat =>
-          `// ${cat.name}\n${cat.cards.map(c => `1 ${c.name}`).join("\n")}`
-        ).join("\n\n");
+      // Plain "QTY Name" lines only — no `//` comments or category headers.
+      // Moxfield's import treats `//` as a syntax error (it's the MTG
+      // double-faced-card separator there). Archidekt / TappedOut / etc.
+      // accept the bare form fine too. Categories are preserved when
+      // pushing via the Archidekt API.
+      const lines = [`1 ${selCmd.card.name}`];
+      deck.categories.forEach(cat => cat.cards.forEach(c => lines.push(`1 ${c.name}`)));
+      const txt = lines.join("\n");
       const a = document.createElement("a");
       a.href = URL.createObjectURL(new Blob([txt], { type:"text/plain" }));
       a.download = `${selCmd.card.name.replace(/\s+/g,"_")}_commander.txt`;
@@ -4893,6 +4897,16 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         💾 Save to Library
                       </button>`
                   }
+                  ${deckSaved
+                    ? html`<span style=${{ fontSize:11, color:"#7a3010", fontWeight:600,
+                        padding:"6px 0", textAlign:"center" }}>📦 In Collection</span>`
+                    : html`<button onClick=${saveDeckToCollection}
+                        title="Saves the deck under Collection → Decks and reserves its non-basic cards from the eligible pool."
+                        style=${{ ...btnSec, padding:"6px 14px", fontSize:11,
+                          borderColor:"#7a3010", color:"#7a3010" }}>
+                        📦 Save to Collection
+                      </button>`
+                  }
                   <button onClick=${() => {
                       setDeckSvd(false); setLibSaved(false);
                       if (fromCollection) { setFromCollection(false); setPhase("select"); }
@@ -5211,21 +5225,6 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   </div>
                 </div>
               `}
-
-              <div style=${{ marginBottom:18, display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
-                ${deckSaved
-                  ? html`<span style=${{ fontSize:13, color:"#2a6a2a", fontWeight:600 }}>
-                      ✅ Saved to Collection — cards reserved for this deck.
-                    </span>`
-                  : html`
-                    <button onClick=${saveDeckToCollection}
-                      style=${{ ...btnSec, fontSize:12, padding:"7px 16px",
-                        borderColor:"#7a3010", color:"#7a3010" }}
-                      title="Saves the deck as a new entry under Collection → Decks, and removes its non-basic cards from the eligible pool so they aren't reused in future builds.">
-                      📦 Save deck to Collection
-                    </button>
-                  `}
-              </div>
 
               <div style=${{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:22 }}>
                 ${deck.categories.map(cat => {
