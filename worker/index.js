@@ -5,6 +5,8 @@
 //                          Cloudflare Access isn't configured / no JWT present)
 //   GET  /api/state      → loads the user's cloud-synced app state from KV
 //   PUT  /api/state      → saves the user's cloud-synced app state to KV
+//   GET  /api/quota      → returns today's shared-Gemini usage for the signed-in user
+//   POST /api/ai/gemini  → proxy to Gemini with the host's key, enforces daily cap
 //   /edhrec/*            → proxy GET to json.edhrec.com (CORS sidestep)
 //   /spellbook/*         → proxy POST to backend.commanderspellbook.com (CORS sidestep)
 //   /archidekt/*         → proxy any method to archidekt.com (CORS sidestep + auth header forwarding)
@@ -59,6 +61,12 @@ export default {
       if (request.method === "GET") return handleStateGet(request, env);
       if (request.method === "PUT") return handleStatePut(request, env);
       return jsonResponse({ error: "method not allowed" }, 405);
+    }
+    if (url.pathname === "/api/quota" && request.method === "GET") {
+      return handleQuota(request, env);
+    }
+    if (url.pathname === "/api/ai/gemini" && request.method === "POST") {
+      return handleSharedGemini(request, env);
     }
 
     // Match against proxy routes. First-prefix-wins.
@@ -226,6 +234,133 @@ async function handleProxy(request, prefix, target) {
   return new Response(upstreamRes.body, {
     status: upstreamRes.status,
     headers: resHeaders,
+  });
+}
+
+// ── Shared Gemini (host-paid, per-user cap) ─────────────────────────────
+// Friends without their own Gemini key can use the host's key (set as the
+// GEMINI_API_KEY Worker secret), capped at SHARED_GEMINI_DAILY_CAP requests
+// per user per UTC day. Quota keys live in the same STATE namespace, with a
+// 25-hour TTL so yesterday's keys self-clean.
+const SHARED_GEMINI_DAILY_CAP = 20;
+const SHARED_GEMINI_DEFAULT_MODEL = "gemini-2.5-flash";
+const QUOTA_KEY_PREFIX = "quota:";
+
+function quotaKey(email) {
+  // UTC date as the bucket. Two friends in different timezones may see the
+  // boundary at slightly different "local midnights" — acceptable trade-off.
+  const today = new Date().toISOString().slice(0, 10);
+  return `${QUOTA_KEY_PREFIX}${today}:${email}`;
+}
+
+async function readUsage(env, email) {
+  if (!env.STATE) return 0;
+  const raw = await env.STATE.get(quotaKey(email));
+  const n = parseInt(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
+async function bumpUsage(env, email, current) {
+  if (!env.STATE) return;
+  await env.STATE.put(quotaKey(email), String(current + 1), {
+    expirationTtl: 25 * 60 * 60,   // 25h: bucket evaporates after the day ends
+  });
+}
+
+async function handleQuota(request, env) {
+  const email = authenticatedEmail(request);
+  if (!email) return jsonResponse({ error: "not authenticated" }, 401);
+  const used = await readUsage(env, email);
+  return jsonResponse({
+    used,
+    cap: SHARED_GEMINI_DAILY_CAP,
+    remaining: Math.max(0, SHARED_GEMINI_DAILY_CAP - used),
+    hasHostKey: !!env.GEMINI_API_KEY,
+    syncReady: !!env.STATE,
+  });
+}
+
+async function handleSharedGemini(request, env) {
+  const email = authenticatedEmail(request);
+  if (!email) return jsonResponse({ error: "not authenticated" }, 401);
+  if (!env.GEMINI_API_KEY) {
+    return jsonResponse({ error: "Host Gemini key not configured. Paste your own key in Settings." }, 503);
+  }
+  if (!env.STATE) {
+    return jsonResponse({ error: "Per-user quota tracking requires KV — see docs/SYNC_SETUP.md." }, 503);
+  }
+
+  // Daily cap check (BEFORE the upstream call — no point in burning quota
+  // for a user who's already maxed out).
+  const used = await readUsage(env, email);
+  if (used >= SHARED_GEMINI_DAILY_CAP) {
+    return jsonResponse({
+      error: "Daily shared-key cap reached",
+      used, cap: SHARED_GEMINI_DAILY_CAP, remaining: 0,
+      resetAtUTC: new Date(Date.now() + 25 * 60 * 60 * 1000).toISOString().slice(0, 10),
+    }, 429);
+  }
+
+  let body;
+  try { body = await request.json(); }
+  catch { return jsonResponse({ error: "request body must be JSON" }, 400); }
+
+  const system     = (body.system || "").toString();
+  const user       = (body.user   || "").toString();
+  const max_tokens = Math.min(parseInt(body.max_tokens) || 4096, 16384);
+  const model      = (body.model || SHARED_GEMINI_DEFAULT_MODEL).toString();
+
+  if (!user) return jsonResponse({ error: "missing 'user' field" }, 400);
+
+  // Forward to Gemini using the host's key.
+  const isThinking = /^gemini-2\.5/.test(model);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${env.GEMINI_API_KEY}`;
+  let r;
+  try {
+    r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: system }] },
+        contents: [{ role: "user", parts: [{ text: user }] }],
+        generationConfig: {
+          maxOutputTokens: max_tokens, temperature: 0.7,
+          responseMimeType: "application/json",
+          ...(isThinking ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
+        },
+      }),
+    });
+  } catch (e) {
+    return jsonResponse({
+      error: `Gemini fetch failed: ${(e?.message || String(e)).slice(0, 200)}`,
+    }, 502);
+  }
+
+  let data;
+  try { data = await r.json(); }
+  catch { return jsonResponse({ error: "Gemini returned non-JSON" }, 502); }
+
+  if (!r.ok) {
+    // Don't increment usage — the user didn't actually consume a successful build.
+    return jsonResponse({
+      error: data.error?.message || `Gemini error ${r.status}`,
+    }, r.status);
+  }
+
+  // Success — increment counter and shape response to match client's expected
+  // contract (matches the shape callGemini() returns when called directly).
+  await bumpUsage(env, email, used);
+
+  const cand = data.candidates?.[0] || {};
+  return jsonResponse({
+    text:             cand.content?.parts?.[0]?.text ?? "",
+    finishReason:     (cand.finishReason || "unknown").toLowerCase(),
+    completionTokens: data.usageMetadata?.candidatesTokenCount || null,
+    promptTokens:     data.usageMetadata?.promptTokenCount     || null,
+    thoughtsTokens:   data.usageMetadata?.thoughtsTokenCount   || null,
+    quotaUsed:        used + 1,
+    quotaCap:         SHARED_GEMINI_DAILY_CAP,
+    quotaRemaining:   SHARED_GEMINI_DAILY_CAP - (used + 1),
   });
 }
 

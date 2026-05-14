@@ -45,6 +45,7 @@
   const LS_SF_CACHE   = "cmdr_forge_sf_cache";
   const LS_ARCH_CREDS = "cmdr_forge_archidekt_creds";  // { username, password }
   const LS_ARCH_TOKEN = "cmdr_forge_archidekt_token";  // bearer token from /api/users/login/
+  const LS_USE_SHARED = "cmdr_forge_use_shared_gemini"; // "1" = route Gemini calls through host's key
   const SF_CACHE_TTL  = 7 * 24 * 60 * 60 * 1000;   // 7-day TTL for Scryfall card data
   // Relative URL — routed by the local Python proxy (proxy.py) to
   // https://archidekt.com/api, sidestepping browser CORS restrictions.
@@ -60,6 +61,7 @@
     LS_KEY_GROQ, LS_KEY_GEMINI, LS_PROVIDER, LS_MODELS,
     LS_CARDS, LS_BINDERS, LS_PREFS, LS_LIBRARY,
     LS_ARCH_CREDS, LS_ARCH_TOKEN,
+    LS_USE_SHARED,
   ];
   // Push interval — debounce window for batching rapid changes (typing in
   // Settings, scrolling through preferences). 5 s gives a responsive feel
@@ -530,6 +532,42 @@
       finishReason: choice.finish_reason || "unknown",       // length | stop | content_filter | tool_calls
       completionTokens: d.usage?.completion_tokens || null,
       promptTokens:     d.usage?.prompt_tokens     || null,
+    };
+  }
+
+  // Host-paid Gemini proxy. Sent via the same-origin Worker (/api/ai/gemini),
+  // which signs the request with the host's GEMINI_API_KEY and enforces a
+  // per-user daily cap (HTTP 429 when exceeded). Used when the visitor hasn't
+  // provided their own Gemini key but is signed-in via Cloudflare Access.
+  // Returns the same { text, finishReason, completionTokens, … } shape as
+  // callGemini, plus { quotaUsed, quotaCap, quotaRemaining }.
+  async function callSharedGemini(_unusedApiKey, model, userText, systemText, maxTokens = 4096) {
+    const r = await fetch("/api/ai/gemini", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        system: systemText, user: userText,
+        max_tokens: maxTokens, model,
+      }),
+    });
+    let d = null;
+    try { d = await r.json(); } catch {}
+    if (r.status === 429) {
+      const used = d?.used ?? "?", cap = d?.cap ?? "?";
+      throw new Error(`Daily shared-key cap reached (${used}/${cap}). Add your own Gemini key in Settings to remove the cap, or wait for tomorrow's reset.`);
+    }
+    if (!r.ok) {
+      throw new Error(d?.error || `Shared Gemini error ${r.status}`);
+    }
+    return {
+      text: d.text || "",
+      finishReason: d.finishReason || "unknown",
+      completionTokens: d.completionTokens,
+      promptTokens:     d.promptTokens,
+      thoughtsTokens:   d.thoughtsTokens,
+      quotaUsed:        d.quotaUsed,
+      quotaCap:         d.quotaCap,
+      quotaRemaining:   d.quotaRemaining,
     };
   }
 
@@ -1253,6 +1291,25 @@
     });
     // Internals that don't need re-render: last pushed hash, last server lastModified, timer id.
     const syncRef = useRef({ lastPushedHash: "", lastModified: 0 });
+
+    // ── Shared-Gemini-key state ──────────────────────────────────────────
+    // The host can expose a pre-paid Gemini key with a per-user daily cap so
+    // friends without their own key can still build decks. The Worker tells
+    // us via /api/quota whether a host key exists; the user toggles whether
+    // they actually want to USE it (default ON if they don't have their own).
+    const [useSharedGemini, setUseSharedGemini] = useState(() => {
+      const saved = localStorage.getItem(LS_USE_SHARED);
+      // Default ON for first-time users — if the host hasn't exposed a shared
+      // key, the toggle is hidden anyway, so this is safely-noop in that case.
+      return saved === null ? true : saved === "1";
+    });
+    const [sharedQuota, setSharedQuota] = useState({
+      hasHostKey: false, used: 0, cap: 20, remaining: 20, loaded: false,
+    });
+    // Persist preference whenever it changes (also picked up by sync).
+    useEffect(() => {
+      localStorage.setItem(LS_USE_SHARED, useSharedGemini ? "1" : "0");
+    }, [useSharedGemini]);
     const tooltipTimer = useRef(null);
     const headerRef    = useRef(null);
 
@@ -1336,6 +1393,22 @@
           }
           syncRef.current.lastPushedHash = snapshotHash(readSyncSnapshot());
           if (!cancelled) setCloudSync({ status: "ready", email: meResp.email, lastSync: Date.now(), error: null, pending: false });
+
+          // Fetch quota info — tells us whether a host Gemini key is available
+          // and how many shared builds the user has left for the day.
+          try {
+            const qr = await fetch("/api/quota");
+            if (qr.ok) {
+              const qd = await qr.json();
+              if (!cancelled) setSharedQuota({
+                hasHostKey: !!qd.hasHostKey,
+                used:       qd.used      ?? 0,
+                cap:        qd.cap       ?? 20,
+                remaining:  qd.remaining ?? 20,
+                loaded:     true,
+              });
+            }
+          } catch {/* non-fatal; quota stays at defaults */}
         } catch (e) {
           if (!cancelled) setCloudSync({ status: "error", email: meResp.email, lastSync: 0, error: e.message || "pull failed", pending: false });
         }
@@ -1544,9 +1617,11 @@
       const gemK  = (aki.gemini || "").trim();
       const groqOK = groqK.length >= 20;
       const gemOK  = gemK.length  >= 20;
-      // At least one valid key required; both is preferred (enables fallback).
-      if (!groqOK && !gemOK) {
-        setError("Please enter at least one valid API key (Groq or Gemini).");
+      const sharedAvailable = sharedQuota.hasHostKey && useSharedGemini;
+      // Need at least ONE path to make AI calls: own Groq key, own Gemini key,
+      // or the shared host Gemini key (enabled + quota remaining).
+      if (!groqOK && !gemOK && !sharedAvailable) {
+        setError("Add at least one API key, or enable the shared host key (if available) to continue.");
         return;
       }
       // Persist whichever keys are present; clear blanks.
@@ -1579,12 +1654,26 @@
       else setPhase("import");
     };
 
+    // Is the shared-Gemini path effectively available for this user right now?
+    //   - Host key is exposed (sharedQuota.hasHostKey)
+    //   - User has opted in (useSharedGemini)
+    //   - User hasn't burned their daily cap
+    const sharedGeminiUsable = (
+      sharedQuota.hasHostKey &&
+      useSharedGemini &&
+      sharedQuota.remaining > 0
+    );
+
     // Compute the provider order (primary first, other after, only those with
-    // a key configured).
+    // a key configured — or, for Gemini, the shared-host-key path).
     const aiUsableProviders = (exclude = []) => {
       const all = ["groq", "gemini"];
       const order = [provider, ...all.filter(p => p !== provider)];
-      return order.filter(p => !exclude.includes(p) && !!apiKeys[p]);
+      return order.filter(p => {
+        if (exclude.includes(p)) return false;
+        if (p === "gemini") return !!apiKeys.gemini || sharedGeminiUsable;
+        return !!apiKeys[p];
+      });
     };
 
     // Per-provider max_tokens caps. Callers ask for an upper bound (e.g. 16384
@@ -1600,12 +1689,31 @@
     // Run a prompt on a single, specific provider. Throws on API failure.
     // Used by callAI (which adds rotation on failure) and by buildDeck's
     // multi-provider retry loop (which rotates on PARSE failure too).
+    //
+    // For Gemini specifically: if the user has NO Gemini key of their own but
+    // has opted into the shared host key (and has quota left), route through
+    // /api/ai/gemini instead of hitting Google directly.
     const callAIOn = async (p, userText, systemText, maxTokens) => {
-      const fn  = p === "groq" ? callGroq : callGemini;
-      const key = apiKeys[p] || "";
-      const mdl = models[p]   || PROVIDERS[p].models[0].id;
       const cap = PROVIDER_MAX_TOKENS[p] || maxTokens;
       const max = Math.min(maxTokens, cap);
+      const mdl = models[p] || PROVIDERS[p].models[0].id;
+
+      if (p === "gemini" && !apiKeys.gemini && sharedGeminiUsable) {
+        const result = await callSharedGemini("", mdl, userText, systemText, max);
+        // Update local quota mirror so the UI reflects the new total without
+        // round-tripping /api/quota.
+        if (typeof result.quotaRemaining === "number") {
+          setSharedQuota(s => ({
+            ...s,
+            used: result.quotaUsed ?? s.used + 1,
+            remaining: result.quotaRemaining,
+          }));
+        }
+        return { ...result, provider: p, maxTokens: max, viaShared: true };
+      }
+
+      const fn  = p === "groq" ? callGroq : callGemini;
+      const key = apiKeys[p] || "";
       const result = await fn(key, mdl, userText, systemText, max);
       return { ...result, provider: p, maxTokens: max };
     };
@@ -1958,12 +2066,15 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         const tried        = [];
         const aiOrder      = aiUsableProviders();   // local: provider rotation order
 
-        // Pre-flight: if no provider has a key, fail immediately with a clear
-        // message instead of running the loop zero times and producing a
-        // confusing "All providers failed (). No response to parse." error.
+        // Pre-flight: no usable provider → fail fast with a clear message
+        // tailored to the situation (out of shared quota vs. no key at all).
         if (aiOrder.length === 0) {
-          addLog("❌ No AI provider configured. Open ⚙ Settings and paste a Groq or Gemini API key.");
-          throw new Error("No AI provider has a key configured. Open ⚙ Settings and paste a Groq or Gemini API key, then try again.");
+          const sharedExhausted = sharedQuota.hasHostKey && useSharedGemini && sharedQuota.remaining <= 0;
+          const msg = sharedExhausted
+            ? `Daily shared-key cap reached (${sharedQuota.used}/${sharedQuota.cap}). Open ⚙ Settings and paste your own Gemini or Groq key to keep building today.`
+            : "No AI provider available. Open ⚙ Settings, paste a Groq or Gemini API key, or enable the shared host key if offered.";
+          addLog(`❌ ${msg}`);
+          throw new Error(msg);
         }
 
         // Gemini 2.5 Flash supports up to 65536 output tokens; Llama 3.3 70B on
@@ -1983,7 +2094,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             continue;
           }
           const tt1 = r1.thoughtsTokens ? `, thoughts=${r1.thoughtsTokens}` : "";
-          addLog(`📊 ${PROVIDERS[p].label}: finish=${r1.finishReason}, completion_tokens=${r1.completionTokens ?? "?"}${tt1} (out of ${DECK_MAX_TOKENS} max).`);
+          const sharedTag = r1.viaShared
+            ? ` [shared host key · ${r1.quotaRemaining ?? "?"}/${r1.quotaCap ?? "?"} left today]`
+            : "";
+          addLog(`📊 ${PROVIDERS[p].label}${sharedTag}: finish=${r1.finishReason}, completion_tokens=${r1.completionTokens ?? "?"}${tt1} (out of ${DECK_MAX_TOKENS} max).`);
           let parsed = safeParse(r1.text);
           if (parsed?.categories) { deckData = parsed; replyObj = r1; break; }
 
@@ -2782,13 +2896,44 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         onKeyDown=${e => e.key === "Enter" && saveSettings()}
                         style=${inp} />
 
+                      ${pid === "gemini" && sharedQuota.hasHostKey && html`
+                        <!-- Shared-host-key panel: friend can opt to use the
+                             host's pre-paid Gemini key with a daily cap. -->
+                        <div style=${{
+                          marginTop:10, padding:"10px 12px",
+                          background:"#eaf3ff", border:"1px solid #99bce5",
+                          borderRadius:8, fontSize:12, color:"#1a4070", lineHeight:1.7,
+                        }}>
+                          <label style=${{ display:"flex", alignItems:"flex-start", gap:8, cursor:"pointer" }}>
+                            <input type="checkbox"
+                              checked=${useSharedGemini}
+                              onChange=${e => setUseSharedGemini(e.target.checked)}
+                              style=${{ marginTop:3 }} />
+                            <span>
+                              <strong>Use the host's shared key</strong>
+                              ${hasKey && html`<span style=${{ fontSize:10, color:"#5a7a9a", marginLeft:6 }}>(your own key above takes priority when set)</span>`}
+                              <div style=${{ fontSize:11, marginTop:4, color:"#3a5a80" }}>
+                                ${useSharedGemini
+                                  ? html`
+                                    <span style=${{ fontWeight:600 }}>${sharedQuota.remaining}</span>
+                                    of <strong>${sharedQuota.cap}</strong> deck builds remaining today.
+                                    ${sharedQuota.remaining === 0
+                                      ? html`<span style=${{ color:"#a04010", display:"block", marginTop:3 }}>Daily cap reached — resets at UTC midnight. Paste your own key above to keep going.</span>`
+                                      : ""}`
+                                  : "Disabled — using only your own key above."}
+                              </div>
+                            </span>
+                          </label>
+                        </div>
+                      `}
+
                       ${pid === "gemini" && html`
                         <div style=${{
                           marginTop:8, padding:"8px 12px",
                           background:"#fff8ee", border:"1px solid #e0c890",
                           borderRadius:8, fontSize:11, color:"#5a3a1a", lineHeight:1.7,
                         }}>
-                          <strong style=${{ color:"#7a2e0e" }}>⚠ Important:</strong> after generating
+                          <strong style=${{ color:"#7a2e0e" }}>⚠ About your own key:</strong> after generating
                           a Gemini key, Google requires you to <strong>set up a billing
                           profile</strong> at <a href="https://console.cloud.google.com/billing"
                           target="_blank" rel="noopener"
