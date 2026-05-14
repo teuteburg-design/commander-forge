@@ -30,9 +30,13 @@
 // Path prefix → upstream base URL. Each request hitting one of these prefixes
 // is forwarded server-side; the browser sees a same-origin response.
 const PROXY_ROUTES = {
-  "/edhrec/":    "https://json.edhrec.com",
-  "/spellbook/": "https://backend.commanderspellbook.com",
-  "/archidekt/": "https://archidekt.com",
+  "/edhrec/":        "https://json.edhrec.com",
+  "/spellbook/":     "https://backend.commanderspellbook.com",
+  "/archidekt/":     "https://archidekt.com",
+  // Public Manabox deck-share pages. The deck JSON is embedded inside an
+  // <astro-island component-export="Main"> element's props attribute — the
+  // client parses it out. We just need to sidestep CORS.
+  "/manabox-share/": "https://manabox.app",
 };
 
 // EDHRec / Cloudflare-fronted endpoints reject "default fetch" UAs. Pretending

@@ -847,6 +847,136 @@
     return { decks: [], binders: [binder], stats };
   }
 
+  // ── Manabox share URL import ────────────────────────────────────────────────
+  //
+  // Public Manabox decks (https://manabox.app/decks/<shareId>) embed their full
+  // contents as JSON inside an Astro hydration island — specifically the one
+  // with component-export="Main". The data is serialised in Astro's reactive
+  // [type, value] format where 0 = literal, 1 = array — so to read it we need
+  // to recursively unwrap that wrapping.
+
+  function manaboxDeckIdFromURL(s) {
+    if (!s) return null;
+    const t = s.trim();
+    // Allow both full URLs and bare share-ids.
+    const m = t.match(/manabox\.app\/decks\/([A-Za-z0-9_-]+)/);
+    if (m) return m[1];
+    if (/^[A-Za-z0-9_-]{8,}$/.test(t)) return t;   // assume bare share id
+    return null;
+  }
+
+  // Astro's hydration format wraps every value in `[type, X]`. Type 0 = literal
+  // (single value), type 1 = array (X is the inner array). Recurse to peel it.
+  function astroUnwrap(v) {
+    if (Array.isArray(v) && v.length === 2 && typeof v[0] === "number") {
+      return astroUnwrap(v[1]);
+    }
+    if (Array.isArray(v)) return v.map(astroUnwrap);
+    if (v && typeof v === "object") {
+      const out = {};
+      for (const [k, val] of Object.entries(v)) out[k] = astroUnwrap(val);
+      return out;
+    }
+    return v;
+  }
+
+  // Minimal HTML-entity decoder (matches what the browser's textarea decoder
+  // would do for the entities Astro actually emits in attribute values).
+  function decodeHtmlEntities(s) {
+    if (typeof DOMParser !== "undefined") {
+      // Cheapest correct way: let the parser handle it.
+      const doc = new DOMParser().parseFromString(`<x v="${s}">`, "text/html");
+      return doc.querySelector("x").getAttribute("v") || "";
+    }
+    return s
+      .replace(/&quot;/g, "\"").replace(/&amp;/g,  "&")
+      .replace(/&lt;/g,   "<").replace(/&gt;/g,    ">")
+      .replace(/&#39;/g,  "'").replace(/&apos;/g,  "'");
+  }
+
+  // boardCategory in Manabox's data:
+  //   0 = commander
+  //   3 = mainboard
+  // (Other values exist for sideboard / maybeboard / etc; we surface them as
+  // mainboard if encountered so nothing is lost.)
+  function parseManaboxShareHTML(html) {
+    if (!html || typeof html !== "string") {
+      return { error: "Empty response from Manabox." };
+    }
+    // Locate the Main hydration island. There may be multiple <astro-island>
+    // elements on the page — we want the one that exports `Main`.
+    const m = html.match(/<astro-island[^>]*component-export="Main"[^>]*\sprops="([^"]+)"/);
+    if (!m) {
+      return { error: "Couldn't find deck data in the Manabox page. The URL may be private or the page format may have changed." };
+    }
+    let raw;
+    try {
+      raw = JSON.parse(decodeHtmlEntities(m[1]));
+    } catch (e) {
+      return { error: "Couldn't decode Manabox deck JSON: " + (e.message || e) };
+    }
+    const data = astroUnwrap(raw);
+    const deck = data?.deck;
+    if (!deck || !Array.isArray(deck.cards)) {
+      return { error: "Manabox page didn't include card data." };
+    }
+
+    // Find the commander (boardCategory 0). If there's more than one, the
+    // first wins — the rest fall back into the mainboard.
+    let commanderName = null;
+    const cards = new Map();   // name → { name, qty, id }
+    let unknownCats = 0;
+    for (const c of deck.cards) {
+      const name = c.name;
+      if (!name) continue;
+      const qty  = c.quantity || 1;
+      if (c.boardCategory === 0 && !commanderName) {
+        commanderName = name;
+      } else if (c.boardCategory !== 0 && c.boardCategory !== 3) {
+        unknownCats++;
+      }
+      // Merge by name across all boards — quantity stacks the way it would
+      // for a Manabox CSV import.
+      if (cards.has(name)) cards.get(name).qty += qty;
+      else cards.set(name, { name, qty, id: "" });
+    }
+
+    return {
+      deck: {
+        name:           deck.name || "Manabox deck",
+        type:           "deck",
+        commanderName,
+        cards:          [...cards.values()],
+        source:         "manabox-share",
+        importedAt:     Date.now(),
+        manaboxId:      deck.id || null,
+        format:         deck.format || null,
+      },
+      stats: {
+        totalCards:   [...cards.values()].reduce((s, c) => s + c.qty, 0),
+        uniqueCards:  cards.size,
+        unknownCats,
+      },
+    };
+  }
+
+  async function fetchManaboxShare(input) {
+    const id = manaboxDeckIdFromURL(input);
+    if (!id) return { error: "Couldn't read a deck id out of that input. Expected a https://manabox.app/decks/… URL." };
+
+    let r;
+    try {
+      r = await fetch(`/manabox-share/decks/${encodeURIComponent(id)}`);
+    } catch (e) {
+      return { error: `Couldn't reach Manabox: ${(e?.message || e).toString().slice(0, 120)}` };
+    }
+    if (!r.ok) {
+      return { error: `Manabox returned HTTP ${r.status} — the deck may be private or removed.` };
+    }
+    const html = await r.text();
+    return parseManaboxShareHTML(html);
+  }
+
   // Dispatcher that picks the right parser based on header detection.
   function parseCollectionCSV(text) {
     const format = detectCSVFormat(text);
@@ -1284,6 +1414,8 @@
 
     const [csvInput, setCsv]      = useState("");
     const [csvDragOver, setCsvDragOver] = useState(false);
+    const [manaboxUrl, setManaboxUrl] = useState("");
+    const [manaboxBusy, setManaboxBusy] = useState(false);
     const csvFileRef = useRef(null);
     const readCsvFile = (file) => {
       if (!file) return;
@@ -1833,6 +1965,51 @@
       setParseStats({ ...parsed.stats, format: parsed.format });
       setError(""); setCsv("");
       setPhase("select");
+    };
+
+    // Import a single deck from a public Manabox share URL
+    // (https://manabox.app/decks/<id>). The Worker proxies the HTML and we
+    // parse the embedded Astro hydration island to extract deck name +
+    // commander + card list. Adds to groups.decks (excluded from pool by
+    // default) and navigates to Select Sources so the user can review.
+    const importManaboxURL = async () => {
+      const url = manaboxUrl.trim();
+      if (!url || manaboxBusy) return;
+      setManaboxBusy(true);
+      setError("");
+      try {
+        const result = await fetchManaboxShare(url);
+        if (result.error) {
+          setError(result.error);
+          return;
+        }
+        const deckEntry = result.deck;
+        // Collision-proof name (in case user imports the same share twice).
+        let title = deckEntry.name, n = 2;
+        while (groups.decks.some(d => d.name === title)) title = `${deckEntry.name} (${n++})`;
+        deckEntry.name = title;
+
+        const nextDecks   = [...groups.decks, deckEntry];
+        const nextDeckInc = { ...deckInc, [deckEntry.name]: false };   // excluded by default
+        const nextGroups  = { decks: nextDecks, binders: groups.binders };
+        setGroups(nextGroups);
+        setDeckInc(nextDeckInc);
+        localStorage.setItem(LS_BINDERS, JSON.stringify({
+          groups: nextGroups, deckInc: nextDeckInc, binInc,
+        }));
+        setManaboxUrl("");
+        setParseStats({
+          format: "manabox-share",
+          totalRows:    result.stats.totalCards,
+          included:     result.stats.totalCards,
+          skippedNoName: 0,
+        });
+        setPhase("select");
+      } catch (e) {
+        setError(`Manabox import failed: ${(e?.message || e).toString().slice(0, 200)}`);
+      } finally {
+        setManaboxBusy(false);
+      }
     };
 
     const confirmSelection = () => {
@@ -3663,6 +3840,44 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   <button onClick=${() => { setCsv(""); setError(""); setPhase("select"); }}
                     style=${{ ...btnSec, marginLeft:"auto" }}>Cancel</button>
                 `}
+              </div>
+
+              <!-- ── Manabox share-URL importer ──────────────────────── -->
+              <div style=${{
+                marginTop:22, padding:"14px 16px",
+                background:"#f4f8fc", border:"1px solid #c8d8e8", borderRadius:10,
+              }}>
+                <div style=${{ fontSize:12, color:"#1a4070", lineHeight:1.7, marginBottom:10 }}>
+                  <strong style=${{ color:"#1a5080" }}>Or import a single deck from a Manabox share URL</strong>
+                  — paste any public deck URL like
+                  <code style=${{ background:"#fff", padding:"1px 5px", borderRadius:4, border:"1px solid #d8d8d8" }}>
+                    manabox.app/decks/PC_…
+                  </code>
+                  and we'll pull the full card list + commander directly. The deck is added under
+                  Collection → Decks (excluded from the eligible pool by default).
+                </div>
+                <div style=${{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+                  <input type="text"
+                    placeholder="https://manabox.app/decks/PC_…"
+                    value=${manaboxUrl}
+                    onInput=${e => setManaboxUrl(e.target.value)}
+                    onKeyDown=${e => e.key === "Enter" && importManaboxURL()}
+                    disabled=${manaboxBusy}
+                    style=${{
+                      ...inp, flex:1, minWidth:200,
+                      borderColor:"#9bbce5", background: manaboxBusy ? "#f0f0f0" : "#fff",
+                    }} />
+                  <button onClick=${importManaboxURL}
+                    disabled=${manaboxBusy || !manaboxUrl.trim()}
+                    style=${{
+                      ...btn, padding:"9px 18px", fontSize:13,
+                      background: manaboxBusy ? "#a0a0a0"
+                        : (!manaboxUrl.trim() ? "#c8b89a" : "linear-gradient(135deg,#1a5080,#2e7ab0)"),
+                      cursor: manaboxBusy || !manaboxUrl.trim() ? "default" : "pointer",
+                    }}>
+                    ${manaboxBusy ? "Fetching…" : "🔗 Import deck from URL"}
+                  </button>
+                </div>
               </div>
             </div>
           `}
