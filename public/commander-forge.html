@@ -758,6 +758,92 @@
     return body;
   }
 
+  // Fetch a deck back from Archidekt after push so we can surface their
+  // computed insights (salt total, estimated bracket, price totals, format
+  // errors). Their API field names aren't documented — we pull the full
+  // object and let the caller pick. Returns the JSON body on success, null
+  // on any failure (insights are nice-to-have, not critical).
+  async function archGetDeck(token, deckId) {
+    try {
+      const r = await fetch(`${ARCH_API}/decks/${encodeURIComponent(deckId)}/`, {
+        method: "GET",
+        credentials: "include",
+        headers: { "Accept": "application/json", "Authorization": `JWT ${token}` },
+      });
+      if (!r.ok) return null;
+      return await r.json();
+    } catch { return null; }
+  }
+
+  // Normalise Archidekt's deck object → a small insights record we render
+  // in the deck view. Defensive about field names because Archidekt's API
+  // is reverse-engineered and the schema can drift; missing fields just
+  // become null and the UI hides them.
+  function extractArchInsights(deck) {
+    if (!deck || typeof deck !== "object") return null;
+    // Salt total — Archidekt aggregates EDHRec salt scores per card.
+    // Common field paths: `salt`, `saltTotal`, `stats.salt`, ...
+    const salt = deck.salt
+              ?? deck.saltTotal
+              ?? deck.deckSalt
+              ?? deck.stats?.salt
+              ?? null;
+    // Estimated bracket — could be a number 1-5 or a string ("Bracket 3").
+    const bracket = deck.bracket
+                 ?? deck.estBracket
+                 ?? deck.estimatedBracket
+                 ?? deck.deckBracket
+                 ?? deck.bracketEstimate
+                 ?? null;
+    // Price totals — Archidekt computes per-vendor. We expose whatever
+    // they hand us; UI shows the first one available.
+    const prices = {
+      tcg:       deck.totalPrice ?? deck.prices?.tcg       ?? deck.priceTotals?.tcg       ?? null,
+      ck:        deck.cardKingdomPrice ?? deck.prices?.ck  ?? deck.priceTotals?.ck        ?? null,
+      cardmarket:deck.cardmarketPrice ?? deck.prices?.cardmarket ?? deck.priceTotals?.eu  ?? null,
+    };
+    // Errors / format warnings.
+    const errors = deck.errors
+                ?? deck.formatErrors
+                ?? deck.warnings
+                ?? deck.deckErrors
+                ?? deck.legalityErrors
+                ?? [];
+    // Computed-from-cards salt as a fallback: many Archidekt deck responses
+    // include per-card salt in cards[].card.saltScore.
+    let cardSaltSum = null;
+    if (salt == null && Array.isArray(deck.cards)) {
+      let s = 0, found = false;
+      for (const entry of deck.cards) {
+        const sc = entry?.card?.saltScore ?? entry?.card?.salt;
+        if (typeof sc === "number") { s += sc * (entry.quantity || 1); found = true; }
+      }
+      if (found) cardSaltSum = Math.round(s * 100) / 100;
+    }
+    // Same trick for prices if not exposed at deck level.
+    let cardTcgSum = null;
+    if (prices.tcg == null && Array.isArray(deck.cards)) {
+      let s = 0, found = false;
+      for (const entry of deck.cards) {
+        const p = parseFloat(entry?.card?.prices?.tcg ?? entry?.card?.prices?.usd ?? entry?.card?.tcgPrice);
+        if (!isNaN(p)) { s += p * (entry.quantity || 1); found = true; }
+      }
+      if (found) cardTcgSum = Math.round(s * 100) / 100;
+    }
+    return {
+      salt:    typeof salt === "number" ? Math.round(salt * 100) / 100 : (cardSaltSum != null ? cardSaltSum : null),
+      bracket,
+      prices: {
+        tcg:        prices.tcg        ?? cardTcgSum,
+        ck:         prices.ck,
+        cardmarket: prices.cardmarket,
+      },
+      errors: Array.isArray(errors) ? errors.filter(Boolean) : (errors ? [errors] : []),
+      // The full raw deck — useful for debugging if a field path is missing.
+      raw: deck,
+    };
+  }
+
   // Resolve a card name → Scryfall UUID via Scryfall (when our local enrichment
   // didn't capture an `id`, e.g. for basic lands or cards not in the collection).
   async function archResolveCardId(name) {
@@ -2885,12 +2971,33 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         const url = `https://archidekt.com/decks/${deckId}`;
         setArchPushing(false);
         const skipped = syntaxErrors.length + cardErrors.length;
+
+        // 4a) Pull back Archidekt's computed insights (salt sum, est. bracket,
+        // cost totals, format errors). This is best-effort — if the fetch
+        // fails the push still succeeded, we just don't show the panel.
+        let insights = null;
+        try {
+          const deckResp = await archGetDeck(token, deckId);
+          insights = extractArchInsights(deckResp);
+          if (insights) {
+            const bits = [];
+            if (insights.salt != null)       bits.push(`salt ${insights.salt}`);
+            if (insights.bracket != null)    bits.push(`bracket ${insights.bracket}`);
+            if (insights.prices.tcg != null) bits.push(`$${insights.prices.tcg}`);
+            if (insights.errors.length)      bits.push(`${insights.errors.length} issue(s)`);
+            if (bits.length) addLog(`📊 Archidekt insights: ${bits.join(" · ")}.`);
+          }
+        } catch (e) {
+          addLog(`ℹ️ Couldn't fetch deck insights: ${(e?.message || e).toString().slice(0, 120)}.`);
+        }
+
         setArchResult({
           kind: "ok",
           url,
           msg: skipped > 0
             ? `Deck created with ${total - skipped}/${total} cards (${skipped} couldn't be matched — see build log).`
             : `Deck created with all ${total} cards.`,
+          insights,
         });
         window.open(url, "_blank");
       } catch (e) {
@@ -4831,6 +4938,119 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   <button onClick=${() => setArchResult(null)}
                     style=${{ background:"transparent", border:"none", color:"inherit",
                       cursor:"pointer", fontSize:14, fontFamily:"inherit", padding:"0 4px" }}>×</button>
+                </div>
+              `}
+
+              ${archResult && archResult.insights && (
+                archResult.insights.salt != null ||
+                archResult.insights.bracket != null ||
+                archResult.insights.prices?.tcg != null ||
+                archResult.insights.prices?.ck != null ||
+                archResult.insights.prices?.cardmarket != null ||
+                archResult.insights.errors?.length > 0
+              ) && html`
+                <!-- Archidekt insights — computed by Archidekt server-side after
+                     the deck is created.  Shows what they returned; missing
+                     metrics are silently omitted. -->
+                <div style=${{
+                  borderRadius:10, padding:"12px 16px", marginBottom:14,
+                  background:"#fff8ee", border:"1px solid #d8c090",
+                }}>
+                  <div style=${{ fontSize:10, letterSpacing:3, color:"#8a4010",
+                    textTransform:"uppercase", fontWeight:700, marginBottom:10,
+                    display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                    <span>📊 Archidekt Insights</span>
+                    <a href=${archResult.url} target="_blank" rel="noopener"
+                      style=${{ fontSize:10, color:"#7a3010", textDecoration:"underline",
+                        letterSpacing:0, textTransform:"none", fontWeight:600 }}>
+                      View on Archidekt ↗
+                    </a>
+                  </div>
+
+                  <!-- Metric chips -->
+                  <div style=${{ display:"flex", gap:10, flexWrap:"wrap" }}>
+                    ${archResult.insights.bracket != null && html`
+                      <div style=${{
+                        flex:"1 1 110px", padding:"8px 12px", borderRadius:8,
+                        background:"#fff", border:"1px solid #e0c890",
+                      }}>
+                        <div style=${{ fontSize:9, letterSpacing:2, color:"#8a5810",
+                          textTransform:"uppercase", fontWeight:700, marginBottom:2 }}>Est. Bracket</div>
+                        <div style=${{ fontSize:18, fontWeight:700, color:"#3a1a00" }}>
+                          ${archResult.insights.bracket}
+                        </div>
+                      </div>
+                    `}
+                    ${archResult.insights.salt != null && html`
+                      <div style=${{
+                        flex:"1 1 110px", padding:"8px 12px", borderRadius:8,
+                        background:"#fff", border:"1px solid #e0c890",
+                      }}>
+                        <div style=${{ fontSize:9, letterSpacing:2, color:"#8a5810",
+                          textTransform:"uppercase", fontWeight:700, marginBottom:2 }}>🧂 Salt Sum</div>
+                        <div style=${{ fontSize:18, fontWeight:700, color:"#3a1a00" }}>
+                          ${archResult.insights.salt}
+                        </div>
+                      </div>
+                    `}
+                    ${archResult.insights.prices?.tcg != null && html`
+                      <div style=${{
+                        flex:"1 1 110px", padding:"8px 12px", borderRadius:8,
+                        background:"#fff", border:"1px solid #e0c890",
+                      }}>
+                        <div style=${{ fontSize:9, letterSpacing:2, color:"#8a5810",
+                          textTransform:"uppercase", fontWeight:700, marginBottom:2 }}>TCGPlayer</div>
+                        <div style=${{ fontSize:18, fontWeight:700, color:"#3a1a00" }}>
+                          $${(+archResult.insights.prices.tcg).toFixed(2)}
+                        </div>
+                      </div>
+                    `}
+                    ${archResult.insights.prices?.ck != null && html`
+                      <div style=${{
+                        flex:"1 1 110px", padding:"8px 12px", borderRadius:8,
+                        background:"#fff", border:"1px solid #e0c890",
+                      }}>
+                        <div style=${{ fontSize:9, letterSpacing:2, color:"#8a5810",
+                          textTransform:"uppercase", fontWeight:700, marginBottom:2 }}>Card Kingdom</div>
+                        <div style=${{ fontSize:18, fontWeight:700, color:"#3a1a00" }}>
+                          $${(+archResult.insights.prices.ck).toFixed(2)}
+                        </div>
+                      </div>
+                    `}
+                    ${archResult.insights.prices?.cardmarket != null && html`
+                      <div style=${{
+                        flex:"1 1 110px", padding:"8px 12px", borderRadius:8,
+                        background:"#fff", border:"1px solid #e0c890",
+                      }}>
+                        <div style=${{ fontSize:9, letterSpacing:2, color:"#8a5810",
+                          textTransform:"uppercase", fontWeight:700, marginBottom:2 }}>Cardmarket</div>
+                        <div style=${{ fontSize:18, fontWeight:700, color:"#3a1a00" }}>
+                          €${(+archResult.insights.prices.cardmarket).toFixed(2)}
+                        </div>
+                      </div>
+                    `}
+                  </div>
+
+                  ${archResult.insights.errors.length > 0 && html`
+                    <div style=${{
+                      marginTop:10, padding:"8px 12px", borderRadius:8,
+                      background:"#fff5e8", border:"1px solid #e8b070",
+                      fontSize:12, color:"#7a4010", lineHeight:1.6,
+                    }}>
+                      <strong>⚠️ ${archResult.insights.errors.length} issue${archResult.insights.errors.length > 1 ? "s" : ""}</strong>
+                      reported by Archidekt:
+                      <ul style=${{ margin:"4px 0 0 18px", padding:0, fontSize:11 }}>
+                        ${archResult.insights.errors.slice(0, 6).map((e, i) => html`
+                          <li key=${i}>${typeof e === "string" ? e : (e?.message || e?.detail || JSON.stringify(e).slice(0,140))}</li>
+                        `)}
+                        ${archResult.insights.errors.length > 6 && html`
+                          <li style=${{ fontStyle:"italic", color:"#a06040" }}>
+                            …and ${archResult.insights.errors.length - 6} more (see deck on Archidekt for the full list).
+                          </li>
+                        `}
+                      </ul>
+                    </div>
+                  `}
                 </div>
               `}
 
