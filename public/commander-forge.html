@@ -180,7 +180,7 @@
       id: `basic-${name.toLowerCase()}`, name, layout: "normal",
       mana_cost: "", cmc: 0, type_line: `Basic Land — ${name}`,
       oracle_text: "", color_identity: colorIdentity,
-      image_uris: { small: BASIC_IMG[name], normal: BASIC_IMG[name] },
+      image_uris: { small: BASIC_IMG[name], normal: BASIC_IMG_NORMAL[name] || BASIC_IMG[name] },
       set: "", set_type: "core", border_color: "black",
       commander_legal: true,
     };
@@ -1284,12 +1284,27 @@
   const C_BG    = { W:"#f5eecc", U:"#2d6eaa", B:"#3a1a5a", R:"#c03030", G:"#1e6e38" };
   const C_LABEL = { W:"White", U:"Blue", B:"Black", R:"Red", G:"Green" };
   const BASIC_LAND = { W:"Plains", U:"Island", B:"Swamp", R:"Mountain", G:"Forest" };
+  // Use Scryfall's /cards/named endpoint with format=image — it 302s to the
+  // current canonical image for that card name, so we don't have to hardcode
+  // a UUID (which can rot when Scryfall reorganises printings, as the old
+  // hardcoded URLs did). Works for both small and normal thumbnail sizes.
+  const basicImgURL = (name, size = "small") =>
+    `https://api.scryfall.com/cards/named?exact=${encodeURIComponent(name)}&format=image&version=${size}`;
   const BASIC_IMG  = {
-    Plains:   "https://cards.scryfall.io/small/front/b/6/b6f787b0-b3e1-4b6c-a7e8-7fa49ae0e9a3.jpg",
-    Island:   "https://cards.scryfall.io/small/front/d/0/d0a2d0af-3f2e-4b42-ac27-c66f52d0cd3e.jpg",
-    Swamp:    "https://cards.scryfall.io/small/front/f/e/fe33b35b-21b3-4be0-b432-d0e53aa23448.jpg",
-    Mountain: "https://cards.scryfall.io/small/front/4/7/4766aa7e-8e2e-411a-9a7d-af89d7f8b97c.jpg",
-    Forest:   "https://cards.scryfall.io/small/front/c/7/c73e7f9b-afda-4ebb-b2b8-dd78e70b7e20.jpg",
+    Plains:   basicImgURL("Plains"),
+    Island:   basicImgURL("Island"),
+    Swamp:    basicImgURL("Swamp"),
+    Mountain: basicImgURL("Mountain"),
+    Forest:   basicImgURL("Forest"),
+    Wastes:   basicImgURL("Wastes"),
+  };
+  const BASIC_IMG_NORMAL = {
+    Plains:   basicImgURL("Plains",   "normal"),
+    Island:   basicImgURL("Island",   "normal"),
+    Swamp:    basicImgURL("Swamp",    "normal"),
+    Mountain: basicImgURL("Mountain", "normal"),
+    Forest:   basicImgURL("Forest",   "normal"),
+    Wastes:   basicImgURL("Wastes",   "normal"),
   };
 
   const btn = {
@@ -1311,6 +1326,35 @@
     textTransform:"uppercase", marginBottom:8, fontWeight:700, display:"block" };
 
   // ── Components ──────────────────────────────────────────────────────────────
+  // Render an MTG mana-cost string ("{2}{W}{U}", "{X}{R}", etc.) as a row of
+  // Scryfall SVG mana-symbol icons — same visual treatment Manabox uses.
+  // Falls back to the raw text if the cost is empty or unparseable.
+  function ManaCost({ cost, size = 14 }) {
+    if (!cost) return null;
+    let tokens = cost.match(/\{[^}]+\}/g) || [];
+    if (tokens.length === 0) {
+      // Some cards expose mana_cost as plain "2WU" — try a best-effort parse.
+      tokens = (cost.match(/[0-9]+|[WUBRGCSXY]/g) || []).map(s => `{${s}}`);
+      if (tokens.length === 0) {
+        return html`<span style=${{ fontFamily:"monospace", fontSize: Math.round(size * 0.85) }}>${cost}</span>`;
+      }
+    }
+    return html`
+      <span style=${{ display:"inline-flex", gap:1, alignItems:"center", verticalAlign:"middle" }}>
+        ${tokens.map((t, i) => {
+          // Strip braces and normalise: "{W/U}" → "WU", "{2/W}" → "2W",
+          // "{T}" → "T" etc. Scryfall serves all variants under
+          // /card-symbols/<inner>.svg with slashes URL-encoded.
+          const inner = t.slice(1, -1).replace(/\//g, "");
+          const url   = `https://svgs.scryfall.io/card-symbols/${encodeURIComponent(inner)}.svg`;
+          return html`<img key=${i} src=${url} alt=${t} title=${t}
+            style=${{ width:size, height:size, display:"inline-block",
+              borderRadius:"50%", boxShadow:"0 1px 2px rgba(0,0,0,0.18)" }} />`;
+        })}
+      </span>
+    `;
+  }
+
   function Pip({ c }) {
     return html`<span title=${C_LABEL[c]||"Colorless"} style=${{
       display:"inline-block", width:14, height:14, borderRadius:"50%",
@@ -3433,7 +3477,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       // mana-curve and type-breakdown all light up correctly.
       const BASICS = new Set(["Plains","Island","Swamp","Mountain","Forest","Wastes"]);
       const BASIC_CI = { Plains:["W"], Island:["U"], Swamp:["B"], Mountain:["R"], Forest:["G"], Wastes:[] };
-      const CAT_ORDER = ["Lands","Creatures","Instants","Sorceries","Enchantments","Artifacts","Planeswalkers","Battles","Other"];
+      // Lands intentionally LAST — matches Manabox/Moxfield convention and
+      // gets the most-visible non-land cards into view first.
+      const CAT_ORDER = ["Creatures","Instants","Sorceries","Enchantments","Artifacts","Planeswalkers","Battles","Other","Lands"];
       const byCat = Object.fromEntries(CAT_ORDER.map(c => [c, []]));
       const categorise = tl => {
         const t = (tl || "").toLowerCase();
@@ -3617,6 +3663,52 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setDeckSvd(true);      // already in Collection — hide that button
       setError("");
       setPhase("deck");
+    };
+
+    // Swap the commander of the currently-open deck to a different card from
+    // the deck's commanderCandidates list (legal commanders found during
+    // enrichment). Used to fix auto-detect mis-picks (e.g. a precon where
+    // the wrong legendary was chosen).
+    const changeCommanderTo = async (newCmdrName) => {
+      if (!newCmdrName || !selCmd || newCmdrName === selCmd.name) return;
+
+      // Need full Scryfall data for the new commander. Try the Scryfall cache
+      // first; fall back to a fresh lookup so the sidebar renders properly.
+      let cmdrCard = null;
+      try {
+        const results = await fetchAllScryfall(
+          [{ name: newCmdrName, qty: 1, id: "" }],
+          () => {}, () => {},
+        );
+        cmdrCard = results.find(c => c.name.toLowerCase() === newCmdrName.toLowerCase()) || null;
+      } catch {}
+
+      const newSelCmd = {
+        ...selCmd,
+        name: newCmdrName,
+        card: cmdrCard || { name: newCmdrName, scryfall: {} },
+        // Keep commanderCandidates from the original so the picker stays usable.
+        commanderCandidates: selCmd.commanderCandidates || [],
+      };
+      setSelCmd(newSelCmd);
+
+      // Persist back to groups.decks if this deck is in the collection so the
+      // change survives reloads and cloud-syncs across devices.
+      if (fromCollection || fromSaved) {
+        // Find the matching entry in groups.decks (by saved selCmd name or
+        // by the current deck theme/name — generated decks store both).
+        const updatedDecks = groups.decks.map(d => {
+          if (d.deckData === deck || (d.selCmd && d.selCmd.name === selCmd.name && d.name)) {
+            return { ...d, selCmd: newSelCmd, commanderName: newCmdrName };
+          }
+          return d;
+        });
+        const nextGroups = { ...groups, decks: updatedDecks };
+        setGroups(nextGroups);
+        localStorage.setItem(LS_BINDERS, JSON.stringify({
+          groups: nextGroups, deckInc, binInc,
+        }));
+      }
     };
 
     const restoreUnsavedDeck = () => {
@@ -5029,13 +5121,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 fontWeight:700, marginBottom:6, lineHeight:1.3 }}>${cand.name}</div>
                               <div style=${{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap", marginBottom:5 }}>
                                 ${ci.map(c => html`<${Pip} key=${c} c=${c} />`)}
-                                ${sf.mana_cost && html`
-                                  <span style=${{ fontSize:10, color:"#5a3a1a",
-                                    background:"#fff", padding:"1px 6px", borderRadius:8,
-                                    border:"1px solid #d8c090", fontFamily:"monospace" }}>
-                                    ${sf.mana_cost}
-                                  </span>
-                                `}
+                                ${sf.mana_cost && html`<${ManaCost} cost=${sf.mana_cost} size=${14} />`}
                               </div>
                               ${sf.type_line && html`
                                 <div style=${{ fontSize:11, color:"#5a3a1a", fontStyle:"italic", marginBottom:10 }}>
@@ -5083,13 +5169,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 fontWeight:700, marginBottom:5, lineHeight:1.3 }}>${cand.name}</div>
                               <div style=${{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap", marginBottom:4 }}>
                                 ${ci.map(c => html`<${Pip} key=${c} c=${c} />`)}
-                                ${sf.mana_cost && html`
-                                  <span style=${{ fontSize:10, color:"#5a3a1a",
-                                    background:"#fff", padding:"1px 6px", borderRadius:8,
-                                    border:"1px solid #d8c090", fontFamily:"monospace" }}>
-                                    ${sf.mana_cost}
-                                  </span>
-                                `}
+                                ${sf.mana_cost && html`<${ManaCost} cost=${sf.mana_cost} size=${14} />`}
                               </div>
                               ${sf.type_line && html`
                                 <div style=${{ fontSize:10, color:"#5a3a1a", fontStyle:"italic" }}>
@@ -5171,11 +5251,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   <div style=${{ display:"flex", alignItems:"center", gap:5,
                     flexWrap:"wrap", marginBottom:4 }}>
                     ${ci.map(c => html`<${Pip} key=${c} c=${c} />`)}
-                    ${sf.mana_cost && html`
-                      <span style=${{ fontSize:11, color:"#5a3a1a", background:"#fff",
-                        padding:"1px 7px", borderRadius:7, border:"1px solid #d8c090",
-                        fontFamily:"monospace" }}>${sf.mana_cost}</span>
-                    `}
+                    ${sf.mana_cost && html`<${ManaCost} cost=${sf.mana_cost} size=${16} />`}
                   </div>
 
                   ${sf.type_line && html`
@@ -5215,6 +5291,38 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       <span>🌐 EDHRec rank</span>
                       <span style=${{ fontWeight:800 }}>#${sf.edhrec_rank.toLocaleString()}</span>
                     </a>
+                  `}
+
+                  ${selCmd.commanderCandidates && selCmd.commanderCandidates.length > 1 && html`
+                    <!-- Commander picker — auto-detect can pick the wrong one
+                         (e.g. a precon where another legendary is more popular
+                         on EDHRec). Lets the user swap to any legal commander
+                         found in the deck. -->
+                    <div style=${{
+                      marginTop:10, padding:"8px 10px", borderRadius:8,
+                      background:"#fff8ee", border:"1px solid #e0c890",
+                    }}>
+                      <div style=${{
+                        fontSize:9, letterSpacing:2, color:"#8a5810",
+                        textTransform:"uppercase", fontWeight:700, marginBottom:5,
+                      }}>Change commander</div>
+                      <select value=${selCmd.name}
+                        onChange=${e => changeCommanderTo(e.target.value)}
+                        style=${{
+                          width:"100%", background:"#fff", border:"1px solid #d8c090",
+                          borderRadius:6, padding:"4px 6px", fontFamily:"inherit",
+                          fontSize:11, color:"#3a1a00", cursor:"pointer",
+                        }}>
+                        ${selCmd.commanderCandidates.map(name => html`
+                          <option key=${name} value=${name}>
+                            ${name === selCmd.name ? "✓ " : ""}${name}
+                          </option>
+                        `)}
+                      </select>
+                      <div style=${{ fontSize:10, color:"#8a6a4a", marginTop:4, lineHeight:1.5, fontStyle:"italic" }}>
+                        ${selCmd.commanderCandidates.length} legal commander${selCmd.commanderCandidates.length === 1 ? "" : "s"} found in this deck.
+                      </div>
+                    </div>
                   `}
                 </div>
               `;
@@ -5627,7 +5735,12 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               `}
 
               <div style=${{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:22 }}>
-                ${deck.categories.map(cat => {
+                ${[...deck.categories].sort((a, b) => {
+                  // Lands always last; everything else keeps its original order.
+                  const aL = /^lands?$/i.test(a.name.trim()) ? 1 : 0;
+                  const bL = /^lands?$/i.test(b.name.trim()) ? 1 : 0;
+                  return aL - bL;
+                }).map(cat => {
                   const slug = cat.name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
                   return html`
                     <button key=${cat.name}
@@ -5724,7 +5837,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 `;
               })()}
 
-              ${deck.categories.map(cat => {
+              ${[...deck.categories].sort((a, b) => {
+                const aL = /^lands?$/i.test(a.name.trim()) ? 1 : 0;
+                const bL = /^lands?$/i.test(b.name.trim()) ? 1 : 0;
+                return aL - bL;
+              }).map(cat => {
                 const slug = cat.name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
                 const isLandCat = /^lands?$/i.test(cat.name.trim());
                 const isBasicCard = c => /basic land/i.test(c.type_line || "") ||
@@ -5758,13 +5875,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             <div style=${{ display:"flex", alignItems:"center", gap:6,
                               marginBottom:1, flexWrap:"wrap" }}>
                               <span style=${{ color:"#2a1000", fontSize:11, fontWeight:600 }}>${card.name}</span>
-                              ${card.mana_cost && html`
-                                <span style=${{ fontSize:10, color:"#7a5a3a",
-                                  background:"#fff", padding:"0 5px", borderRadius:6,
-                                  border:"1px solid #e0c890", fontFamily:"monospace" }}>
-                                  ${card.mana_cost}
-                                </span>
-                              `}
+                              ${card.mana_cost && html`<${ManaCost} cost=${card.mana_cost} size=${13} />`}
                               ${isBasic && html`
                                 <span style=${{ fontSize:9, padding:"1px 6px", borderRadius:10, fontWeight:600,
                                   background:"#d8eaf8", color:"#1a5a8a" }}>Basic</span>
@@ -6023,11 +6134,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             </div>
                             <div style=${{ display:"flex", gap:4, flexWrap:"wrap", alignItems:"center", marginBottom:5 }}>
                               ${ci.map(c => html`<${Pip} key=${c} c=${c} />`)}
-                              ${sf.mana_cost && html`
-                                <span style=${{ fontSize:10, color:"#5a3a1a", background:"#fff",
-                                  padding:"1px 6px", borderRadius:6, border:"1px solid #d8c090",
-                                  fontFamily:"monospace" }}>${sf.mana_cost}</span>
-                              `}
+                              ${sf.mana_cost && html`<${ManaCost} cost=${sf.mana_cost} size=${13} />`}
                             </div>
                             ${(!isImported || isEnriched) && html`
                               <div style=${{ fontSize:11, color:"#5a2a08", fontStyle:"italic", marginBottom:3 }}>
