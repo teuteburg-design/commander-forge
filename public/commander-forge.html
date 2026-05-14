@@ -930,6 +930,7 @@
       type: "binder",
       cards: [...cards.values()],
       commanderName: null,
+      source: "csv:moxfield",   // tag for the re-import diff logic
     };
     return { decks: [], binders: [binder], stats };
   }
@@ -1064,6 +1065,97 @@
     return parseManaboxShareHTML(html);
   }
 
+  // ── Collection-check / re-import diff ───────────────────────────────────────
+  //
+  // When the user re-imports a CSV, we don't want to silently overwrite
+  // everything. Compute a diff:
+  //   - Added decks/binders (in new CSV, not in old)
+  //   - Removed decks/binders (in old CSV-sourced data, not in new)
+  //   - Changed entries (same name, different card list)
+  //   - Preserved non-CSV decks (generated, manabox-share) — never touched
+  // The user reviews the summary on an "import_review" screen, then
+  // confirms to apply.
+
+  const isCsvSourced = entry =>
+    !entry.source ||                       // legacy entries (pre-source-tag) treated as CSV
+    entry.source === "csv:manabox" ||
+    entry.source === "csv:moxfield";
+
+  function diffCardLists(oldCards, newCards) {
+    const oldMap = new Map((oldCards || []).map(c => [c.name, c.qty || 1]));
+    const newMap = new Map((newCards || []).map(c => [c.name, c.qty || 1]));
+    const added = [], removed = [], qtyChanged = [];
+    for (const [name, qty] of newMap) {
+      if (!oldMap.has(name)) added.push({ name, qty });
+      else if (oldMap.get(name) !== qty) qtyChanged.push({ name, oldQty: oldMap.get(name), newQty: qty });
+    }
+    for (const [name, qty] of oldMap) {
+      if (!newMap.has(name)) removed.push({ name, qty });
+    }
+    return {
+      added, removed, qtyChanged,
+      changed: added.length + removed.length + qtyChanged.length > 0,
+      // Totals for quick summary lines.
+      addedQty:   added.reduce((s, c) => s + c.qty, 0),
+      removedQty: removed.reduce((s, c) => s + c.qty, 0),
+    };
+  }
+
+  function diffGroups(oldGroups, newGroups) {
+    // Old entries we MIGHT be replacing — only those with a CSV source.
+    // Generated decks (Save-to-Collection output) and manabox-share imports
+    // are preserved as-is.
+    const oldDecksCsv   = (oldGroups.decks   || []).filter(isCsvSourced);
+    const preservedDecks = (oldGroups.decks  || []).filter(d => !isCsvSourced(d));
+    const oldBindersCsv = (oldGroups.binders || []).filter(isCsvSourced);
+    // Binders always come from CSV, but future-proof the filter.
+    const preservedBinders = (oldGroups.binders || []).filter(b => !isCsvSourced(b));
+
+    const oldDeckMap   = new Map(oldDecksCsv.map(d => [d.name, d]));
+    const newDeckMap   = new Map((newGroups.decks   || []).map(d => [d.name, d]));
+    const oldBinderMap = new Map(oldBindersCsv.map(b => [b.name, b]));
+    const newBinderMap = new Map((newGroups.binders || []).map(b => [b.name, b]));
+
+    const decks = { added: [], removed: [], changed: [], unchanged: [] };
+    for (const [name, d] of newDeckMap) {
+      if (!oldDeckMap.has(name)) decks.added.push(d);
+    }
+    for (const [name, d] of oldDeckMap) {
+      if (!newDeckMap.has(name)) {
+        decks.removed.push(d);
+      } else {
+        const cardDiff = diffCardLists(d.cards, newDeckMap.get(name).cards);
+        if (cardDiff.changed) decks.changed.push({ name, oldEntry: d, newEntry: newDeckMap.get(name), ...cardDiff });
+        else decks.unchanged.push(d);
+      }
+    }
+
+    const binders = { added: [], removed: [], changed: [], unchanged: [] };
+    for (const [name, b] of newBinderMap) {
+      if (!oldBinderMap.has(name)) binders.added.push(b);
+    }
+    for (const [name, b] of oldBinderMap) {
+      if (!newBinderMap.has(name)) {
+        binders.removed.push(b);
+      } else {
+        const cardDiff = diffCardLists(b.cards, newBinderMap.get(name).cards);
+        if (cardDiff.changed) binders.changed.push({ name, oldEntry: b, newEntry: newBinderMap.get(name), ...cardDiff });
+        else binders.unchanged.push(b);
+      }
+    }
+
+    const totalChanges =
+      decks.added.length + decks.removed.length + decks.changed.length +
+      binders.added.length + binders.removed.length + binders.changed.length;
+
+    return {
+      decks, binders,
+      preservedDecks, preservedBinders,
+      totalChanges,
+      isNoOp: totalChanges === 0,
+    };
+  }
+
   // Dispatcher that picks the right parser based on header detection.
   function parseCollectionCSV(text) {
     const format = detectCSVFormat(text);
@@ -1107,7 +1199,12 @@
     }
     const decks = [], binders = [];
     for (const [, g] of groups) {
-      const item = { name: g.name, type: g.type, cards: [...g.cards.values()], commanderName: g.commanderName || null };
+      const item = {
+        name: g.name, type: g.type,
+        cards: [...g.cards.values()],
+        commanderName: g.commanderName || null,
+        source: "csv:manabox",   // tag for the re-import diff logic
+      };
       if (g.type === "deck") decks.push(item); else binders.push(item);
     }
     return { decks, binders, stats };
@@ -1503,6 +1600,9 @@
     const [csvDragOver, setCsvDragOver] = useState(false);
     const [manaboxUrl, setManaboxUrl] = useState("");
     const [manaboxBusy, setManaboxBusy] = useState(false);
+    // When a re-import is in progress, this holds { parsed, diff } so the
+    // import_review screen can render the change summary. Null = no review pending.
+    const [importReview, setImportReview] = useState(null);
     const csvFileRef = useRef(null);
     const readCsvFile = (file) => {
       if (!file) return;
@@ -2045,13 +2145,72 @@
         const src = parsed.format === "moxfield" ? "Moxfield" : "Manabox";
         setError(`No cards found in the ${src} CSV. Make sure you exported the full collection.`); return;
       }
-      const di = {}; parsed.decks.forEach(d => { di[d.name] = false; });
-      const bi = {}; parsed.binders.forEach(b => { bi[b.name] = true; });
-      setGroups({ decks: parsed.decks, binders: parsed.binders });
-      setDeckInc(di); setBinInc(bi);
-      setParseStats({ ...parsed.stats, format: parsed.format });
+
+      // First import or no CSV-sourced data present → apply directly (no
+      // review needed because there's nothing to diff against).
+      const hasExistingCsvData =
+        (groups.decks   || []).some(isCsvSourced) ||
+        (groups.binders || []).some(isCsvSourced);
+
+      if (!hasExistingCsvData) {
+        const di = {}; parsed.decks.forEach(d => { di[d.name] = false; });
+        const bi = {}; parsed.binders.forEach(b => { bi[b.name] = true; });
+        // Preserve any non-CSV entries (generated decks, URL-imported decks).
+        const preservedDecks   = (groups.decks   || []).filter(d => !isCsvSourced(d));
+        const preservedBinders = (groups.binders || []).filter(b => !isCsvSourced(b));
+        // Their existing inclusion settings should survive.
+        preservedDecks.forEach(d => { if (!(d.name in di)) di[d.name] = !!deckInc[d.name]; });
+        preservedBinders.forEach(b => { if (!(b.name in bi)) bi[b.name] = !!binInc[b.name]; });
+        setGroups({
+          decks:   [...preservedDecks, ...parsed.decks],
+          binders: [...preservedBinders, ...parsed.binders],
+        });
+        setDeckInc(di); setBinInc(bi);
+        setParseStats({ ...parsed.stats, format: parsed.format });
+        setError(""); setCsv("");
+        setPhase("select");
+        return;
+      }
+
+      // Existing CSV data — compute diff and let the user review before applying.
+      const diff = diffGroups(groups, { decks: parsed.decks, binders: parsed.binders });
+      setImportReview({ parsed, diff });
       setError(""); setCsv("");
+      setPhase("import_review");
+    };
+
+    // Apply the changes from the import-review screen. Replaces CSV-sourced
+    // entries with the new ones; preserves generated / URL-imported entries
+    // untouched. Selection state (deckInc/binInc) carried over for entries
+    // that survive, with sensible defaults for new ones.
+    const applyImportChanges = () => {
+      if (!importReview) return;
+      const { parsed, diff } = importReview;
+
+      const nextDecks   = [...diff.preservedDecks,   ...parsed.decks];
+      const nextBinders = [...diff.preservedBinders, ...parsed.binders];
+
+      const di = {};
+      const bi = {};
+      // Carry inclusion state over for surviving entries, default for new ones.
+      nextDecks.forEach(d => {
+        di[d.name] = (d.name in deckInc) ? deckInc[d.name] : false;   // decks excluded by default
+      });
+      nextBinders.forEach(b => {
+        bi[b.name] = (b.name in binInc) ? binInc[b.name] : true;      // binders included by default
+      });
+
+      setGroups({ decks: nextDecks, binders: nextBinders });
+      setDeckInc(di);
+      setBinInc(bi);
+      setParseStats({ ...parsed.stats, format: parsed.format });
+      setImportReview(null);
       setPhase("select");
+    };
+
+    const cancelImportChanges = () => {
+      setImportReview(null);
+      setPhase("import");
     };
 
     // Import a single deck from a public Manabox share URL
@@ -4021,6 +4180,247 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               </div>
             </div>
           `}
+
+          <!-- ── IMPORT REVIEW (Collection Check) ───────────────────────── -->
+          ${phase === "import_review" && importReview && (() => {
+            const { parsed, diff } = importReview;
+            const fmtBadge = parsed.format === "moxfield"
+              ? { txt:"MOXFIELD", bg:"#eaf3ff", col:"#1a5080", brd:"#9bbce5" }
+              : { txt:"MANABOX",  bg:"#f7ecdc", col:"#7a3a10", brd:"#d8b870" };
+
+            // Cap card lists shown per entry; full lists could be huge.
+            const PER_ENTRY_LIMIT = 12;
+
+            const renderCardList = (list, color) => html`
+              <div style=${{ display:"flex", flexWrap:"wrap", gap:5, marginTop:4 }}>
+                ${list.slice(0, PER_ENTRY_LIMIT).map(c => html`
+                  <span style=${{
+                    fontSize:11, padding:"1px 7px", borderRadius:8,
+                    background:"#fff", color, border:"1px solid " + color + "55",
+                  }}>${c.name}${(c.qty || c.newQty) > 1 ? ` ×${c.qty || c.newQty}` : ""}</span>
+                `)}
+                ${list.length > PER_ENTRY_LIMIT && html`
+                  <span style=${{ fontSize:11, color:"#9a7a5a", fontStyle:"italic" }}>
+                    …and ${list.length - PER_ENTRY_LIMIT} more
+                  </span>
+                `}
+              </div>
+            `;
+
+            return html`
+            <div style=${{ maxWidth:900, margin:"0 auto" }}>
+              <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:12, marginBottom:18 }}>
+                <div>
+                  <h2 style=${{ fontSize:18, color:"#3a1a00", margin:"0 0 4px" }}>📋 Collection Check</h2>
+                  <p style=${{ fontSize:13, color:"#7a5a3a" }}>
+                    Review what will change before applying the new import. Your
+                    saved-to-Collection generated decks and URL-imported decks are
+                    always preserved.
+                  </p>
+                </div>
+                <div style=${{ display:"flex", gap:8, flexShrink:0 }}>
+                  <button onClick=${cancelImportChanges}
+                    style=${{ ...btnSec, fontSize:12, padding:"7px 14px" }}>Cancel</button>
+                  <button onClick=${applyImportChanges}
+                    style=${{ ...btn, fontSize:12, padding:"7px 16px" }}>
+                    Apply ${diff.totalChanges} change${diff.totalChanges === 1 ? "" : "s"} →
+                  </button>
+                </div>
+              </div>
+
+              <!-- Summary -->
+              <div style=${{
+                marginBottom:18, padding:"12px 16px", borderRadius:10,
+                background: diff.isNoOp ? "#f0f6f0" : "#fff8ee",
+                border: "1px solid " + (diff.isNoOp ? "#bcd8bc" : "#e0c890"),
+                fontSize:13, color:"#3a2010", lineHeight:1.8,
+              }}>
+                <span style=${{
+                  display:"inline-block", padding:"1px 8px", borderRadius:10, fontWeight:700,
+                  fontSize:10, letterSpacing:0.5, marginRight:8,
+                  background: fmtBadge.bg, color: fmtBadge.col,
+                  border:"1px solid " + fmtBadge.brd,
+                }}>${fmtBadge.txt}</span>
+                ${diff.isNoOp
+                  ? html`<strong>No changes detected.</strong> The new CSV matches your current import exactly.`
+                  : html`
+                    <strong>${diff.totalChanges} change${diff.totalChanges === 1 ? "" : "s"}</strong>:
+                    ${diff.binders.added.length   > 0 ? ` +${diff.binders.added.length} binder(s) added`   : ""}
+                    ${diff.binders.removed.length > 0 ? ` · −${diff.binders.removed.length} binder(s) removed` : ""}
+                    ${diff.binders.changed.length > 0 ? ` · ${diff.binders.changed.length} binder(s) changed`  : ""}
+                    ${diff.decks.added.length     > 0 ? ` · +${diff.decks.added.length} deck(s) added`     : ""}
+                    ${diff.decks.removed.length   > 0 ? ` · −${diff.decks.removed.length} deck(s) removed` : ""}
+                    ${diff.decks.changed.length   > 0 ? ` · ${diff.decks.changed.length} deck(s) changed`  : ""}
+                  `}
+              </div>
+
+              ${(diff.preservedDecks.length + diff.preservedBinders.length) > 0 && html`
+                <div style=${{
+                  marginBottom:14, padding:"8px 12px", borderRadius:8,
+                  background:"#e6f4e6", border:"1px solid #9bc89b",
+                  fontSize:12, color:"#1a5a2a",
+                }}>
+                  ✓ Preserved (not touched by this import):
+                  ${diff.preservedDecks.length} generated/URL-imported deck${diff.preservedDecks.length === 1 ? "" : "s"}.
+                </div>
+              `}
+
+              <!-- BINDERS section -->
+              ${(diff.binders.added.length + diff.binders.removed.length + diff.binders.changed.length) > 0 && html`
+                <div style=${{ marginBottom:18 }}>
+                  <div style=${{ ...label, marginTop:0 }}>Binders</div>
+
+                  ${diff.binders.added.map(b => html`
+                    <div key=${"bin-add-" + b.name} style=${{
+                      padding:"10px 14px", borderRadius:9, marginBottom:6,
+                      background:"#e6f4e6", border:"1px solid #9bc89b",
+                    }}>
+                      <div style=${{ fontSize:12, fontWeight:700, color:"#1a5a2a" }}>
+                        + ${b.name}
+                        <span style=${{ fontWeight:400, color:"#3a6a3a", marginLeft:6 }}>
+                          NEW · ${b.cards.length} unique cards
+                        </span>
+                      </div>
+                    </div>
+                  `)}
+
+                  ${diff.binders.removed.map(b => html`
+                    <div key=${"bin-rem-" + b.name} style=${{
+                      padding:"10px 14px", borderRadius:9, marginBottom:6,
+                      background:"#f8e8e8", border:"1px solid #c89090",
+                    }}>
+                      <div style=${{ fontSize:12, fontWeight:700, color:"#7a2010" }}>
+                        − ${b.name}
+                        <span style=${{ fontWeight:400, color:"#a04030", marginLeft:6 }}>
+                          REMOVED · ${b.cards.length} cards gone from your collection
+                        </span>
+                      </div>
+                    </div>
+                  `)}
+
+                  ${diff.binders.changed.map(b => html`
+                    <div key=${"bin-chg-" + b.name} style=${{
+                      padding:"10px 14px", borderRadius:9, marginBottom:6,
+                      background:"#fff8ee", border:"1px solid #e0c890",
+                    }}>
+                      <div style=${{ fontSize:12, fontWeight:700, color:"#7a4010", marginBottom:4 }}>
+                        ✎ ${b.name}
+                        <span style=${{ fontWeight:400, color:"#a06030", marginLeft:6 }}>
+                          ${b.added.length > 0 ? `+${b.added.length}` : ""}
+                          ${b.removed.length > 0 ? ` −${b.removed.length}` : ""}
+                          ${b.qtyChanged.length > 0 ? ` ≠${b.qtyChanged.length}` : ""}
+                        </span>
+                      </div>
+                      ${b.added.length > 0 && html`
+                        <div style=${{ fontSize:11, color:"#1a5a2a", marginTop:4 }}>
+                          Added (${b.added.length}):
+                          ${renderCardList(b.added, "#1a5a2a")}
+                        </div>
+                      `}
+                      ${b.removed.length > 0 && html`
+                        <div style=${{ fontSize:11, color:"#7a2010", marginTop:4 }}>
+                          Removed (${b.removed.length}):
+                          ${renderCardList(b.removed, "#7a2010")}
+                        </div>
+                      `}
+                      ${b.qtyChanged.length > 0 && html`
+                        <div style=${{ fontSize:11, color:"#7a4010", marginTop:4 }}>
+                          Quantity changed (${b.qtyChanged.length}):
+                          <div style=${{ display:"flex", flexWrap:"wrap", gap:5, marginTop:4 }}>
+                            ${b.qtyChanged.slice(0, PER_ENTRY_LIMIT).map(c => html`
+                              <span style=${{
+                                fontSize:11, padding:"1px 7px", borderRadius:8,
+                                background:"#fff", color:"#7a4010", border:"1px solid #d8b870",
+                              }}>${c.name}: ${c.oldQty} → ${c.newQty}</span>
+                            `)}
+                            ${b.qtyChanged.length > PER_ENTRY_LIMIT && html`
+                              <span style=${{ fontSize:11, color:"#9a7a5a", fontStyle:"italic" }}>
+                                …and ${b.qtyChanged.length - PER_ENTRY_LIMIT} more
+                              </span>
+                            `}
+                          </div>
+                        </div>
+                      `}
+                    </div>
+                  `)}
+                </div>
+              `}
+
+              <!-- DECKS section -->
+              ${(diff.decks.added.length + diff.decks.removed.length + diff.decks.changed.length) > 0 && html`
+                <div style=${{ marginBottom:18 }}>
+                  <div style=${{ ...label, marginTop:0 }}>Decks (imported)</div>
+
+                  ${diff.decks.added.map(d => html`
+                    <div key=${"deck-add-" + d.name} style=${{
+                      padding:"10px 14px", borderRadius:9, marginBottom:6,
+                      background:"#e6f4e6", border:"1px solid #9bc89b",
+                    }}>
+                      <div style=${{ fontSize:12, fontWeight:700, color:"#1a5a2a" }}>
+                        + ${d.name}
+                        <span style=${{ fontWeight:400, color:"#3a6a3a", marginLeft:6 }}>
+                          NEW · ${d.cards.length} unique cards
+                        </span>
+                      </div>
+                    </div>
+                  `)}
+
+                  ${diff.decks.removed.map(d => html`
+                    <div key=${"deck-rem-" + d.name} style=${{
+                      padding:"10px 14px", borderRadius:9, marginBottom:6,
+                      background:"#f8e8e8", border:"1px solid #c89090",
+                    }}>
+                      <div style=${{ fontSize:12, fontWeight:700, color:"#7a2010" }}>
+                        − ${d.name}
+                        <span style=${{ fontWeight:400, color:"#a04030", marginLeft:6 }}>
+                          REMOVED · ${d.cards.length} cards
+                        </span>
+                      </div>
+                    </div>
+                  `)}
+
+                  ${diff.decks.changed.map(d => html`
+                    <div key=${"deck-chg-" + d.name} style=${{
+                      padding:"10px 14px", borderRadius:9, marginBottom:6,
+                      background:"#fff8ee", border:"1px solid #e0c890",
+                    }}>
+                      <div style=${{ fontSize:12, fontWeight:700, color:"#7a4010", marginBottom:4 }}>
+                        ✎ ${d.name}
+                        <span style=${{ fontWeight:400, color:"#a06030", marginLeft:6 }}>
+                          ${d.added.length > 0 ? `+${d.added.length}` : ""}
+                          ${d.removed.length > 0 ? ` −${d.removed.length}` : ""}
+                          ${d.qtyChanged.length > 0 ? ` ≠${d.qtyChanged.length}` : ""}
+                        </span>
+                      </div>
+                      ${d.added.length > 0 && html`
+                        <div style=${{ fontSize:11, color:"#1a5a2a", marginTop:4 }}>
+                          Added (${d.added.length}):
+                          ${renderCardList(d.added, "#1a5a2a")}
+                        </div>
+                      `}
+                      ${d.removed.length > 0 && html`
+                        <div style=${{ fontSize:11, color:"#7a2010", marginTop:4 }}>
+                          Removed (${d.removed.length}):
+                          ${renderCardList(d.removed, "#7a2010")}
+                        </div>
+                      `}
+                    </div>
+                  `)}
+                </div>
+              `}
+
+              <!-- Bottom action bar (mirrors top) -->
+              <div style=${{ display:"flex", justifyContent:"flex-end", gap:10, marginTop:24 }}>
+                <button onClick=${cancelImportChanges}
+                  style=${{ ...btnSec, fontSize:13, padding:"8px 18px" }}>Cancel</button>
+                <button onClick=${applyImportChanges}
+                  style=${{ ...btn, fontSize:13, padding:"8px 22px" }}>
+                  ${diff.isNoOp ? "Apply (no changes)" : `Apply ${diff.totalChanges} change${diff.totalChanges === 1 ? "" : "s"} →`}
+                </button>
+              </div>
+            </div>
+            `;
+          })()}
 
           <!-- ── SELECT SOURCES ────────────────────────────────────────── -->
           ${phase === "select" && (() => {
