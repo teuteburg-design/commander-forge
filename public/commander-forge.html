@@ -787,99 +787,82 @@
     // user can copy the JSON and we can update the extractor.
     try { console.debug("[Commander Forge] Archidekt deck response:", deck); } catch {}
 
-    // Salt total — Archidekt aggregates EDHRec salt scores per card.
-    // Tries every documented and observed field path; falls back to summing
-    // per-card salt if the deck-level field isn't exposed.
-    const salt = deck.salt
-              ?? deck.saltSum
-              ?? deck.saltTotal
-              ?? deck.totalSalt
-              ?? deck.deckSalt
-              ?? deck.saltScore
-              ?? deck.stats?.salt
-              ?? deck.stats?.saltSum
-              ?? deck.stats?.saltScore
-              ?? deck.deckInfo?.salt
-              ?? null;
-    // Estimated bracket — could be a number 1-5 or a string ("Bracket 3").
-    const bracket = deck.bracket
-                 ?? deck.estBracket
-                 ?? deck.estimatedBracket
-                 ?? deck.deckBracket
-                 ?? deck.bracketEstimate
-                 ?? deck.stats?.bracket
-                 ?? deck.bracket?.value
-                 ?? deck.bracket?.bracket
-                 ?? deck.bracket?.estimate
-                 ?? null;
-    // Format legality — "Legal" / "Not legal" / list of illegal cards.
-    // Archidekt exposes this as a status string and/or a list of issues.
-    const legalityStatus = (() => {
-      const v = deck.legality?.status
-             ?? deck.legality
-             ?? deck.formatLegality
-             ?? deck.legalStatus
-             ?? deck.deckLegality
-             ?? null;
-      if (v == null) return null;
-      if (typeof v === "string") return v;
-      if (typeof v === "boolean") return v ? "Legal" : "Not legal";
-      if (typeof v === "object") {
-        if (v.status) return v.status;
-        if (typeof v.legal === "boolean") return v.legal ? "Legal" : "Not legal";
-        if (typeof v.isLegal === "boolean") return v.isLegal ? "Legal" : "Not legal";
+    const cards = Array.isArray(deck.cards) ? deck.cards : [];
+
+    // ── Salt sum: sum oracleCard.salt × quantity ───────────────────────
+    // Archidekt's API stores per-card EDHRec salt under
+    // cards[i].card.oracleCard.salt (verified against their public schema).
+    // No deck-level aggregate exists — we compute it ourselves.
+    let salt = null;
+    {
+      let s = 0, hits = 0;
+      for (const ce of cards) {
+        const v = ce?.card?.oracleCard?.salt;
+        if (typeof v === "number") { s += v * (ce.quantity || 1); hits++; }
       }
-      return null;
-    })();
-    // Price totals — Archidekt computes per-vendor. We expose whatever
-    // they hand us; UI shows what's available.
-    const prices = {
-      tcg:       deck.totalPrice ?? deck.tcgPrice ?? deck.prices?.tcg       ?? deck.priceTotals?.tcg       ?? null,
-      ck:        deck.cardKingdomPrice ?? deck.ckPrice ?? deck.prices?.ck   ?? deck.priceTotals?.ck        ?? null,
-      cardmarket:deck.cardmarketPrice ?? deck.prices?.cardmarket ?? deck.priceTotals?.cardmarket ?? deck.priceTotals?.eu  ?? null,
+      if (hits > 0) salt = Math.round(s * 100) / 100;
+    }
+
+    // ── Bracket: top-level edhBracket (1-5, may be null) ──────────────
+    const bracket = (typeof deck.edhBracket === "number" && deck.edhBracket >= 1)
+      ? deck.edhBracket : null;
+
+    // ── Format legality: derived from per-card commander legality ─────
+    // cards[i].card.oracleCard.legalities is a Scryfall-style map of
+    // format → "legal" / "not_legal" / "banned" / "restricted". For a
+    // Commander deck (deckFormat === 3), every card must be commander-legal.
+    // We collect the illegal ones so the errors block lists them too.
+    let legalityStatus = null;
+    const illegalCards = [];
+    if (deck.deckFormat === 3 && cards.length > 0) {
+      let knownLegalities = 0;
+      for (const ce of cards) {
+        const leg = ce?.card?.oracleCard?.legalities?.commander;
+        if (!leg) continue;
+        knownLegalities++;
+        if (leg !== "legal") {
+          illegalCards.push(`${ce.card?.oracleCard?.name || "Unknown card"} — ${leg.replace(/_/g, " ")}`);
+        }
+      }
+      if (knownLegalities > 0) {
+        legalityStatus = illegalCards.length === 0 ? "Legal" : `${illegalCards.length} not legal`;
+      }
+    }
+
+    // ── Prices: sum cards[].card.prices.{tcg,ck,cm} × qty ─────────────
+    // Archidekt uses short keys: tcg, ck, cm (cardmarket), scg (StarCity),
+    // mp (Mana Pool), mtgo. We surface the three the UI cares about.
+    const sumPrice = key => {
+      let s = 0, found = false;
+      for (const ce of cards) {
+        const p = ce?.card?.prices?.[key];
+        if (typeof p === "number") { s += p * (ce.quantity || 1); found = true; }
+      }
+      return found ? Math.round(s * 100) / 100 : null;
     };
-    // Errors / format warnings (illegal cards, banned, duplicates, etc.).
-    const errors = deck.errors
-                ?? deck.formatErrors
-                ?? deck.warnings
-                ?? deck.deckErrors
-                ?? deck.legalityErrors
-                ?? deck.illegalCards
-                ?? deck.legality?.errors
-                ?? deck.legality?.issues
-                ?? [];
-    // Computed-from-cards salt as a fallback: many Archidekt deck responses
-    // include per-card salt in cards[].card.saltScore.
-    let cardSaltSum = null;
-    if (salt == null && Array.isArray(deck.cards)) {
-      let s = 0, found = false;
-      for (const entry of deck.cards) {
-        const sc = entry?.card?.saltScore ?? entry?.card?.salt;
-        if (typeof sc === "number") { s += sc * (entry.quantity || 1); found = true; }
-      }
-      if (found) cardSaltSum = Math.round(s * 100) / 100;
-    }
-    // Same trick for prices if not exposed at deck level.
-    let cardTcgSum = null;
-    if (prices.tcg == null && Array.isArray(deck.cards)) {
-      let s = 0, found = false;
-      for (const entry of deck.cards) {
-        const p = parseFloat(entry?.card?.prices?.tcg ?? entry?.card?.prices?.usd ?? entry?.card?.tcgPrice);
-        if (!isNaN(p)) { s += p * (entry.quantity || 1); found = true; }
-      }
-      if (found) cardTcgSum = Math.round(s * 100) / 100;
-    }
+    const prices = {
+      tcg:        sumPrice("tcg"),
+      ck:         sumPrice("ck"),
+      cardmarket: sumPrice("cm"),
+    };
+
+    // ── Errors: combine illegal-card list with any explicit deck errors ─
+    const explicitErrors = deck.errors
+                        ?? deck.formatErrors
+                        ?? deck.warnings
+                        ?? deck.deckErrors
+                        ?? [];
+    const errors = [
+      ...(Array.isArray(explicitErrors) ? explicitErrors : []),
+      ...illegalCards,
+    ];
+
     return {
-      salt:           typeof salt === "number" ? Math.round(salt * 100) / 100 : (cardSaltSum != null ? cardSaltSum : null),
+      salt,
       bracket,
-      legalityStatus, // "Legal" | "Not legal" | other string | null
-      prices: {
-        tcg:        prices.tcg        ?? cardTcgSum,
-        ck:         prices.ck,
-        cardmarket: prices.cardmarket,
-      },
-      errors: Array.isArray(errors) ? errors.filter(Boolean) : (errors ? [errors] : []),
-      // The full raw deck — useful for debugging if a field path is missing.
+      legalityStatus, // "Legal" | "N not legal" | null
+      prices,
+      errors: errors.filter(Boolean),
       raw: deck,
     };
   }
