@@ -110,7 +110,14 @@ function handleMe(request) {
 // stored lastModified is newer, we return 409 with the current value so the
 // client can merge before retrying.
 const KV_USER_PREFIX = "user:";
-const MAX_STATE_BYTES = 1024 * 1024;   // 1 MB hard cap per user
+// Cloudflare KV allows up to 25 MiB per value. 10 MiB is plenty for the
+// "everything in one blob per user" model — covers a typical collection
+// (2-3 K cards) + 20-30 enriched decks + library + push history with
+// generous headroom. The serialised state grew past the original 1 MB
+// cap once decks started carrying enriched Scryfall + EDHRec + Spellbook
+// + Archidekt payloads. If we ever need more, splitting state into
+// per-section KV entries is the next move.
+const MAX_STATE_BYTES = 10 * 1024 * 1024;   // 10 MiB hard cap per user
 
 async function handleStateGet(request, env) {
   const email = authenticatedEmail(request);
@@ -171,9 +178,10 @@ async function handleStatePut(request, env) {
   // Size guard.
   const serialized = JSON.stringify({ state, lastModified: Date.now() });
   if (serialized.length > MAX_STATE_BYTES) {
+    const mb = (n) => (n / (1024 * 1024)).toFixed(2);
     return jsonResponse({
-      error: `state too large (${serialized.length} bytes, max ${MAX_STATE_BYTES}). ` +
-             `The Scryfall cache should not be synced — strip it out client-side.`,
+      error: `Synced state is too large: ${mb(serialized.length)} MiB (cap ${mb(MAX_STATE_BYTES)} MiB). ` +
+             `Trim the library / saved decks, or delete some enriched-deck caches via DevTools to free space.`,
     }, 413);
   }
   const parsedNow = JSON.parse(serialized);
