@@ -198,6 +198,7 @@
       // Legality + provenance — used to reject Unfinity/silver-border/emblem cards.
       border_color: sf.border_color,  // "black" | "silver" (un-set) | "gold" (promo) | "white"
       set:          (sf.set || "").toLowerCase(),  // 3-letter set code, e.g. "unf"
+      set_name:     sf.set_name,      // full set name, e.g. "Commander 2021"
       set_type:     sf.set_type,      // "funny" = Unfinity / Un-sets
       commander_legal: sf.legalities?.commander === "legal",
     };
@@ -2855,6 +2856,48 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       );
       const sfByName = new Map(sfResults.map(c => [c.name.toLowerCase(), c]));
 
+      // ── Precon detection ────────────────────────────────────────────────
+      // If every card in the deck (commander included) comes from the same
+      // Scryfall set, it's almost certainly a precon. Tokens / non-card
+      // entries are skipped since they don't have a meaningful set tag for
+      // this purpose. Excludes basics with no set — basics in precons usually
+      // have a real set code, but we still want to be tolerant if Scryfall
+      // returns a generic basic.
+      let precon = null;   // { setCode, setName } when detected
+      {
+        const setBag = new Map();   // code → name (most-recent wins; they're identical anyway)
+        let unsetCount = 0;
+        for (const c of sfResults) {
+          const sf = c.scryfall || {};
+          if (sf.set_type === "token") continue;
+          if (!sf.set) { unsetCount++; continue; }
+          setBag.set(sf.set, sf.set_name || sf.set);
+        }
+        // Don't claim "precon" if some cards have no set data at all (Scryfall
+        // failures would mask non-precon decks as precons).
+        if (setBag.size === 1 && unsetCount === 0 && sfResults.length >= 50) {
+          const [code, name] = [...setBag.entries()][0];
+          precon = { setCode: code, setName: name };
+          addLog(`🎁 Detected as a precon — all ${sfResults.length} cards from “${name}” (${code.toUpperCase()}).`);
+        } else if (setBag.size > 1 && setBag.size <= 3 && sfResults.length >= 50) {
+          // A near-precon: 2-3 sets covering everything. Mention it as a hint
+          // for partially-reprinted precons (e.g. a Commander deck where a
+          // few cards came from a different printing).
+          const counts = new Map();
+          sfResults.forEach(c => {
+            const s = c.scryfall?.set;
+            if (s) counts.set(s, (counts.get(s) || 0) + 1);
+          });
+          // Look for a dominant set (>= 90% of cards from it).
+          const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+          const [topCode, topCount] = sorted[0];
+          if (topCount / sfResults.length >= 0.9) {
+            precon = { setCode: topCode, setName: setBag.get(topCode) || topCode, partial: true };
+            addLog(`🎁 Likely a precon — ${topCount}/${sfResults.length} cards from “${precon.setName}” (${topCode.toUpperCase()}).`);
+          }
+        }
+      }
+
       // ── Commander auto-detection ────────────────────────────────────────
       // If the CSV didn't tell us which card is the commander, scan the deck
       // for legal commanders (legendary creatures + planeswalkers/cards with
@@ -2981,15 +3024,19 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
       setProg(95);
       const totalRendered = categories.reduce((s, c) => s + c.cards.length, 0);
+      const preconLine = precon
+        ? ` Precon: ${precon.setName} (${precon.setCode.toUpperCase()})${precon.partial ? " — mostly" : ""}.`
+        : "";
       const enrichedDeck = {
         theme:       rawDeck.name,
-        description: `Imported deck — ${totalRendered} cards categorised by type.` +
+        description: `Imported deck — ${totalRendered} cards categorised by type.${preconLine}` +
                      (cmdrEnr ? "" : " (Commander not found in Scryfall — basic name only.)"),
         warnings:    [],
         categories,
         edhrecSuggestions,
         combosHave,
         combosAlmost,
+        precon,   // null | { setCode, setName, partial? }
       };
 
       return { selCmd: selCmdObj, deck: enrichedDeck };
@@ -4530,6 +4577,26 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 </div>
               `}
 
+              ${deck.precon && html`
+                <div style=${{
+                  background:"#f4ead2", border:"1px solid #d8b870", borderRadius:10,
+                  padding:"10px 14px", marginBottom:14, fontSize:13, color:"#5a3a10",
+                  display:"flex", alignItems:"center", gap:10, flexWrap:"wrap",
+                }}>
+                  <span style=${{ fontSize:20 }}>🎁</span>
+                  <div style=${{ flex:1, lineHeight:1.6 }}>
+                    <strong>${deck.precon.partial ? "Likely a precon" : "Precon detected"}:</strong>
+                    ${" "}${deck.precon.setName}
+                    <span style=${{ color:"#8a6a3a" }}>· ${deck.precon.setCode.toUpperCase()}</span>
+                    ${deck.precon.partial && html`
+                      <span style=${{ color:"#8a6a3a", fontStyle:"italic" }}>
+                        ${" "}(most cards from this set; a few are different printings)
+                      </span>
+                    `}
+                  </div>
+                </div>
+              `}
+
               ${deck.description && html`
                 <div style=${{ background:"#fff8f0", border:"1px solid #ddd0a8", borderRadius:10,
                   padding:"14px 18px", marginBottom:18, fontSize:13, color:"#3a2010", lineHeight:1.9 }}>
@@ -5008,6 +5075,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     const badge = isLibrary  ? { txt:"💾 LIBRARY",   bg:"#cde8c8", col:"#1a5a2a" }
                                 : isGen      ? { txt:"🃏 FORGE",     bg:"#f5d8c0", col:"#7a2e0e" }
                                 :              { txt:"📦 IMPORTED",  bg:"#dee9f4", col:"#1a4a7a" };
+                    // Precon badge appears alongside the source badge once an
+                    // imported deck has been enriched and detected as a precon.
+                    const preconInfo = deckDataHere?.precon || null;
 
                     const cmdrLabel = isImported
                       ? (entry.commanderName || "(no commander)")
@@ -5025,6 +5095,19 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           padding:"2px 8px", borderRadius:10, fontSize:9, fontWeight:700, letterSpacing:0.5,
                           background: badge.bg, color: badge.col,
                         }}>${badge.txt}</div>
+
+                        ${preconInfo && html`
+                          <!-- Precon chip — sits below the source badge -->
+                          <div title=${`Detected as a precon — all cards from "${preconInfo.setName}" (${preconInfo.setCode.toUpperCase()})${preconInfo.partial ? "; some printings differ" : ""}.`}
+                            style=${{
+                              position:"absolute", top:30, right: isLibrary ? 36 : 12, zIndex:1,
+                              padding:"2px 8px", borderRadius:10, fontSize:9, fontWeight:700, letterSpacing:0.5,
+                              background:"#f4ead2", color:"#7a5510", border:"1px solid #d8c090",
+                              maxWidth:160, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap",
+                            }}>
+                            🎁 ${preconInfo.partial ? "MOSTLY " : ""}${preconInfo.setCode.toUpperCase()}
+                          </div>
+                        `}
 
                         ${isLibrary && html`
                           <button onClick=${e => { e.stopPropagation(); deleteFromLibrary(entry.id); }}
