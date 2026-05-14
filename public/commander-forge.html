@@ -781,12 +781,25 @@
   // become null and the UI hides them.
   function extractArchInsights(deck) {
     if (!deck || typeof deck !== "object") return null;
+
+    // Devtools peek: dump the raw deck to the console so when a field path
+    // is wrong (Archidekt's API is reverse-engineered, schema drifts), the
+    // user can copy the JSON and we can update the extractor.
+    try { console.debug("[Commander Forge] Archidekt deck response:", deck); } catch {}
+
     // Salt total — Archidekt aggregates EDHRec salt scores per card.
-    // Common field paths: `salt`, `saltTotal`, `stats.salt`, ...
+    // Tries every documented and observed field path; falls back to summing
+    // per-card salt if the deck-level field isn't exposed.
     const salt = deck.salt
+              ?? deck.saltSum
               ?? deck.saltTotal
+              ?? deck.totalSalt
               ?? deck.deckSalt
+              ?? deck.saltScore
               ?? deck.stats?.salt
+              ?? deck.stats?.saltSum
+              ?? deck.stats?.saltScore
+              ?? deck.deckInfo?.salt
               ?? null;
     // Estimated bracket — could be a number 1-5 or a string ("Bracket 3").
     const bracket = deck.bracket
@@ -794,20 +807,46 @@
                  ?? deck.estimatedBracket
                  ?? deck.deckBracket
                  ?? deck.bracketEstimate
+                 ?? deck.stats?.bracket
+                 ?? deck.bracket?.value
+                 ?? deck.bracket?.bracket
+                 ?? deck.bracket?.estimate
                  ?? null;
+    // Format legality — "Legal" / "Not legal" / list of illegal cards.
+    // Archidekt exposes this as a status string and/or a list of issues.
+    const legalityStatus = (() => {
+      const v = deck.legality?.status
+             ?? deck.legality
+             ?? deck.formatLegality
+             ?? deck.legalStatus
+             ?? deck.deckLegality
+             ?? null;
+      if (v == null) return null;
+      if (typeof v === "string") return v;
+      if (typeof v === "boolean") return v ? "Legal" : "Not legal";
+      if (typeof v === "object") {
+        if (v.status) return v.status;
+        if (typeof v.legal === "boolean") return v.legal ? "Legal" : "Not legal";
+        if (typeof v.isLegal === "boolean") return v.isLegal ? "Legal" : "Not legal";
+      }
+      return null;
+    })();
     // Price totals — Archidekt computes per-vendor. We expose whatever
-    // they hand us; UI shows the first one available.
+    // they hand us; UI shows what's available.
     const prices = {
-      tcg:       deck.totalPrice ?? deck.prices?.tcg       ?? deck.priceTotals?.tcg       ?? null,
-      ck:        deck.cardKingdomPrice ?? deck.prices?.ck  ?? deck.priceTotals?.ck        ?? null,
-      cardmarket:deck.cardmarketPrice ?? deck.prices?.cardmarket ?? deck.priceTotals?.eu  ?? null,
+      tcg:       deck.totalPrice ?? deck.tcgPrice ?? deck.prices?.tcg       ?? deck.priceTotals?.tcg       ?? null,
+      ck:        deck.cardKingdomPrice ?? deck.ckPrice ?? deck.prices?.ck   ?? deck.priceTotals?.ck        ?? null,
+      cardmarket:deck.cardmarketPrice ?? deck.prices?.cardmarket ?? deck.priceTotals?.cardmarket ?? deck.priceTotals?.eu  ?? null,
     };
-    // Errors / format warnings.
+    // Errors / format warnings (illegal cards, banned, duplicates, etc.).
     const errors = deck.errors
                 ?? deck.formatErrors
                 ?? deck.warnings
                 ?? deck.deckErrors
                 ?? deck.legalityErrors
+                ?? deck.illegalCards
+                ?? deck.legality?.errors
+                ?? deck.legality?.issues
                 ?? [];
     // Computed-from-cards salt as a fallback: many Archidekt deck responses
     // include per-card salt in cards[].card.saltScore.
@@ -831,8 +870,9 @@
       if (found) cardTcgSum = Math.round(s * 100) / 100;
     }
     return {
-      salt:    typeof salt === "number" ? Math.round(salt * 100) / 100 : (cardSaltSum != null ? cardSaltSum : null),
+      salt:           typeof salt === "number" ? Math.round(salt * 100) / 100 : (cardSaltSum != null ? cardSaltSum : null),
       bracket,
+      legalityStatus, // "Legal" | "Not legal" | other string | null
       prices: {
         tcg:        prices.tcg        ?? cardTcgSum,
         ck:         prices.ck,
@@ -5438,22 +5478,23 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 </div>
               </div>
 
-              <!-- Archidekt push result banner -->
-              ${archResult && html`
+              <!-- Archidekt fallback / failure banner — only shown for the
+                   clipboard-fallback case. Successful pushes go straight to
+                   the Insights panel below (which absorbs the success line
+                   into its own header). -->
+              ${archResult && archResult.kind !== "ok" && html`
                 <div style=${{
                   borderRadius:10, padding:"10px 14px", marginBottom:14, fontSize:12,
                   display:"flex", gap:10, alignItems:"flex-start",
-                  background: archResult.kind === "ok" ? "#e6f4e6" : "#fff5e8",
-                  border: "1px solid " + (archResult.kind === "ok" ? "#7aaa6a" : "#e8b070"),
-                  color:    archResult.kind === "ok" ? "#1a5a2a" : "#7a4010",
+                  background:"#fff5e8", border:"1px solid #e8b070", color:"#7a4010",
                 }}>
-                  <span style=${{ fontSize:16 }}>${archResult.kind === "ok" ? "✓" : "⚠️"}</span>
+                  <span style=${{ fontSize:16 }}>⚠️</span>
                   <div style=${{ flex:1, lineHeight:1.6 }}>
                     <div>${archResult.msg}</div>
                     ${archResult.url && html`
                       <a href=${archResult.url} target="_blank" rel="noopener"
                         style=${{ color:"inherit", textDecoration:"underline", fontWeight:600 }}>
-                        ${archResult.kind === "ok" ? "Open deck on Archidekt →" : "Open new-deck page →"}
+                        Open new-deck page →
                       </a>
                     `}
                   </div>
@@ -5463,97 +5504,82 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 </div>
               `}
 
-              ${archResult && archResult.insights && (
-                archResult.insights.salt != null ||
-                archResult.insights.bracket != null ||
-                archResult.insights.prices?.tcg != null ||
-                archResult.insights.prices?.ck != null ||
-                archResult.insights.prices?.cardmarket != null ||
-                archResult.insights.errors?.length > 0
-              ) && html`
-                <!-- Archidekt insights — computed by Archidekt server-side after
-                     the deck is created.  Shows what they returned; missing
-                     metrics are silently omitted. -->
+              ${archResult && archResult.kind === "ok" && html`
+                <!-- Archidekt push success + insights panel. Replaces the old
+                     standalone green banner — the success line lives in the
+                     header here, the link too. Metric chips light up only
+                     for fields Archidekt actually returned (raw response
+                     also logged to console.debug for easy field-name probing). -->
                 <div style=${{
                   borderRadius:10, padding:"12px 16px", marginBottom:14,
                   background:"#fff8ee", border:"1px solid #d8c090",
                 }}>
+                  <div style=${{
+                    display:"flex", alignItems:"center", justifyContent:"space-between",
+                    gap:10, flexWrap:"wrap", marginBottom:10,
+                  }}>
+                    <div style=${{ fontSize:12, color:"#1a5a2a", fontWeight:600,
+                      display:"flex", alignItems:"center", gap:7 }}>
+                      <span style=${{ fontSize:16 }}>✓</span>
+                      <span>${archResult.msg}</span>
+                    </div>
+                    <div style=${{ display:"flex", gap:10, alignItems:"center" }}>
+                      <a href=${archResult.url} target="_blank" rel="noopener"
+                        style=${{ fontSize:11, color:"#7a3010", textDecoration:"underline",
+                          fontWeight:600 }}>
+                        View on Archidekt ↗
+                      </a>
+                      <button onClick=${() => setArchResult(null)}
+                        title="Dismiss"
+                        style=${{ background:"transparent", border:"none", color:"#7a5a3a",
+                          cursor:"pointer", fontSize:14, fontFamily:"inherit", padding:"0 4px" }}>×</button>
+                    </div>
+                  </div>
+
                   <div style=${{ fontSize:10, letterSpacing:3, color:"#8a4010",
-                    textTransform:"uppercase", fontWeight:700, marginBottom:10,
-                    display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-                    <span>📊 Archidekt Insights</span>
-                    <a href=${archResult.url} target="_blank" rel="noopener"
-                      style=${{ fontSize:10, color:"#7a3010", textDecoration:"underline",
-                        letterSpacing:0, textTransform:"none", fontWeight:600 }}>
-                      View on Archidekt ↗
-                    </a>
+                    textTransform:"uppercase", fontWeight:700, marginBottom:8 }}>
+                    📊 Archidekt Insights
                   </div>
 
                   <!-- Metric chips -->
                   <div style=${{ display:"flex", gap:10, flexWrap:"wrap" }}>
-                    ${archResult.insights.bracket != null && html`
-                      <div style=${{
-                        flex:"1 1 110px", padding:"8px 12px", borderRadius:8,
-                        background:"#fff", border:"1px solid #e0c890",
-                      }}>
-                        <div style=${{ fontSize:9, letterSpacing:2, color:"#8a5810",
-                          textTransform:"uppercase", fontWeight:700, marginBottom:2 }}>Est. Bracket</div>
-                        <div style=${{ fontSize:18, fontWeight:700, color:"#3a1a00" }}>
-                          ${archResult.insights.bracket}
+                    ${(() => {
+                      const ins  = archResult.insights || {};
+                      const chip = (label, value, valueColor) => html`
+                        <div style=${{
+                          flex:"1 1 110px", padding:"8px 12px", borderRadius:8,
+                          background:"#fff", border:"1px solid #e0c890",
+                        }}>
+                          <div style=${{ fontSize:9, letterSpacing:2, color:"#8a5810",
+                            textTransform:"uppercase", fontWeight:700, marginBottom:2 }}>${label}</div>
+                          <div style=${{ fontSize:18, fontWeight:700, color: valueColor || "#3a1a00" }}>${value}</div>
                         </div>
-                      </div>
-                    `}
-                    ${archResult.insights.salt != null && html`
-                      <div style=${{
-                        flex:"1 1 110px", padding:"8px 12px", borderRadius:8,
-                        background:"#fff", border:"1px solid #e0c890",
-                      }}>
-                        <div style=${{ fontSize:9, letterSpacing:2, color:"#8a5810",
-                          textTransform:"uppercase", fontWeight:700, marginBottom:2 }}>🧂 Salt Sum</div>
-                        <div style=${{ fontSize:18, fontWeight:700, color:"#3a1a00" }}>
-                          ${archResult.insights.salt}
-                        </div>
-                      </div>
-                    `}
-                    ${archResult.insights.prices?.tcg != null && html`
-                      <div style=${{
-                        flex:"1 1 110px", padding:"8px 12px", borderRadius:8,
-                        background:"#fff", border:"1px solid #e0c890",
-                      }}>
-                        <div style=${{ fontSize:9, letterSpacing:2, color:"#8a5810",
-                          textTransform:"uppercase", fontWeight:700, marginBottom:2 }}>TCGPlayer</div>
-                        <div style=${{ fontSize:18, fontWeight:700, color:"#3a1a00" }}>
-                          $${(+archResult.insights.prices.tcg).toFixed(2)}
-                        </div>
-                      </div>
-                    `}
-                    ${archResult.insights.prices?.ck != null && html`
-                      <div style=${{
-                        flex:"1 1 110px", padding:"8px 12px", borderRadius:8,
-                        background:"#fff", border:"1px solid #e0c890",
-                      }}>
-                        <div style=${{ fontSize:9, letterSpacing:2, color:"#8a5810",
-                          textTransform:"uppercase", fontWeight:700, marginBottom:2 }}>Card Kingdom</div>
-                        <div style=${{ fontSize:18, fontWeight:700, color:"#3a1a00" }}>
-                          $${(+archResult.insights.prices.ck).toFixed(2)}
-                        </div>
-                      </div>
-                    `}
-                    ${archResult.insights.prices?.cardmarket != null && html`
-                      <div style=${{
-                        flex:"1 1 110px", padding:"8px 12px", borderRadius:8,
-                        background:"#fff", border:"1px solid #e0c890",
-                      }}>
-                        <div style=${{ fontSize:9, letterSpacing:2, color:"#8a5810",
-                          textTransform:"uppercase", fontWeight:700, marginBottom:2 }}>Cardmarket</div>
-                        <div style=${{ fontSize:18, fontWeight:700, color:"#3a1a00" }}>
-                          €${(+archResult.insights.prices.cardmarket).toFixed(2)}
-                        </div>
-                      </div>
-                    `}
+                      `;
+                      const chips = [];
+                      if (ins.bracket != null) chips.push(chip("Est. Bracket", ins.bracket));
+                      if (ins.salt    != null) chips.push(chip("🧂 Salt Sum", ins.salt));
+                      if (ins.legalityStatus) {
+                        const legal = /^legal$/i.test(ins.legalityStatus);
+                        chips.push(chip("Format", ins.legalityStatus, legal ? "#1a6a2a" : "#a04010"));
+                      }
+                      if (ins.prices?.tcg        != null) chips.push(chip("TCGPlayer",    "$" + (+ins.prices.tcg).toFixed(2)));
+                      if (ins.prices?.ck         != null) chips.push(chip("Card Kingdom", "$" + (+ins.prices.ck).toFixed(2)));
+                      if (ins.prices?.cardmarket != null) chips.push(chip("Cardmarket",   "€" + (+ins.prices.cardmarket).toFixed(2)));
+                      if (chips.length === 0) {
+                        return html`
+                          <div style=${{ fontSize:11, color:"#9a7a5a", fontStyle:"italic",
+                            padding:"6px 2px", lineHeight:1.6 }}>
+                            Archidekt hasn't returned the salt / bracket / price computations yet —
+                            this can take a few seconds after a fresh push. Click <em>View on Archidekt ↗</em>
+                            to see them on the deck page directly.
+                          </div>
+                        `;
+                      }
+                      return chips;
+                    })()}
                   </div>
 
-                  ${archResult.insights.errors.length > 0 && html`
+                  ${archResult.insights?.errors?.length > 0 && html`
                     <div style=${{
                       marginTop:10, padding:"8px 12px", borderRadius:8,
                       background:"#fff5e8", border:"1px solid #e8b070",
