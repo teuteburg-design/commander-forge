@@ -1187,6 +1187,32 @@
     return { format: "unknown", decks: [], binders: [], stats: { totalRows: 0, included: 0, skippedNoName: 0 } };
   }
 
+  // Manabox uses the TCG-style 5/6-tier condition ladder; map to our
+  // Cardmarket-style 7-tier scale.
+  const MANABOX_CONDITION_MAP = {
+    "mint":              "M",
+    "near_mint":         "NM",
+    "near mint":         "NM",
+    "lightly_played":    "LP",
+    "lightly played":    "LP",
+    "moderately_played": "GD",
+    "moderately played": "GD",
+    "heavily_played":    "PL",
+    "heavily played":    "PL",
+    "damaged":           "PO",
+    "poor":              "PO",
+  };
+  // Manabox "Foil" column values → our finish scheme. "etched" foils are
+  // still foils for ownership-tracking purposes.
+  const MANABOX_FINISH_MAP = {
+    "":         "normal",
+    "normal":   "normal",
+    "non-foil": "normal",
+    "nonfoil":  "normal",
+    "foil":     "foil",
+    "etched":   "foil",
+  };
+
   function parseManabox(text) {
     const rows = parseCSV(text);
     const stats = { totalRows: 0, included: 0, skippedNoName: 0 };
@@ -1198,6 +1224,9 @@
     const iBN   = hdr.findIndex(h => h === "binder name" || h === "binder_name");
     const iSF   = hdr.findIndex(h => h.includes("scryfall"));
     const iCmd  = hdr.findIndex(h => h.includes("commander"));        // is_commander flag
+    const iFoil = hdr.findIndex(h => h === "foil" || h === "finish");
+    const iCond = hdr.findIndex(h => h === "condition");
+    const iMis  = hdr.findIndex(h => h === "misprint" || h === "is_misprint");
     if (iName < 0) return { decks: [], binders: [], stats };
 
     const groups = new Map();
@@ -1212,12 +1241,31 @@
       const bn   = iBN >= 0 ? ((cols[iBN] || "").trim() || "Default Binder") : "Default Binder";
       const sfid = iSF >= 0 ? (cols[iSF] || "").trim() : "";
       const isCmdr = iCmd >= 0 && /^(true|1|yes)$/i.test((cols[iCmd] || "").trim());
+
+      // Finish / Condition / Misprint — new in the import pipeline. Fall back
+      // to NM / normal / correct when columns are absent (older CSV exports).
+      const foilRaw = iFoil >= 0 ? (cols[iFoil] || "").trim().toLowerCase() : "";
+      const condRaw = iCond >= 0 ? (cols[iCond] || "").trim().toLowerCase() : "";
+      const misRaw  = iMis  >= 0 ? (cols[iMis]  || "").trim() : "";
+      const finish    = MANABOX_FINISH_MAP[foilRaw] || (foilRaw ? "foil" : "normal");
+      const condition = MANABOX_CONDITION_MAP[condRaw] || "NM";
+      const misprint  = /^(true|1|yes)$/i.test(misRaw);
+
       const key = `${bt}::${bn}`;
       if (!groups.has(key)) groups.set(key, { type: bt, name: bn, cards: new Map() });
       const g = groups.get(key);
       if (isCmdr) g.commanderName = name;
-      if (g.cards.has(name)) g.cards.get(name).qty += qty;
-      else g.cards.set(name, { name, qty, id: sfid });
+
+      // Row key includes finish/condition/misprint so foils stay distinct
+      // from non-foils and damaged copies stay distinct from NM copies.
+      const rowKey = `${name.toLowerCase()}|${sfid}|${condition}|${finish}|${misprint ? "1" : "0"}`;
+      if (g.cards.has(rowKey)) {
+        g.cards.get(rowKey).qty += qty;
+      } else {
+        const row = { name, qty, id: sfid, condition, finish };
+        if (misprint) row.misprint = true;
+        g.cards.set(rowKey, row);
+      }
       stats.included++;
     }
     const decks = [], binders = [];
