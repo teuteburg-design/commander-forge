@@ -1747,6 +1747,8 @@
     const [binderCollapsed, setBinderCollapsed] = useState({});
     // 3-dot menu next to the binder name in the binder view header.
     const [binderMenuOpen, setBinderMenuOpen] = useState(false);
+    // Inline rename: when set, the name h2 is replaced by an editable input.
+    const [binderRenameValue, setBinderRenameValue] = useState(null);
     // "Delete binder & move its cards" modal — name of binder being deleted,
     // plus the chosen destination (real binder name or "__uncategorised__").
     const [binderDeleteName,   setBinderDeleteName]   = useState(null);
@@ -4122,18 +4124,16 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       persistGroups(nextGroups);
     };
 
-    const renameBinder = (oldName) => {
-      const raw = window.prompt("New name for this binder:", oldName);
-      if (!raw) return;
-      const trimmed = raw.trim();
-      if (!trimmed || trimmed === oldName) return;
+    // Apply a binder rename given an explicit new name. Returns true on
+    // success, false if validation failed (caller decides how to surface).
+    const applyBinderRename = (oldName, rawNewName) => {
+      const trimmed = (rawNewName || "").trim();
+      if (!trimmed || trimmed === oldName) return false;
       if ((groups.binders || []).some(b => b.name === trimmed)) {
         alert(`A binder named "${trimmed}" already exists.`);
-        return;
+        return false;
       }
       const nextBinders = (groups.binders || []).map(b => b.name === oldName ? { ...b, name: trimmed } : b);
-      const nextGroups = { ...groups, binders: nextBinders };
-      // Re-key binInc and binderEnriched onto the new name.
       const nextBinInc = { ...binInc };
       if (oldName in nextBinInc) { nextBinInc[trimmed] = nextBinInc[oldName]; delete nextBinInc[oldName]; }
       setBinInc(nextBinInc);
@@ -4142,7 +4142,23 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         const next = { ...m }; next[trimmed] = next[oldName]; delete next[oldName]; return next;
       });
       if (viewingBinder === oldName) setViewingBinder(trimmed);
-      persistGroups(nextGroups, deckInc, nextBinInc);
+      persistGroups({ ...groups, binders: nextBinders }, deckInc, nextBinInc);
+      return true;
+    };
+
+    // Enter inline rename mode (the binder name h2 becomes an input).
+    const startBinderRename = () => {
+      if (!viewingBinder) return;
+      setBinderRenameValue(viewingBinder);
+    };
+
+    // Legacy entry point — still used by any Collection-view callers; routes
+    // through inline rename when the binder is currently open, falls back to
+    // a prompt otherwise.
+    const renameBinder = (oldName) => {
+      if (viewingBinder === oldName) { startBinderRename(); return; }
+      const raw = window.prompt("New name for this binder:", oldName);
+      if (raw) applyBinderRename(oldName, raw);
     };
 
     const renameDeck = (oldName) => {
@@ -4320,6 +4336,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setBinderHover(null);
       setBinderCollapsed({});
       setBinderMenuOpen(false);
+      setBinderRenameValue(null);
       setPhase("binder_view");
       if (binderEnriched[binderName]) return; // cached
       const binder = (groups.binders || []).find(b => b.name === binderName);
@@ -5621,14 +5638,43 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"flex-end", gap:12 }}>
                     <div>
                       <div style=${{ display:"flex", alignItems:"center", gap:6, position:"relative" }}>
-                        <h2 style=${{ fontSize:18, color:"#3a1a00", margin:0 }}>${binder.name}</h2>
-                        <button onClick=${() => setBinderMenuOpen(o => !o)}
-                          title="Binder actions"
-                          style=${{
-                            background:"transparent", border:"1px solid #d0b880", borderRadius:6,
-                            padding:"2px 7px", fontSize:14, color:"#7a5a3a", cursor:"pointer",
-                            fontFamily:"inherit", lineHeight:1,
-                          }}>⋯</button>
+                        ${binderRenameValue === null
+                          ? html`<h2 style=${{ fontSize:18, color:"#3a1a00", margin:0 }}>${binder.name}</h2>`
+                          : html`<input
+                              autoFocus=${true}
+                              value=${binderRenameValue}
+                              onInput=${e => setBinderRenameValue(e.target.value)}
+                              onKeyDown=${e => {
+                                if (e.key === "Enter") {
+                                  if (applyBinderRename(binder.name, binderRenameValue)) setBinderRenameValue(null);
+                                } else if (e.key === "Escape") {
+                                  setBinderRenameValue(null);
+                                }
+                              }}
+                              onBlur=${() => {
+                                // Commit on blur if anything changed; silently cancel otherwise.
+                                if ((binderRenameValue || "").trim() && binderRenameValue.trim() !== binder.name) {
+                                  if (!applyBinderRename(binder.name, binderRenameValue)) setBinderRenameValue(null);
+                                  else setBinderRenameValue(null);
+                                } else {
+                                  setBinderRenameValue(null);
+                                }
+                              }}
+                              style=${{
+                                fontSize:18, fontWeight:700, color:"#3a1a00",
+                                background:"#fffaf0", border:"1px solid #c07030", borderRadius:6,
+                                padding:"3px 8px", fontFamily:"inherit",
+                                outline:"none", minWidth:240,
+                              }} />`}
+                        ${binderRenameValue === null && html`
+                          <button onClick=${() => setBinderMenuOpen(o => !o)}
+                            title="Binder actions"
+                            style=${{
+                              background:"transparent", border:"1px solid #d0b880", borderRadius:6,
+                              padding:"2px 7px", fontSize:14, color:"#7a5a3a", cursor:"pointer",
+                              fontFamily:"inherit", lineHeight:1,
+                            }}>⋯</button>
+                        `}
                         ${binderMenuOpen && html`
                           <div onClick=${() => setBinderMenuOpen(false)}
                             style=${{ position:"fixed", inset:0, zIndex:50 }}></div>
@@ -5638,7 +5684,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             boxShadow:"0 4px 16px rgba(0,0,0,0.18)",
                             minWidth:180, padding:4,
                           }}>
-                            <button onClick=${() => { setBinderMenuOpen(false); renameBinder(viewingBinder); }}
+                            <button onClick=${() => { setBinderMenuOpen(false); startBinderRename(); }}
                               style=${{
                                 display:"block", width:"100%", textAlign:"left",
                                 padding:"7px 10px", fontSize:12, color:"#3a1a00",
