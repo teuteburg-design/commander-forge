@@ -1754,6 +1754,32 @@
     const [binderDeleteName,   setBinderDeleteName]   = useState(null);
     const [binderDeleteTarget, setBinderDeleteTarget] = useState("__uncategorised__");
 
+    // Create-binder modal state.
+    const [binderCreateOpen, setBinderCreateOpen] = useState(false);
+    const [binderCreateName, setBinderCreateName] = useState("");
+    const [binderCreateTags, setBinderCreateTags] = useState("");
+
+    // Create-deck modal state.
+    const DECK_FORMATS = [
+      { value: "commander", label: "Commander" },
+      { value: "standard",  label: "Standard" },
+      { value: "modern",    label: "Modern" },
+      { value: "pioneer",   label: "Pioneer" },
+      { value: "pauper",    label: "Pauper" },
+      { value: "limited",   label: "Limited" },
+      { value: "legacy",    label: "Legacy" },
+      { value: "vintage",   label: "Vintage" },
+      { value: "casual",    label: "Casual" },
+    ];
+    const [deckCreateOpen,     setDeckCreateOpen]     = useState(false);
+    const [deckCreateName,     setDeckCreateName]     = useState("");
+    const [deckCreateFormat,   setDeckCreateFormat]   = useState("commander");
+    const [deckCmdrQuery,      setDeckCmdrQuery]      = useState("");
+    const [deckCmdrSuggestions,setDeckCmdrSuggestions]= useState([]);
+    const [deckCmdrBusy,       setDeckCmdrBusy]       = useState(false);
+    const [deckCmdrPicked,     setDeckCmdrPicked]     = useState(null); // full Scryfall printing
+    const deckCmdrTimerRef = useRef(null);
+
     // "Add card" modal state (Phase B).
     // Two input modes:
     //   "name" → Scryfall autocomplete → printings picker → single add
@@ -4102,26 +4128,105 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       return `${base} (${i})`;
     };
 
+    // Opens the create-binder modal (replaces the old prompt).
     const createBinder = () => {
-      const raw = window.prompt("Name for the new binder:", "New Binder");
+      setBinderCreateName("");
+      setBinderCreateTags("");
+      setBinderCreateOpen(true);
+    };
+
+    const commitCreateBinder = () => {
+      const raw = (binderCreateName || "").trim();
       if (!raw) return;
-      const name = uniqueName(raw.trim(), (groups.binders || []).map(b => b.name));
-      if (!name) return;
-      const newBinder = { name, type: "binder", cards: [], commanderName: null, source: "manual" };
+      const name = uniqueName(raw, (groups.binders || []).map(b => b.name));
+      const tags = (binderCreateTags || "")
+        .split(",").map(t => t.trim()).filter(Boolean);
+      const newBinder = {
+        name, type: "binder", cards: [],
+        commanderName: null, source: "manual",
+        ...(tags.length ? { tags } : {}),
+      };
       const nextGroups = { ...groups, binders: [...(groups.binders || []), newBinder] };
       const nextBinInc = { ...binInc, [name]: true };
       setBinInc(nextBinInc);
       persistGroups(nextGroups, deckInc, nextBinInc);
+      setBinderCreateOpen(false);
+      setBinderCreateName(""); setBinderCreateTags("");
     };
 
+    // Opens the create-deck modal.
     const createDeck = () => {
-      const raw = window.prompt("Name for the new deck:", "New Deck");
+      setDeckCreateName("");
+      setDeckCreateFormat("commander");
+      setDeckCmdrQuery("");
+      setDeckCmdrSuggestions([]);
+      setDeckCmdrPicked(null);
+      setDeckCreateOpen(true);
+    };
+
+    // Scryfall autocomplete for the commander picker. Debounced.
+    const runDeckCmdrAutocomplete = (q) => {
+      clearTimeout(deckCmdrTimerRef.current);
+      const trimmed = q.trim();
+      if (trimmed.length < 2) { setDeckCmdrSuggestions([]); setDeckCmdrBusy(false); return; }
+      setDeckCmdrBusy(true);
+      deckCmdrTimerRef.current = setTimeout(async () => {
+        try {
+          // type:legendary creature filter narrows to plausible commanders;
+          // partners/backgrounds/planeswalkers-with-CAN-BE-YOUR-COMMANDER are
+          // accepted if Scryfall returns them via the same search.
+          const url = `https://api.scryfall.com/cards/search?q=${encodeURIComponent(`is:commander ${trimmed}`)}&order=name&unique=cards`;
+          const r = await fetch(url);
+          if (!r.ok) { setDeckCmdrSuggestions([]); return; }
+          const j = await r.json();
+          // Dedupe by name — multiple printings of the same card share name.
+          const byName = new Map();
+          for (const c of (j.data || [])) {
+            if (!byName.has(c.name)) byName.set(c.name, c);
+          }
+          setDeckCmdrSuggestions([...byName.values()].slice(0, 20));
+        } catch {
+          setDeckCmdrSuggestions([]);
+        } finally {
+          setDeckCmdrBusy(false);
+        }
+      }, 220);
+    };
+
+    const commitCreateDeck = () => {
+      const raw = (deckCreateName || "").trim();
       if (!raw) return;
-      const name = uniqueName(raw.trim(), (groups.decks || []).map(d => d.name));
-      if (!name) return;
-      const newDeck = { name, type: "deck", cards: [], commanderName: null, source: "manual" };
+      if (deckCreateFormat === "commander" && !deckCmdrPicked) {
+        alert("Pick a commander, or change the format.");
+        return;
+      }
+      const name = uniqueName(raw, (groups.decks || []).map(d => d.name));
+      const newDeck = {
+        name, type: "deck", cards: [],
+        commanderName: deckCreateFormat === "commander" ? (deckCmdrPicked?.name || null) : null,
+        format: deckCreateFormat,
+        source: "manual",
+      };
+      // Persist a slim Scryfall record for the commander so its colour
+      // identity shows up in the deck row badges without an extra fetch.
+      if (deckCreateFormat === "commander" && deckCmdrPicked) {
+        try {
+          const cache = getSFCache();
+          const slim = slimSF(deckCmdrPicked);
+          const ts = Date.now();
+          cache[(deckCmdrPicked.id   || "").toLowerCase()] = { d: slim, ts };
+          cache[(deckCmdrPicked.name || "").toLowerCase()] = { d: slim, ts };
+          setSFCache(cache);
+        } catch {}
+        newDeck.selCmd = {
+          name: deckCmdrPicked.name,
+          card: { name: deckCmdrPicked.name, scryfall: deckCmdrPicked },
+          commanderCandidates: [],
+        };
+      }
       const nextGroups = { ...groups, decks: [...(groups.decks || []), newDeck] };
       persistGroups(nextGroups);
+      setDeckCreateOpen(false);
     };
 
     // Apply a binder rename given an explicit new name. Returns true on
@@ -4324,6 +4429,55 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       // Clear hover/pin so we don't display a row that no longer exists here.
       setBinderHover(null);
       setBinderPinned(null);
+    };
+
+    // Route a deck-row click to the appropriate viewer.
+    // Generated decks have full deckData → open via loadCollectionDeck.
+    // Imported / manual decks with cards → run them through openImportedDeck
+    // which enriches on demand (and caches the result back on the entry).
+    // Empty manual decks have nothing to show yet — surface that.
+    const openDeck = (d) => {
+      if (d.deckData && d.selCmd) return loadCollectionDeck(d);
+      if (!(d.cards || []).length) {
+        alert(`"${d.name}" is empty — add cards via the Build flow or import a CSV first.`);
+        return;
+      }
+      return openImportedDeck(d, "collection");
+    };
+
+    // Derive the displayable color identity for a deck row.
+    //   Commander format (default) → the commander's color identity, looked
+    //   up from the saved selCmd if present, falling back to the Scryfall
+    //   slim cache via commanderName.
+    //   Other formats → union of color identities across the deck's land
+    //   cards (looked up in the slim cache).
+    const deckColorIdentity = (d) => {
+      const fmt = d.format || "commander";
+      if (fmt === "commander") {
+        const ci = d.selCmd?.card?.scryfall?.color_identity;
+        if (Array.isArray(ci) && ci.length >= 0) {
+          // Empty array here would be a colorless commander — still valid.
+          if (ci.length > 0 || d.selCmd) return ci;
+        }
+        if (d.commanderName) {
+          const cache = getSFCache();
+          const hit = cache[d.commanderName.toLowerCase()];
+          const cci = hit?.d?.color_identity;
+          if (Array.isArray(cci)) return cci;
+        }
+        return [];
+      }
+      // Land-based color identity for non-Commander formats.
+      const cache = getSFCache();
+      const set = new Set();
+      for (const c of (d.cards || [])) {
+        const slim = cache[(c.id || "").toLowerCase()]?.d
+                  || cache[(c.name || "").toLowerCase()]?.d;
+        if (!slim) continue;
+        if (!/Land/i.test(slim.type_line || "")) continue;
+        for (const col of (slim.color_identity || [])) set.add(col);
+      }
+      return [...set];
     };
 
     // Open a binder in the detail view. Enriches its cards on-demand
@@ -5327,61 +5481,40 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     : html`<div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
                         ${sortedBinders.map(b => {
                           const total = cardTotal(b.cards);
-                          const expKey = `binder::${b.name}`;
-                          const isExp  = !!expanded[expKey];
-                          const sortedCards = [...b.cards].sort((a,b) => a.name.localeCompare(b.name));
+                          const included = !!binInc[b.name];
                           return html`
-                            <div key=${b.name} style=${{
-                              borderRadius:10, transition:"all .15s",
-                              background: binInc[b.name] ? "#fff0e0" : "#fff",
-                              border: binInc[b.name] ? "1px solid #c07030" : "1px solid #ddd0b8",
-                              boxShadow:"0 1px 4px rgba(0,0,0,0.05)", overflow:"hidden",
-                            }}>
-                              <div onClick=${() => setBinInc(bi => ({ ...bi, [b.name]: !bi[b.name] }))}
-                                style=${{ display:"flex", alignItems:"center", gap:12, padding:"11px 14px", cursor:"pointer" }}>
-                                <span style=${{ fontSize:18, width:24, textAlign:"center", flexShrink:0 }}>
-                                  ${binInc[b.name] ? "✅" : "⬜"}
-                                </span>
-                                <div style=${{ flex:1, minWidth:0 }}>
-                                  <div onClick=${e => { e.stopPropagation(); openBinder(b.name); }}
-                                    title="Browse this binder"
-                                    style=${{ fontSize:13, fontWeight:600, color:"#7a2e0e",
-                                    whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
-                                    cursor:"pointer", textDecoration:"underline", textDecorationColor:"#d8b890",
-                                    textUnderlineOffset:2 }}>${b.name}</div>
-                                  <div style=${{ fontSize:11, color:"#8a6a4a" }}>Binder · ${total} cards (${b.cards.length} unique)</div>
+                            <div key=${b.name}
+                              onClick=${() => openBinder(b.name)}
+                              title="Click to open this binder"
+                              style=${{
+                                borderRadius:10, transition:"all .15s",
+                                background: included ? "#fff0e0" : "#fff",
+                                border: included ? "1px solid #c07030" : "1px solid #ddd0b8",
+                                boxShadow:"0 1px 4px rgba(0,0,0,0.05)", overflow:"hidden",
+                                cursor:"pointer",
+                                display:"flex", alignItems:"center", gap:12, padding:"11px 14px",
+                              }}>
+                              <span onClick=${e => { e.stopPropagation(); setBinInc(bi => ({ ...bi, [b.name]: !bi[b.name] })); }}
+                                title=${included ? "Click to exclude from analysis pool" : "Click to include in analysis pool"}
+                                style=${{ fontSize:18, width:24, textAlign:"center", flexShrink:0, cursor:"pointer" }}>
+                                ${included ? "✅" : "⬜"}
+                              </span>
+                              <div style=${{ flex:1, minWidth:0 }}>
+                                <div style=${{ fontSize:13, fontWeight:600, color:"#2a1000",
+                                  whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>${b.name}</div>
+                                <div style=${{ fontSize:11, color:"#8a6a4a", display:"flex", flexWrap:"wrap", gap:6, alignItems:"center" }}>
+                                  <span>Binder · ${total} cards (${b.cards.length} unique)</span>
+                                  ${(b.tags || []).length > 0 && (b.tags || []).map(t => html`<span key=${t} style=${{
+                                    padding:"1px 7px", borderRadius:10, fontSize:10,
+                                    background:"#f0e0c0", color:"#5a3a1a",
+                                  }}>${t}</span>`)}
                                 </div>
-                                <span style=${{
-                                  padding:"3px 10px", borderRadius:20, fontSize:11, fontWeight:600, flexShrink:0,
-                                  background: binInc[b.name] ? "#7a2e0e" : "#e8d8c0",
-                                  color: binInc[b.name] ? "#fff" : "#8a6a4a",
-                                }}>
-                                  ${binInc[b.name] ? "Included" : "Excluded"}
-                                </span>
-                                <button onClick=${e => { e.stopPropagation(); setExpanded(x => ({ ...x, [expKey]: !x[expKey] })); }}
-                                  style=${{
-                                    background:"transparent", border:"1px solid #d0b880", borderRadius:6,
-                                    padding:"3px 8px", fontSize:11, color:"#7a5a3a", cursor:"pointer",
-                                    fontFamily:"inherit", flexShrink:0,
-                                  }}>
-                                  ${isExp ? "▲ Hide" : "▼ Cards"}
-                                </button>
                               </div>
-                              ${isExp && html`
-                                <div style=${{
-                                  background:"#fffdf8", borderTop:"1px solid #e8d8b8",
-                                  padding:"10px 14px", maxHeight:260, overflowY:"auto", fontSize:11,
-                                  color:"#3a2010", display:"grid",
-                                  gridTemplateColumns:"repeat(auto-fill, minmax(180px, 1fr))", gap:"4px 12px",
-                                }}>
-                                  ${sortedCards.map(c => html`
-                                    <div key=${c.name} style=${{ display:"flex", justifyContent:"space-between", gap:6 }}>
-                                      <span style=${{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>${c.name}</span>
-                                      <strong style=${{ color:"#7a3010", flexShrink:0 }}>×${c.qty}</strong>
-                                    </div>
-                                  `)}
-                                </div>
-                              `}
+                              <span style=${{
+                                padding:"3px 10px", borderRadius:20, fontSize:11, fontWeight:600, flexShrink:0,
+                                background: included ? "#7a2e0e" : "#e8d8c0",
+                                color: included ? "#fff" : "#8a6a4a",
+                              }}>${included ? "Included" : "Excluded"}</span>
                             </div>
                           `;
                         })}
@@ -5403,117 +5536,95 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     : html`<div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
                         ${sortedDecks.map(d => {
                           const total = cardTotal(d.cards);
+                          const fmt = (d.format || "commander");
+                          const isCmdr = fmt === "commander";
                           // Commander deck = 100 cards (99 mainboard + 1 commander).
-                          // Manabox sometimes exports just the 99 mainboard, so treat 99-100 as complete.
-                          const complete = total >= 99 && total <= 100;
-                          const badge = total === 100 ? "✓ 100/100"
-                            : total === 99 ? "✓ 99 + cmdr"
-                            : `${total}/100`;
-                          const expKey = `deck::${d.name}`;
-                          const isExp  = !!expanded[expKey];
-                          const sortedCards = [...d.cards].sort((a,b) => a.name.localeCompare(b.name));
+                          // For other formats, 60 cards is the baseline.
+                          const target = isCmdr ? 100 : 60;
+                          const complete = isCmdr
+                            ? (total >= 99 && total <= 100)
+                            : (total >= target);
+                          const badge = isCmdr
+                            ? (total === 100 ? "✓ 100/100"
+                              : total === 99 ? "✓ 99 + cmdr"
+                              : `${total}/100`)
+                            : `${total}/${target}`;
                           const isGen = d.source === "generated" && d.deckData;
+                          const included = !!deckInc[d.name];
+                          const colors = deckColorIdentity(d);
                           return html`
-                            <div key=${d.name} style=${{
-                              borderRadius:10, transition:"all .15s",
-                              background: deckInc[d.name] ? "#fff0e0" : "#fff",
-                              border: deckInc[d.name] ? "1px solid #c07030" : "1px solid #ddd0b8",
-                              boxShadow:"0 1px 4px rgba(0,0,0,0.05)", overflow:"hidden",
-                            }}>
-                              <div onClick=${() => setDeckInc(di => ({ ...di, [d.name]: !di[d.name] }))}
-                                style=${{ display:"flex", alignItems:"center", gap:12, padding:"11px 14px", cursor:"pointer" }}>
-                                <span style=${{ fontSize:20, width:24, textAlign:"center", flexShrink:0 }}>
-                                  ${deckInc[d.name] ? "🔓" : "🔒"}
-                                </span>
-                                <div style=${{ flex:1, minWidth:0 }}>
-                                  <div style=${{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
-                                    <span style=${{ fontSize:13, fontWeight:600, color:"#2a1000",
-                                      whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", minWidth:0 }}>${d.name}</span>
-                                    ${isGen && html`
-                                      <span style=${{
-                                        padding:"1px 6px", borderRadius:8, fontSize:9, fontWeight:700, letterSpacing:0.5,
-                                        background:"#7a3010", color:"#fff8f0", flexShrink:0,
-                                      }}>FORGE</span>
-                                    `}
-                                  </div>
-                                  <div style=${{ fontSize:11, color:"#8a6a4a", display:"flex", gap:6, alignItems:"center" }}>
-                                    <span>Deck · ${total} cards (${d.cards.length} unique)</span>
-                                    <span style=${{
-                                      fontSize:10, padding:"1px 7px", borderRadius:10, fontWeight:600,
-                                      background: complete ? "#cde8c8" : "#f5d8c0",
-                                      color: complete ? "#2a6a2a" : "#a04010",
-                                    }}>
-                                      ${badge}
+                            <div key=${d.name}
+                              onClick=${() => openDeck(d)}
+                              title="Click to open this deck"
+                              style=${{
+                                borderRadius:10, transition:"all .15s",
+                                background: included ? "#fff0e0" : "#fff",
+                                border: included ? "1px solid #c07030" : "1px solid #ddd0b8",
+                                boxShadow:"0 1px 4px rgba(0,0,0,0.05)", overflow:"hidden",
+                                cursor:"pointer",
+                                display:"flex", alignItems:"center", gap:12, padding:"11px 14px",
+                              }}>
+                              <span onClick=${e => { e.stopPropagation(); setDeckInc(di => ({ ...di, [d.name]: !di[d.name] })); }}
+                                title=${included ? "Click to exclude from analysis pool" : "Click to include in analysis pool"}
+                                style=${{ fontSize:20, width:24, textAlign:"center", flexShrink:0, cursor:"pointer" }}>
+                                ${included ? "🔓" : "🔒"}
+                              </span>
+                              <div style=${{ flex:1, minWidth:0 }}>
+                                <div style=${{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
+                                  <span style=${{ fontSize:13, fontWeight:600, color:"#2a1000",
+                                    whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", minWidth:0 }}>${d.name}</span>
+                                  ${colors.length > 0 && html`
+                                    <span style=${{ display:"inline-flex", gap:2, alignItems:"center" }}>
+                                      ${colors.map(c => html`<${Pip} key=${c} c=${c} />`)}
                                     </span>
-                                  </div>
+                                  `}
+                                  ${isGen && html`
+                                    <span style=${{
+                                      padding:"1px 6px", borderRadius:8, fontSize:9, fontWeight:700, letterSpacing:0.5,
+                                      background:"#7a3010", color:"#fff8f0", flexShrink:0,
+                                    }}>FORGE</span>
+                                  `}
                                 </div>
-                                <span style=${{
-                                  padding:"3px 10px", borderRadius:20, fontSize:11, fontWeight:600, flexShrink:0,
-                                  background: deckInc[d.name] ? "#7a2e0e" : "#e8d8c0",
-                                  color: deckInc[d.name] ? "#fff" : "#8a6a4a",
-                                }}>
-                                  ${deckInc[d.name] ? "Included" : "Excluded"}
-                                </span>
-                                ${isGen && html`
-                                  <button onClick=${e => { e.stopPropagation(); loadCollectionDeck(d); }}
-                                    style=${{
-                                      background:"#7a2e0e", border:"none", borderRadius:6,
-                                      padding:"4px 10px", fontSize:11, color:"#fff8f0", cursor:"pointer",
-                                      fontFamily:"inherit", flexShrink:0, fontWeight:600,
-                                    }}
-                                    title="Open the deck — commander art, mana curve, categories, full card view.">
-                                    🃏 Open
-                                  </button>
-                                `}
-                                <button onClick=${e => { e.stopPropagation(); renameDeck(d.name); }}
-                                  title="Rename deck"
-                                  style=${{
-                                    background:"transparent", border:"1px solid #d0b880", borderRadius:6,
-                                    padding:"3px 6px", fontSize:12, color:"#7a5a3a", cursor:"pointer",
-                                    fontFamily:"inherit", flexShrink:0,
-                                  }}>✏️</button>
-                                <button onClick=${e => { e.stopPropagation(); deleteDeck(d.name); }}
-                                  title="Delete deck"
-                                  style=${{
-                                    background:"transparent", border:"1px solid #d0b880", borderRadius:6,
-                                    padding:"3px 6px", fontSize:12, color:"#a04020", cursor:"pointer",
-                                    fontFamily:"inherit", flexShrink:0,
-                                  }}>🗑</button>
-                                <button onClick=${e => { e.stopPropagation(); setExpanded(x => ({ ...x, [expKey]: !x[expKey] })); }}
-                                  style=${{
-                                    background:"transparent", border:"1px solid #d0b880", borderRadius:6,
-                                    padding:"3px 8px", fontSize:11, color:"#7a5a3a", cursor:"pointer",
-                                    fontFamily:"inherit", flexShrink:0,
-                                  }}>
-                                  ${isExp ? "▲ Hide" : "▼ Cards"}
-                                </button>
+                                <div style=${{ fontSize:11, color:"#8a6a4a", display:"flex", gap:6, alignItems:"center", flexWrap:"wrap" }}>
+                                  <span style=${{
+                                    fontSize:9, padding:"1px 6px", borderRadius:8, fontWeight:700, letterSpacing:0.5,
+                                    background:"#e8d8b8", color:"#5a3a1a", textTransform:"uppercase",
+                                  }}>${fmt}</span>
+                                  <span>${total} cards (${d.cards.length} unique)</span>
+                                  ${total > 0 && html`<span style=${{
+                                    fontSize:10, padding:"1px 7px", borderRadius:10, fontWeight:600,
+                                    background: complete ? "#cde8c8" : "#f5d8c0",
+                                    color: complete ? "#2a6a2a" : "#a04010",
+                                  }}>${badge}</span>`}
+                                  ${isCmdr && d.commanderName && html`<span style=${{ color:"#7a3010" }}>· 👑 ${d.commanderName}</span>`}
+                                </div>
                               </div>
-                              ${isExp && html`
-                                <div style=${{
-                                  background:"#fffdf8", borderTop:"1px solid #e8d8b8",
-                                  padding:"10px 14px", maxHeight:260, overflowY:"auto", fontSize:11,
-                                  color:"#3a2010", display:"grid",
-                                  gridTemplateColumns:"repeat(auto-fill, minmax(180px, 1fr))", gap:"4px 12px",
-                                }}>
-                                  ${sortedCards.map(c => html`
-                                    <div key=${c.name} style=${{ display:"flex", justifyContent:"space-between", gap:6 }}>
-                                      <span style=${{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
-                                        ${c.name === d.commanderName ? "👑 " : ""}${c.name}
-                                      </span>
-                                      <strong style=${{ color:"#7a3010", flexShrink:0 }}>×${c.qty}</strong>
-                                    </div>
-                                  `)}
-                                </div>
-                              `}
+                              <span style=${{
+                                padding:"3px 10px", borderRadius:20, fontSize:11, fontWeight:600, flexShrink:0,
+                                background: included ? "#7a2e0e" : "#e8d8c0",
+                                color: included ? "#fff" : "#8a6a4a",
+                              }}>${included ? "Included" : "Excluded"}</span>
+                              <button onClick=${e => { e.stopPropagation(); renameDeck(d.name); }}
+                                title="Rename deck"
+                                style=${{
+                                  background:"transparent", border:"1px solid #d0b880", borderRadius:6,
+                                  padding:"3px 6px", fontSize:12, color:"#7a5a3a", cursor:"pointer",
+                                  fontFamily:"inherit", flexShrink:0,
+                                }}>✏️</button>
+                              <button onClick=${e => { e.stopPropagation(); deleteDeck(d.name); }}
+                                title="Delete deck"
+                                style=${{
+                                  background:"transparent", border:"1px solid #d0b880", borderRadius:6,
+                                  padding:"3px 6px", fontSize:12, color:"#a04020", cursor:"pointer",
+                                  fontFamily:"inherit", flexShrink:0,
+                                }}>🗑</button>
                             </div>
                           `;
                         })}
                       </div>`
                   }
                 </div>
-
               </div>
-
             </div>
           `;
           })()}
@@ -8034,6 +8145,210 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           </div>
         `;
       })()}
+
+      <!-- ── Create binder modal ──────────────────────────────────────────── -->
+      ${binderCreateOpen && html`
+        <div onClick=${() => setBinderCreateOpen(false)}
+          style=${{
+            position:"fixed", inset:0, background:"rgba(20,10,0,0.45)",
+            display:"flex", alignItems:"flex-start", justifyContent:"center",
+            paddingTop:80, zIndex:9999,
+          }}>
+          <div onClick=${e => e.stopPropagation()}
+            style=${{
+              background:"#fffaf0", border:"1px solid #d8b890", borderRadius:12,
+              width:"min(480px, 94vw)", overflow:"hidden",
+              boxShadow:"0 8px 32px rgba(0,0,0,0.35)",
+            }}>
+            <div style=${{
+              padding:"12px 16px", borderBottom:"1px solid #e8d8b8",
+              display:"flex", justifyContent:"space-between", alignItems:"center",
+            }}>
+              <div style=${{ fontSize:14, fontWeight:700, color:"#3a1a00" }}>New binder</div>
+              <button onClick=${() => setBinderCreateOpen(false)}
+                style=${{ background:"transparent", border:"none", fontSize:20,
+                  cursor:"pointer", color:"#7a5a3a", padding:"0 4px", lineHeight:1 }}>✕</button>
+            </div>
+            <div style=${{ padding:16 }}>
+              <div style=${{ ...label, marginBottom:5 }}>Name</div>
+              <input type="text" autoFocus=${true}
+                value=${binderCreateName}
+                onInput=${e => setBinderCreateName(e.target.value)}
+                onKeyDown=${e => { if (e.key === "Enter" && binderCreateName.trim()) commitCreateBinder(); }}
+                placeholder="e.g. Trade binder"
+                style=${{ ...inp, width:"100%", padding:"8px 10px", fontSize:13, marginBottom:14 }} />
+
+              <div style=${{ ...label, marginBottom:5 }}>Tags <span style=${{ color:"#a08868", fontWeight:400 }}>· optional, comma-separated</span></div>
+              <input type="text"
+                value=${binderCreateTags}
+                onInput=${e => setBinderCreateTags(e.target.value)}
+                placeholder="e.g. trade, modern staples, foils"
+                style=${{ ...inp, width:"100%", padding:"8px 10px", fontSize:13 }} />
+              <div style=${{ fontSize:11, color:"#8a6a4a", marginTop:6, lineHeight:1.5 }}>
+                Tags show up as small chips next to the binder name in the Collection view.
+              </div>
+            </div>
+            <div style=${{
+              padding:"10px 16px", borderTop:"1px solid #e8d8b8",
+              background:"#fff8ee",
+              display:"flex", justifyContent:"flex-end", gap:8,
+            }}>
+              <button onClick=${() => setBinderCreateOpen(false)}
+                style=${{ ...btnSec, fontSize:12, padding:"7px 14px" }}>Cancel</button>
+              <button onClick=${commitCreateBinder}
+                disabled=${!binderCreateName.trim()}
+                style=${{ ...btn, fontSize:12, padding:"7px 14px",
+                  opacity: binderCreateName.trim() ? 1 : 0.5 }}>
+                Create binder
+              </button>
+            </div>
+          </div>
+        </div>
+      `}
+
+      <!-- ── Create deck modal ────────────────────────────────────────────── -->
+      ${deckCreateOpen && html`
+        <div onClick=${() => setDeckCreateOpen(false)}
+          style=${{
+            position:"fixed", inset:0, background:"rgba(20,10,0,0.45)",
+            display:"flex", alignItems:"flex-start", justifyContent:"center",
+            paddingTop:60, zIndex:9999,
+          }}>
+          <div onClick=${e => e.stopPropagation()}
+            style=${{
+              background:"#fffaf0", border:"1px solid #d8b890", borderRadius:12,
+              width:"min(560px, 94vw)", maxHeight:"86vh", overflow:"hidden",
+              boxShadow:"0 8px 32px rgba(0,0,0,0.35)",
+              display:"flex", flexDirection:"column",
+            }}>
+            <div style=${{
+              padding:"12px 16px", borderBottom:"1px solid #e8d8b8",
+              display:"flex", justifyContent:"space-between", alignItems:"center",
+            }}>
+              <div style=${{ fontSize:14, fontWeight:700, color:"#3a1a00" }}>New deck</div>
+              <button onClick=${() => setDeckCreateOpen(false)}
+                style=${{ background:"transparent", border:"none", fontSize:20,
+                  cursor:"pointer", color:"#7a5a3a", padding:"0 4px", lineHeight:1 }}>✕</button>
+            </div>
+            <div style=${{ padding:16, overflowY:"auto", flex:1 }}>
+              <div style=${{ ...label, marginBottom:5 }}>Name</div>
+              <input type="text" autoFocus=${true}
+                value=${deckCreateName}
+                onInput=${e => setDeckCreateName(e.target.value)}
+                placeholder="e.g. Mono-red burn"
+                style=${{ ...inp, width:"100%", padding:"8px 10px", fontSize:13, marginBottom:14 }} />
+
+              <div style=${{ ...label, marginBottom:5 }}>Format</div>
+              <div style=${{ display:"flex", flexWrap:"wrap", gap:5, marginBottom:14 }}>
+                ${DECK_FORMATS.map(f => {
+                  const on = deckCreateFormat === f.value;
+                  return html`<button key=${f.value} onClick=${() => setDeckCreateFormat(f.value)}
+                    style=${{
+                      padding:"5px 11px", fontSize:11, fontWeight:600, borderRadius:14,
+                      border:"1px solid " + (on ? "#7a2e0e" : "#d0b880"),
+                      background: on ? "#7a2e0e" : "#fff",
+                      color: on ? "#fff" : "#3a1a00",
+                      cursor:"pointer", fontFamily:"inherit",
+                    }}>${f.label}</button>`;
+                })}
+              </div>
+
+              ${deckCreateFormat === "commander" && html`
+                <div style=${{ ...label, marginBottom:5 }}>
+                  Commander <span style=${{ color:"#a04020", fontWeight:400 }}>· required</span>
+                </div>
+                ${deckCmdrPicked
+                  ? (() => {
+                      const ci = deckCmdrPicked.color_identity || [];
+                      const img = deckCmdrPicked.image_uris?.small || deckCmdrPicked.card_faces?.[0]?.image_uris?.small;
+                      return html`
+                        <div style=${{
+                          display:"flex", gap:10, padding:10, alignItems:"center",
+                          background:"#fff", border:"1px solid #c07030", borderRadius:8,
+                        }}>
+                          ${img && html`<img src=${img} alt=${deckCmdrPicked.name}
+                            style=${{ width:46, height:64, objectFit:"cover", borderRadius:4 }} />`}
+                          <div style=${{ flex:1, minWidth:0 }}>
+                            <div style=${{ fontSize:13, fontWeight:700, color:"#3a1a00",
+                              display:"flex", gap:6, alignItems:"center", flexWrap:"wrap" }}>
+                              <span>${deckCmdrPicked.name}</span>
+                              ${ci.map(c => html`<${Pip} key=${c} c=${c} />`)}
+                            </div>
+                            <div style=${{ fontSize:11, color:"#7a5a3a" }}>${deckCmdrPicked.type_line || ""}</div>
+                          </div>
+                          <button onClick=${() => { setDeckCmdrPicked(null); setDeckCmdrQuery(""); }}
+                            style=${{ ...btnSec, fontSize:11, padding:"5px 10px", flexShrink:0 }}>
+                            Change
+                          </button>
+                        </div>
+                      `;
+                    })()
+                  : html`
+                    <input type="text"
+                      value=${deckCmdrQuery}
+                      onInput=${e => { setDeckCmdrQuery(e.target.value); runDeckCmdrAutocomplete(e.target.value); }}
+                      placeholder="Start typing a commander name…"
+                      style=${{ ...inp, width:"100%", padding:"8px 10px", fontSize:13 }} />
+                    <div style=${{ marginTop:6, fontSize:11, color:"#8a6a4a", minHeight:14 }}>
+                      ${deckCmdrBusy ? "Searching…"
+                        : deckCmdrQuery.trim().length < 2 ? "Type at least 2 characters."
+                        : deckCmdrSuggestions.length === 0 ? "No matches."
+                        : `${deckCmdrSuggestions.length} match${deckCmdrSuggestions.length === 1 ? "" : "es"}`}
+                    </div>
+                    ${deckCmdrSuggestions.length > 0 && html`
+                      <div style=${{
+                        marginTop:6, border:"1px solid #e8d8b8", borderRadius:8,
+                        background:"#fff", maxHeight:260, overflowY:"auto",
+                      }}>
+                        ${deckCmdrSuggestions.map(c => {
+                          const img = c.image_uris?.small || c.card_faces?.[0]?.image_uris?.small;
+                          const ci = c.color_identity || [];
+                          return html`<div key=${c.id}
+                            onClick=${() => setDeckCmdrPicked(c)}
+                            style=${{
+                              display:"flex", gap:8, padding:"6px 10px", alignItems:"center",
+                              borderBottom:"1px solid #f0e0c0", cursor:"pointer",
+                            }}
+                            onMouseEnter=${e => e.currentTarget.style.background = "#fff0e0"}
+                            onMouseLeave=${e => e.currentTarget.style.background = "transparent"}>
+                            ${img && html`<img src=${img} alt=${c.name}
+                              style=${{ width:30, height:42, objectFit:"cover", borderRadius:3, flexShrink:0 }} />`}
+                            <div style=${{ flex:1, minWidth:0 }}>
+                              <div style=${{ fontSize:12, fontWeight:600, color:"#3a1a00",
+                                whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+                                display:"flex", gap:5, alignItems:"center" }}>
+                                <span>${c.name}</span>
+                                ${ci.map(col => html`<${Pip} key=${col} c=${col} />`)}
+                              </div>
+                              <div style=${{ fontSize:10, color:"#8a6a4a",
+                                whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                                ${c.type_line || ""}
+                              </div>
+                            </div>
+                          </div>`;
+                        })}
+                      </div>
+                    `}
+                  `}
+              `}
+            </div>
+            <div style=${{
+              padding:"10px 16px", borderTop:"1px solid #e8d8b8",
+              background:"#fff8ee",
+              display:"flex", justifyContent:"flex-end", gap:8,
+            }}>
+              <button onClick=${() => setDeckCreateOpen(false)}
+                style=${{ ...btnSec, fontSize:12, padding:"7px 14px" }}>Cancel</button>
+              <button onClick=${commitCreateDeck}
+                disabled=${!deckCreateName.trim() || (deckCreateFormat === "commander" && !deckCmdrPicked)}
+                style=${{ ...btn, fontSize:12, padding:"7px 14px",
+                  opacity: (!deckCreateName.trim() || (deckCreateFormat === "commander" && !deckCmdrPicked)) ? 0.5 : 1 }}>
+                Create deck
+              </button>
+            </div>
+          </div>
+        </div>
+      `}
 
       <!-- (commander sidebar now rendered inline as sticky flex column) -->
 
