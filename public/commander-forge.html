@@ -1745,6 +1745,8 @@
     // Per-section collapsed state for the type-grouped grid.
     // Shape: { [typeName]: true } — present = collapsed.
     const [binderCollapsed, setBinderCollapsed] = useState({});
+    // 3-dot menu next to the binder name in the binder view header.
+    const [binderMenuOpen, setBinderMenuOpen] = useState(false);
 
     // "Add card" modal state (Phase B).
     // Two input modes:
@@ -4245,6 +4247,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setBinderPinned(null);
       setBinderHover(null);
       setBinderCollapsed({});
+      setBinderMenuOpen(false);
       setPhase("binder_view");
       if (binderEnriched[binderName]) return; // cached
       const binder = (groups.binders || []).find(b => b.name === binderName);
@@ -5266,20 +5269,6 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 }}>
                                   ${binInc[b.name] ? "Included" : "Excluded"}
                                 </span>
-                                <button onClick=${e => { e.stopPropagation(); renameBinder(b.name); }}
-                                  title="Rename binder"
-                                  style=${{
-                                    background:"transparent", border:"1px solid #d0b880", borderRadius:6,
-                                    padding:"3px 6px", fontSize:12, color:"#7a5a3a", cursor:"pointer",
-                                    fontFamily:"inherit", flexShrink:0,
-                                  }}>✏️</button>
-                                <button onClick=${e => { e.stopPropagation(); deleteBinder(b.name); }}
-                                  title="Delete binder"
-                                  style=${{
-                                    background:"transparent", border:"1px solid #d0b880", borderRadius:6,
-                                    padding:"3px 6px", fontSize:12, color:"#a04020", cursor:"pointer",
-                                    fontFamily:"inherit", flexShrink:0,
-                                  }}>🗑</button>
                                 <button onClick=${e => { e.stopPropagation(); setExpanded(x => ({ ...x, [expKey]: !x[expKey] })); }}
                                   style=${{
                                     background:"transparent", border:"1px solid #d0b880", borderRadius:6,
@@ -5559,7 +5548,49 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   </div>
                   <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"flex-end", gap:12 }}>
                     <div>
-                      <h2 style=${{ fontSize:18, color:"#3a1a00", margin:0 }}>${binder.name}</h2>
+                      <div style=${{ display:"flex", alignItems:"center", gap:6, position:"relative" }}>
+                        <h2 style=${{ fontSize:18, color:"#3a1a00", margin:0 }}>${binder.name}</h2>
+                        <button onClick=${() => setBinderMenuOpen(o => !o)}
+                          title="Binder actions"
+                          style=${{
+                            background:"transparent", border:"1px solid #d0b880", borderRadius:6,
+                            padding:"2px 7px", fontSize:14, color:"#7a5a3a", cursor:"pointer",
+                            fontFamily:"inherit", lineHeight:1,
+                          }}>⋯</button>
+                        ${binderMenuOpen && html`
+                          <div onClick=${() => setBinderMenuOpen(false)}
+                            style=${{ position:"fixed", inset:0, zIndex:50 }}></div>
+                          <div style=${{
+                            position:"absolute", top:"110%", left:36, zIndex:60,
+                            background:"#fff", border:"1px solid #d8b890", borderRadius:8,
+                            boxShadow:"0 4px 16px rgba(0,0,0,0.18)",
+                            minWidth:180, padding:4,
+                          }}>
+                            <button onClick=${() => { setBinderMenuOpen(false); renameBinder(viewingBinder); }}
+                              style=${{
+                                display:"block", width:"100%", textAlign:"left",
+                                padding:"7px 10px", fontSize:12, color:"#3a1a00",
+                                background:"transparent", border:"none", borderRadius:5,
+                                cursor:"pointer", fontFamily:"inherit",
+                              }}
+                              onMouseEnter=${e => e.currentTarget.style.background = "#fff0e0"}
+                              onMouseLeave=${e => e.currentTarget.style.background = "transparent"}>
+                              ✏️ Rename binder
+                            </button>
+                            <button onClick=${() => { setBinderMenuOpen(false); deleteBinder(viewingBinder); }}
+                              style=${{
+                                display:"block", width:"100%", textAlign:"left",
+                                padding:"7px 10px", fontSize:12, color:"#a04020",
+                                background:"transparent", border:"none", borderRadius:5,
+                                cursor:"pointer", fontFamily:"inherit",
+                              }}
+                              onMouseEnter=${e => e.currentTarget.style.background = "#fde8e0"}
+                              onMouseLeave=${e => e.currentTarget.style.background = "transparent"}>
+                              🗑 Delete binder…
+                            </button>
+                          </div>
+                        `}
+                      </div>
                       <div style=${{ fontSize:12, color:"#8a6a4a", marginTop:2 }}>
                         ${binder.cards.reduce((s,c) => s + (c.qty||1), 0).toLocaleString()} cards · ${binder.cards.length.toLocaleString()} unique
                         ${binderLoading && html` <span style=${{ color:"#a05010", marginLeft:8 }}>· enriching…</span>`}
