@@ -1386,6 +1386,29 @@
     }}></span>`;
   }
 
+  // Card-condition scale — mirrors Cardmarket's 7-tier ladder
+  // (M, NM, EX, GD, LP, PL, PO). The colors are our own green→red gradient
+  // used to stand in for an icon set; not a copy of any third-party glyphs.
+  const CONDITIONS = [
+    { code: "M",  label: "Mint",         color: "#2a8a40" },
+    { code: "NM", label: "Near Mint",    color: "#4ca050" },
+    { code: "EX", label: "Excellent",    color: "#8aa030" },
+    { code: "GD", label: "Good",         color: "#c89020" },
+    { code: "LP", label: "Light Played", color: "#d0701a" },
+    { code: "PL", label: "Played",       color: "#b04020" },
+    { code: "PO", label: "Poor",         color: "#702020" },
+  ];
+  const CONDITION_BY_CODE = Object.fromEntries(CONDITIONS.map(c => [c.code, c]));
+
+  function ConditionDot({ code, size = 10 }) {
+    const c = CONDITION_BY_CODE[code] || { color: "#999" };
+    return html`<span title=${c.label || code} style=${{
+      display:"inline-block", width:size, height:size, borderRadius:"50%",
+      background: c.color, border:"1px solid rgba(0,0,0,0.18)",
+      verticalAlign:"middle", flexShrink:0,
+    }}></span>`;
+  }
+
   function ProgressBar({ value }) {
     return html`
       <div style=${{ background:"#e8d8c0", borderRadius:6, height:8, maxWidth:400, margin:"0 auto 18px", overflow:"hidden" }}>
@@ -7103,32 +7126,66 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
               <!-- Shared defaults: Condition / Finish / State (apply to BOTH add methods) -->
               <div style=${{
-                display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10, marginBottom:14,
-                padding:10, background:"#fff8ee", border:"1px solid #e8d8b8", borderRadius:8,
+                marginBottom:14, padding:10,
+                background:"#fff8ee", border:"1px solid #e8d8b8", borderRadius:8,
               }}>
-                <div>
-                  <div style=${{ ...label, marginBottom:4 }}>Condition</div>
-                  <select value=${addCondition} onChange=${e => setAddCondition(e.target.value)}
-                    style=${{ ...inp, width:"100%", padding:"6px 8px", fontSize:12 }}>
-                    ${[["NM","NM (Near Mint)"],["LP","LP (Lightly Played)"],["MP","MP (Moderately Played)"],["HP","HP (Heavily Played)"],["DMG","DMG (Damaged)"]].map(([v,lab]) =>
-                      html`<option key=${v} value=${v}>${lab}</option>`)}
-                  </select>
+                <!-- Condition pills (Cardmarket-style 7-step scale) -->
+                <div style=${{ ...label, marginBottom:5 }}>Condition</div>
+                <div style=${{ display:"flex", flexWrap:"wrap", gap:5, marginBottom:10 }}>
+                  ${CONDITIONS.map(c => {
+                    const on = addCondition === c.code;
+                    return html`<button key=${c.code} onClick=${() => setAddCondition(c.code)}
+                      title=${`${c.code} — ${c.label}`}
+                      style=${{
+                        display:"inline-flex", alignItems:"center", gap:6,
+                        padding:"4px 9px", fontSize:11, fontWeight:600, borderRadius:14,
+                        border:"1px solid " + (on ? c.color : "#d0b880"),
+                        background: on ? c.color : "#fff",
+                        color: on ? "#fff" : "#3a1a00",
+                        cursor:"pointer", fontFamily:"inherit",
+                        boxShadow: on ? `0 1px 4px ${c.color}55` : "none",
+                      }}>
+                      <${ConditionDot} code=${c.code} size=${9} />
+                      <span>${c.code}</span>
+                      <span style=${{ opacity:0.85, fontWeight:400 }}>${c.label}</span>
+                    </button>`;
+                  })}
                 </div>
-                <div>
-                  <div style=${{ ...label, marginBottom:4 }}>Finish</div>
-                  <select value=${addFinish} onChange=${e => setAddFinish(e.target.value)}
-                    style=${{ ...inp, width:"100%", padding:"6px 8px", fontSize:12 }}>
-                    <option value="normal">Normal</option>
-                    <option value="foil">Foil</option>
-                  </select>
-                </div>
-                <div>
-                  <div style=${{ ...label, marginBottom:4 }}>State</div>
-                  <select value=${addPiece} onChange=${e => setAddPiece(e.target.value)}
-                    style=${{ ...inp, width:"100%", padding:"6px 8px", fontSize:12 }}>
-                    <option value="correct">Correct</option>
-                    <option value="misprint">Misprint</option>
-                  </select>
+
+                <!-- Finish + State pills -->
+                <div style=${{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14 }}>
+                  <div>
+                    <div style=${{ ...label, marginBottom:5 }}>Finish</div>
+                    <div style=${{ display:"flex", gap:5 }}>
+                      ${[["normal","Normal",""],["foil","Foil","✨"]].map(([v,lab,icon]) => {
+                        const on = addFinish === v;
+                        return html`<button key=${v} onClick=${() => setAddFinish(v)}
+                          style=${{
+                            flex:1, padding:"5px 8px", fontSize:11, fontWeight:600, borderRadius:14,
+                            border:"1px solid " + (on ? "#7a2e0e" : "#d0b880"),
+                            background: on ? "#7a2e0e" : "#fff",
+                            color: on ? "#fff" : "#3a1a00",
+                            cursor:"pointer", fontFamily:"inherit",
+                          }}>${icon ? icon + " " : ""}${lab}</button>`;
+                      })}
+                    </div>
+                  </div>
+                  <div>
+                    <div style=${{ ...label, marginBottom:5 }}>State</div>
+                    <div style=${{ display:"flex", gap:5 }}>
+                      ${[["correct","Correct",""],["misprint","Misprint","⚠️"]].map(([v,lab,icon]) => {
+                        const on = addPiece === v;
+                        return html`<button key=${v} onClick=${() => setAddPiece(v)}
+                          style=${{
+                            flex:1, padding:"5px 8px", fontSize:11, fontWeight:600, borderRadius:14,
+                            border:"1px solid " + (on ? "#7a2e0e" : "#d0b880"),
+                            background: on ? "#7a2e0e" : "#fff",
+                            color: on ? "#fff" : "#3a1a00",
+                            cursor:"pointer", fontFamily:"inherit",
+                          }}>${icon ? icon + " " : ""}${lab}</button>`;
+                      })}
+                    </div>
+                  </div>
                 </div>
               </div>
 
@@ -7297,8 +7354,15 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
                               ${p.name}
                             </div>
-                            <div style=${{ fontSize:10, color:"#8a6a4a" }}>
-                              ${(p.set || "").toUpperCase()} #${p.collector_number} · ${s.condition} · ${s.finish}${s.misprint ? " · misprint" : ""}
+                            <div style=${{ fontSize:10, color:"#8a6a4a",
+                              display:"inline-flex", alignItems:"center", gap:5, flexWrap:"wrap" }}>
+                              <span>${(p.set || "").toUpperCase()} #${p.collector_number}</span>
+                              <span>·</span>
+                              <${ConditionDot} code=${s.condition} size=${8} />
+                              <span>${s.condition}</span>
+                              <span>·</span>
+                              <span>${s.finish === "foil" ? "✨ Foil" : "Normal"}</span>
+                              ${s.misprint && html`<span>·</span><span title="Misprint">⚠️</span>`}
                             </div>
                           </div>
                           <input type="number" min="1" max="99" value=${s.qty}
