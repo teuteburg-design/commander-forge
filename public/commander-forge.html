@@ -1678,7 +1678,6 @@
     //   "set"  → set code + collector # + condition/finish/state →
     //            staging list → bulk add to chosen binder
     const [addCardOpen, setAddCardOpen] = useState(false);
-    const [addMode, setAddMode] = useState("name");      // "name" | "set"
     const [addTargetBinder, setAddTargetBinder] = useState("");
 
     // Name-search state
@@ -1716,7 +1715,6 @@
 
     const closeAddCard = () => {
       setAddCardOpen(false);
-      setAddMode("name");
       setAddQuery("");
       setAddSuggestions([]);
       setAddStep("search");
@@ -1890,20 +1888,27 @@
       return true;
     };
 
-    // "By name" single add — uses the staging API with one entry.
-    const addCardToBinder = () => {
-      if (!addTargetBinder || !addSelectedPrinting || addQty < 1) return;
-      const ok = writeEntriesToBinder(addTargetBinder, [{
+    // Stage the currently-picked by-name printing into the shared list,
+    // then reset the search so the user can quickly enter the next card.
+    const stageNameSelection = () => {
+      if (!addSelectedPrinting || addQty < 1) return;
+      setAddStaging(s => [...s, {
         printing: addSelectedPrinting,
         qty: addQty,
-        condition: "NM",
-        finish: "normal",
-        misprint: false,
+        condition: addCondition,
+        finish: addFinish,
+        misprint: addPiece === "misprint",
       }]);
-      if (ok) closeAddCard();
+      setAddQty(1);
+      setAddQuery("");
+      setAddSuggestions([]);
+      setAddPrintings([]);
+      setAddSelectedName("");
+      setAddSelectedPrinting(null);
+      setAddStep("search");
     };
 
-    // "By set" commit — flushes the staging list to the chosen binder.
+    // Commit the entire staging list to the chosen binder.
     const commitStagingToBinder = () => {
       if (!addTargetBinder || addStaging.length === 0) return;
       const ok = writeEntriesToBinder(addTargetBinder, addStaging);
@@ -7089,22 +7094,6 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 }}>✕</button>
             </div>
 
-            <!-- mode tabs -->
-            <div style=${{
-              display:"flex", borderBottom:"1px solid #e8d8b8", background:"#fff8ee",
-            }}>
-              ${[["name","By name"],["set","By set + number"]].map(([k,lab]) => {
-                const on = addMode === k;
-                return html`<button key=${k} onClick=${() => setAddMode(k)}
-                  style=${{
-                    flex:1, padding:"9px 12px", fontSize:12, fontWeight:600,
-                    border:"none", borderBottom: on ? "2px solid #7a2e0e" : "2px solid transparent",
-                    background: on ? "#fff" : "transparent",
-                    color: on ? "#7a2e0e" : "#7a5a3a", cursor:"pointer", fontFamily:"inherit",
-                  }}>${lab}</button>`;
-              })}
-            </div>
-
             <!-- body -->
             <div style=${{ padding:16, overflowY:"auto", flex:1 }}>
               ${addError && html`<div style=${{
@@ -7112,44 +7101,100 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 borderRadius:6, color:"#a02010", fontSize:12, marginBottom:10,
               }}>${addError}</div>`}
 
-              ${addMode === "name" && addStep === "search" && html`
-                <input type="text" autoFocus=${true}
-                  value=${addQuery}
-                  onInput=${e => { setAddQuery(e.target.value); runAutocomplete(e.target.value); }}
-                  placeholder="Start typing a card name…"
-                  style=${{ ...inp, width:"100%", padding:"9px 12px", fontSize:14 }} />
-                <div style=${{ marginTop:10, fontSize:11, color:"#8a6a4a", minHeight:14 }}>
-                  ${addSugBusy ? "Searching…"
-                    : addQuery.trim().length < 2 ? "Type at least 2 characters."
-                    : addSuggestions.length === 0 ? "No matches."
-                    : `${addSuggestions.length} suggestion${addSuggestions.length === 1 ? "" : "s"}`}
+              <!-- Shared defaults: Condition / Finish / State (apply to BOTH add methods) -->
+              <div style=${{
+                display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10, marginBottom:14,
+                padding:10, background:"#fff8ee", border:"1px solid #e8d8b8", borderRadius:8,
+              }}>
+                <div>
+                  <div style=${{ ...label, marginBottom:4 }}>Condition</div>
+                  <select value=${addCondition} onChange=${e => setAddCondition(e.target.value)}
+                    style=${{ ...inp, width:"100%", padding:"6px 8px", fontSize:12 }}>
+                    ${[["NM","NM (Near Mint)"],["LP","LP (Lightly Played)"],["MP","MP (Moderately Played)"],["HP","HP (Heavily Played)"],["DMG","DMG (Damaged)"]].map(([v,lab]) =>
+                      html`<option key=${v} value=${v}>${lab}</option>`)}
+                  </select>
                 </div>
-                ${addSuggestions.length > 0 && html`
-                  <div style=${{
-                    marginTop:8, border:"1px solid #e8d8b8", borderRadius:8,
-                    background:"#fff", maxHeight:360, overflowY:"auto",
-                  }}>
-                    ${addSuggestions.map(name => html`
-                      <div key=${name} onClick=${() => loadPrintings(name)}
-                        style=${{
-                          padding:"8px 12px", fontSize:13, color:"#3a1a00",
-                          borderBottom:"1px solid #f0e0c0", cursor:"pointer",
-                        }}
-                        onMouseEnter=${e => e.currentTarget.style.background = "#fff0e0"}
-                        onMouseLeave=${e => e.currentTarget.style.background = "#fff"}>
-                        ${name}
-                      </div>
-                    `)}
-                  </div>
-                `}
+                <div>
+                  <div style=${{ ...label, marginBottom:4 }}>Finish</div>
+                  <select value=${addFinish} onChange=${e => setAddFinish(e.target.value)}
+                    style=${{ ...inp, width:"100%", padding:"6px 8px", fontSize:12 }}>
+                    <option value="normal">Normal</option>
+                    <option value="foil">Foil</option>
+                  </select>
+                </div>
+                <div>
+                  <div style=${{ ...label, marginBottom:4 }}>State</div>
+                  <select value=${addPiece} onChange=${e => setAddPiece(e.target.value)}
+                    style=${{ ...inp, width:"100%", padding:"6px 8px", fontSize:12 }}>
+                    <option value="correct">Correct</option>
+                    <option value="misprint">Misprint</option>
+                  </select>
+                </div>
+              </div>
+
+              <!-- ── By set + number ─────────────────────────────────────── -->
+              <div style=${{ ...label, marginBottom:6 }}>By set + collector #</div>
+              <div style=${{ display:"grid", gridTemplateColumns:"110px 130px 1fr", gap:8, alignItems:"end", marginBottom:18 }}>
+                <input type="text" value=${addSetCode}
+                  onInput=${e => setAddSetCode(e.target.value.toUpperCase().slice(0, 6))}
+                  placeholder="Set (e.g. CLB)"
+                  style=${{ ...inp, width:"100%", padding:"7px 9px", fontSize:13, textTransform:"uppercase" }} />
+                <input type="text" ref=${addCollNumRef} value=${addCollNum}
+                  onInput=${e => setAddCollNum(e.target.value.trim())}
+                  onKeyDown=${e => { if (e.key === "Enter" && !addSetBusy) lookupAndStage(); }}
+                  placeholder="Collector # (e.g. 123)"
+                  style=${{ ...inp, width:"100%", padding:"7px 9px", fontSize:13 }} />
+                <button onClick=${lookupAndStage}
+                  disabled=${addSetBusy || !addSetCode.trim() || !addCollNum.trim()}
+                  style=${{
+                    ...btn, fontSize:12, padding:"8px 14px",
+                    opacity: (addSetBusy || !addSetCode.trim() || !addCollNum.trim()) ? 0.5 : 1,
+                  }}>${addSetBusy ? "Looking up…" : "Look up & add"}</button>
+              </div>
+
+              <!-- ── By name ─────────────────────────────────────────────── -->
+              <div style=${{ ...label, marginBottom:6 }}>By name (search)</div>
+              <input type="text"
+                value=${addQuery}
+                onInput=${e => { setAddQuery(e.target.value); runAutocomplete(e.target.value); setAddStep("search"); }}
+                placeholder="Start typing a card name…"
+                style=${{ ...inp, width:"100%", padding:"9px 12px", fontSize:14 }} />
+              ${addStep === "search" && addQuery.trim().length >= 2 && html`
+                <div style=${{ marginTop:6, fontSize:11, color:"#8a6a4a", minHeight:14 }}>
+                  ${addSugBusy ? "Searching…"
+                    : addSuggestions.length === 0 ? "No matches."
+                    : `${addSuggestions.length} suggestion${addSuggestions.length === 1 ? "" : "s"} — click to choose printings`}
+                </div>
+              `}
+              ${addStep === "search" && addSuggestions.length > 0 && html`
+                <div style=${{
+                  marginTop:6, border:"1px solid #e8d8b8", borderRadius:8,
+                  background:"#fff", maxHeight:240, overflowY:"auto",
+                }}>
+                  ${addSuggestions.map(name => html`
+                    <div key=${name} onClick=${() => loadPrintings(name)}
+                      style=${{
+                        padding:"7px 12px", fontSize:13, color:"#3a1a00",
+                        borderBottom:"1px solid #f0e0c0", cursor:"pointer",
+                      }}
+                      onMouseEnter=${e => e.currentTarget.style.background = "#fff0e0"}
+                      onMouseLeave=${e => e.currentTarget.style.background = "#fff"}>
+                      ${name}
+                    </div>
+                  `)}
+                </div>
               `}
 
-              ${addMode === "name" && addStep === "printings" && html`
-                <button onClick=${() => { setAddStep("search"); setAddPrintings([]); setAddSelectedPrinting(null); }}
-                  style=${{ ...btnSec, fontSize:11, padding:"5px 10px", marginBottom:10 }}>
-                  ← Choose a different card
-                </button>
-                <div style=${{ fontSize:12, color:"#7a5a3a", marginBottom:10 }}>${addSelectedName}</div>
+              ${addStep === "printings" && html`
+                <div style=${{ marginTop:10, display:"flex", justifyContent:"space-between",
+                  alignItems:"center", marginBottom:8 }}>
+                  <div style=${{ fontSize:12, color:"#7a5a3a" }}>
+                    <strong>${addSelectedName}</strong> — pick a printing
+                    <span style=${{ color:"#a08868", marginLeft:6 }}>(hover for full-size)</span>
+                  </div>
+                  <button onClick=${() => { setAddStep("search"); setAddPrintings([]); setAddSelectedPrinting(null); }}
+                    style=${{ ...btnSec, fontSize:11, padding:"4px 10px" }}>← Pick another card</button>
+                </div>
                 ${addPrintingsBusy
                   ? html`<div style=${{ padding:20, textAlign:"center", color:"#7a5a3a" }}>Loading printings…</div>`
                   : addPrintings.length === 0
@@ -7157,13 +7202,16 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     : html`
                       <div style=${{
                         display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(120px, 1fr))",
-                        gap:10, marginBottom:14,
+                        gap:10,
                       }}>
                         ${addPrintings.map(p => {
                           const img = p.image_uris?.small || p.card_faces?.[0]?.image_uris?.small;
+                          const big = p.image_uris?.normal || p.card_faces?.[0]?.image_uris?.normal || img;
                           const sel = addSelectedPrinting?.id === p.id;
                           return html`
                             <div key=${p.id} onClick=${() => setAddSelectedPrinting(p)}
+                              onMouseEnter=${e => showTooltip(e, big, p.name)}
+                              onMouseLeave=${hideTooltip}
                               title=${`${p.set_name} (${(p.set || "").toUpperCase()}) #${p.collector_number}`}
                               style=${{
                                 position:"relative", borderRadius:8, overflow:"hidden",
@@ -7192,118 +7240,83 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           `;
                         })}
                       </div>
+                      ${addSelectedPrinting && html`
+                        <div style=${{
+                          marginTop:12, padding:"8px 12px", background:"#fff",
+                          border:"1px solid #c07030", borderRadius:8,
+                          display:"flex", justifyContent:"space-between", alignItems:"center", gap:10,
+                        }}>
+                          <div style=${{ fontSize:12, color:"#5a3a1a",
+                            overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                            <strong>${addSelectedPrinting.name}</strong> ·
+                            ${(addSelectedPrinting.set || "").toUpperCase()} #${addSelectedPrinting.collector_number}
+                          </div>
+                          <div style=${{ display:"flex", alignItems:"center", gap:8 }}>
+                            <label style=${{ fontSize:11, color:"#7a5a3a" }}>Qty</label>
+                            <input type="number" min="1" max="99" value=${addQty}
+                              onInput=${e => setAddQty(Math.max(1, Math.min(99, parseInt(e.target.value) || 1)))}
+                              style=${{ ...inp, width:60, padding:"5px 8px", fontSize:13 }} />
+                            <button onClick=${stageNameSelection}
+                              style=${{ ...btn, fontSize:12, padding:"6px 12px" }}>
+                              + Add to list
+                            </button>
+                          </div>
+                        </div>
+                      `}
                     `}
               `}
 
-              ${addMode === "set" && html`
-                <div style=${{ fontSize:11, color:"#8a6a4a", marginBottom:10, lineHeight:1.5 }}>
-                  Enter set code (e.g. <strong>CLB</strong>), collector number, condition and finish.
-                  Press <strong>Enter</strong> or click <strong>Look up</strong> to add the card to the list below.
-                  The set code stays — keep typing collector numbers for fast bulk entry.
+              <!-- ── Staging list (shared by both methods) ───────────────── -->
+              <div style=${{ borderTop:"1px solid #e8d8b8", paddingTop:12, marginTop:18 }}>
+                <div style=${{ ...label, marginBottom:6 }}>
+                  To add ${addStaging.length > 0 && html`<span style=${{ color:"#7a5a3a", fontWeight:400 }}>· ${addStaging.length} card${addStaging.length === 1 ? "" : "s"}</span>`}
                 </div>
-
-                <div style=${{ display:"grid", gridTemplateColumns:"110px 130px 1fr", gap:8, alignItems:"end", marginBottom:10 }}>
-                  <div>
-                    <div style=${{ ...label, marginBottom:4 }}>Set</div>
-                    <input type="text" value=${addSetCode}
-                      onInput=${e => setAddSetCode(e.target.value.toUpperCase().slice(0, 6))}
-                      placeholder="CLB"
-                      style=${{ ...inp, width:"100%", padding:"7px 9px", fontSize:13, textTransform:"uppercase" }} />
-                  </div>
-                  <div>
-                    <div style=${{ ...label, marginBottom:4 }}>Collector #</div>
-                    <input type="text" ref=${addCollNumRef} value=${addCollNum}
-                      onInput=${e => setAddCollNum(e.target.value.trim())}
-                      onKeyDown=${e => { if (e.key === "Enter" && !addSetBusy) lookupAndStage(); }}
-                      placeholder="123"
-                      style=${{ ...inp, width:"100%", padding:"7px 9px", fontSize:13 }} />
-                  </div>
-                  <button onClick=${lookupAndStage}
-                    disabled=${addSetBusy || !addSetCode.trim() || !addCollNum.trim()}
-                    style=${{
-                      ...btn, fontSize:12, padding:"8px 14px",
-                      opacity: (addSetBusy || !addSetCode.trim() || !addCollNum.trim()) ? 0.5 : 1,
-                    }}>${addSetBusy ? "Looking up…" : "Look up & add to list"}</button>
-                </div>
-
-                <div style=${{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10, marginBottom:14 }}>
-                  <div>
-                    <div style=${{ ...label, marginBottom:4 }}>Condition</div>
-                    <select value=${addCondition} onChange=${e => setAddCondition(e.target.value)}
-                      style=${{ ...inp, width:"100%", padding:"6px 8px", fontSize:12 }}>
-                      ${[["NM","NM (Near Mint)"],["LP","LP (Lightly Played)"],["MP","MP (Moderately Played)"],["HP","HP (Heavily Played)"],["DMG","DMG (Damaged)"]].map(([v,lab]) =>
-                        html`<option key=${v} value=${v}>${lab}</option>`)}
-                    </select>
-                  </div>
-                  <div>
-                    <div style=${{ ...label, marginBottom:4 }}>Finish</div>
-                    <select value=${addFinish} onChange=${e => setAddFinish(e.target.value)}
-                      style=${{ ...inp, width:"100%", padding:"6px 8px", fontSize:12 }}>
-                      <option value="normal">Normal</option>
-                      <option value="foil">Foil</option>
-                    </select>
-                  </div>
-                  <div>
-                    <div style=${{ ...label, marginBottom:4 }}>State</div>
-                    <select value=${addPiece} onChange=${e => setAddPiece(e.target.value)}
-                      style=${{ ...inp, width:"100%", padding:"6px 8px", fontSize:12 }}>
-                      <option value="correct">Correct</option>
-                      <option value="misprint">Misprint</option>
-                    </select>
-                  </div>
-                </div>
-
-                <!-- staging list -->
-                <div style=${{
-                  borderTop:"1px solid #e8d8b8", paddingTop:10, marginTop:6,
-                }}>
-                  <div style=${{ ...label, marginBottom:6 }}>
-                    To add ${addStaging.length > 0 && html`<span style=${{ color:"#7a5a3a", fontWeight:400 }}>· ${addStaging.length} card${addStaging.length === 1 ? "" : "s"}</span>`}
-                  </div>
-                  ${addStaging.length === 0
-                    ? html`<div style=${{ padding:14, textAlign:"center", fontSize:12,
-                        color:"#a08868", fontStyle:"italic",
-                        background:"#fffdf8", border:"1px dashed #d8c090", borderRadius:8,
-                      }}>Nothing staged yet. Look up a card to add it here.</div>`
-                    : html`<div style=${{
-                        border:"1px solid #e8d8b8", borderRadius:8,
-                        background:"#fff", maxHeight:240, overflowY:"auto",
-                      }}>
-                        ${addStaging.map((s, i) => {
-                          const p = s.printing;
-                          const img = p.image_uris?.small || p.card_faces?.[0]?.image_uris?.small;
-                          return html`<div key=${i} style=${{
-                            display:"flex", gap:10, padding:"6px 10px", alignItems:"center",
-                            borderBottom: i < addStaging.length - 1 ? "1px solid #f0e0c0" : "none",
-                          }}>
-                            ${img && html`<img src=${img} alt=${p.name}
-                              style=${{ width:34, height:48, objectFit:"cover", borderRadius:3, flexShrink:0 }} />`}
-                            <div style=${{ flex:1, minWidth:0 }}>
-                              <div style=${{ fontSize:12, color:"#3a1a00", fontWeight:600,
-                                whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
-                                ${p.name}
-                              </div>
-                              <div style=${{ fontSize:10, color:"#8a6a4a" }}>
-                                ${(p.set || "").toUpperCase()} #${p.collector_number} · ${s.condition} · ${s.finish}${s.misprint ? " · misprint" : ""}
-                              </div>
+                ${addStaging.length === 0
+                  ? html`<div style=${{ padding:14, textAlign:"center", fontSize:12,
+                      color:"#a08868", fontStyle:"italic",
+                      background:"#fffdf8", border:"1px dashed #d8c090", borderRadius:8,
+                    }}>Nothing staged yet. Look up a card above to add it here.</div>`
+                  : html`<div style=${{
+                      border:"1px solid #e8d8b8", borderRadius:8,
+                      background:"#fff", maxHeight:240, overflowY:"auto",
+                    }}>
+                      ${addStaging.map((s, i) => {
+                        const p = s.printing;
+                        const img = p.image_uris?.small || p.card_faces?.[0]?.image_uris?.small;
+                        const big = p.image_uris?.normal || p.card_faces?.[0]?.image_uris?.normal || img;
+                        return html`<div key=${i} style=${{
+                          display:"flex", gap:10, padding:"6px 10px", alignItems:"center",
+                          borderBottom: i < addStaging.length - 1 ? "1px solid #f0e0c0" : "none",
+                        }}>
+                          ${img && html`<img src=${img} alt=${p.name}
+                            onMouseEnter=${e => showTooltip(e, big, p.name)}
+                            onMouseLeave=${hideTooltip}
+                            style=${{ width:34, height:48, objectFit:"cover", borderRadius:3, flexShrink:0, cursor:"zoom-in" }} />`}
+                          <div style=${{ flex:1, minWidth:0 }}>
+                            <div style=${{ fontSize:12, color:"#3a1a00", fontWeight:600,
+                              whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                              ${p.name}
                             </div>
-                            <input type="number" min="1" max="99" value=${s.qty}
-                              onInput=${e => {
-                                const q = Math.max(1, Math.min(99, parseInt(e.target.value) || 1));
-                                setAddStaging(arr => arr.map((x, idx) => idx === i ? { ...x, qty: q } : x));
-                              }}
-                              style=${{ ...inp, width:54, padding:"3px 6px", fontSize:12 }} />
-                            <button onClick=${() => setAddStaging(arr => arr.filter((_, idx) => idx !== i))}
-                              title="Remove"
-                              style=${{
-                                background:"transparent", border:"none", color:"#a05030",
-                                cursor:"pointer", fontSize:16, padding:"0 4px", lineHeight:1,
-                              }}>✕</button>
-                          </div>`;
-                        })}
-                      </div>`}
-                </div>
-              `}
+                            <div style=${{ fontSize:10, color:"#8a6a4a" }}>
+                              ${(p.set || "").toUpperCase()} #${p.collector_number} · ${s.condition} · ${s.finish}${s.misprint ? " · misprint" : ""}
+                            </div>
+                          </div>
+                          <input type="number" min="1" max="99" value=${s.qty}
+                            onInput=${e => {
+                              const q = Math.max(1, Math.min(99, parseInt(e.target.value) || 1));
+                              setAddStaging(arr => arr.map((x, idx) => idx === i ? { ...x, qty: q } : x));
+                            }}
+                            style=${{ ...inp, width:54, padding:"3px 6px", fontSize:12 }} />
+                          <button onClick=${() => setAddStaging(arr => arr.filter((_, idx) => idx !== i))}
+                            title="Remove"
+                            style=${{
+                              background:"transparent", border:"none", color:"#a05030",
+                              cursor:"pointer", fontSize:16, padding:"0 4px", lineHeight:1,
+                            }}>✕</button>
+                        </div>`;
+                      })}
+                    </div>`}
+              </div>
             </div>
 
             <!-- footer -->
@@ -7312,34 +7325,15 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               background:"#fff8ee",
               display:"flex", justifyContent:"flex-end", alignItems:"center", gap:10,
             }}>
-              ${addMode === "name" && addStep === "printings" && addSelectedPrinting && html`
-                <div style=${{ fontSize:12, color:"#5a3a1a", marginRight:"auto",
-                  overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
-                  <strong>${addSelectedPrinting.name}</strong> ·
-                  ${(addSelectedPrinting.set || "").toUpperCase()} #${addSelectedPrinting.collector_number}
-                </div>
-                <label style=${{ fontSize:11, color:"#7a5a3a" }}>Qty</label>
-                <input type="number" min="1" max="99" value=${addQty}
-                  onInput=${e => setAddQty(Math.max(1, Math.min(99, parseInt(e.target.value) || 1)))}
-                  style=${{ ...inp, width:60, padding:"5px 8px", fontSize:13 }} />
-                <button onClick=${addCardToBinder}
-                  disabled=${!addTargetBinder}
-                  style=${{ ...btn, fontSize:12, padding:"7px 14px",
-                    opacity: addTargetBinder ? 1 : 0.5 }}>
-                  Add to ${addTargetBinder ? `"${addTargetBinder}"` : "binder"}
-                </button>
-              `}
-              ${addMode === "set" && html`
-                <span style=${{ fontSize:11, color:"#8a6a4a", marginRight:"auto" }}>
-                  ${addStaging.length === 0 ? "Nothing staged" : `${addStaging.length} card${addStaging.length === 1 ? "" : "s"} staged · ${addStaging.reduce((s,x) => s + (x.qty||1), 0)} total`}
-                </span>
-                <button onClick=${commitStagingToBinder}
-                  disabled=${!addTargetBinder || addStaging.length === 0}
-                  style=${{ ...btn, fontSize:12, padding:"7px 14px",
-                    opacity: (addTargetBinder && addStaging.length > 0) ? 1 : 0.5 }}>
-                  Add to ${addTargetBinder ? `"${addTargetBinder}"` : "binder"}
-                </button>
-              `}
+              <span style=${{ fontSize:11, color:"#8a6a4a", marginRight:"auto" }}>
+                ${addStaging.length === 0 ? "Nothing staged" : `${addStaging.length} card${addStaging.length === 1 ? "" : "s"} staged · ${addStaging.reduce((s,x) => s + (x.qty||1), 0)} total`}
+              </span>
+              <button onClick=${commitStagingToBinder}
+                disabled=${!addTargetBinder || addStaging.length === 0}
+                style=${{ ...btn, fontSize:12, padding:"7px 14px",
+                  opacity: (addTargetBinder && addStaging.length > 0) ? 1 : 0.5 }}>
+                Add to ${addTargetBinder ? `"${addTargetBinder}"` : "binder"}
+              </button>
             </div>
           </div>
         </div>
