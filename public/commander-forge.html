@@ -1686,6 +1686,9 @@
       cmcMax: 20,
       query: "",
       sort: "type",          // "type" | "name" | "cmc"
+      conditions: [],        // empty = any of M/NM/EX/GD/LP/PL/PO
+      finishes: [],          // empty = any of normal/foil
+      states: [],            // empty = any of correct/misprint
     });
     // Hover/pin preview for the binder grid right-side panel.
     const [binderPinned, setBinderPinned] = useState(null);
@@ -4027,7 +4030,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // filters, and metrics. Subsequent opens hit the in-memory cache.
     const openBinder = async (binderName) => {
       setViewingBinder(binderName);
-      setBinderFilters({ colors:[], colorMode:"any", types:[], cmcMin:0, cmcMax:20, query:"", sort:"type" });
+      setBinderFilters({ colors:[], colorMode:"any", types:[], cmcMin:0, cmcMax:20, query:"", sort:"type", conditions:[], finishes:[], states:[] });
       setBinderPinned(null);
       setBinderHover(null);
       setBinderCollapsed({});
@@ -5230,6 +5233,12 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 }
               }
               if (f.colorMode === "only" && c.ci.length !== 0) return false;
+              if (f.conditions.length > 0 && !f.conditions.includes(c.condition || "NM")) return false;
+              if (f.finishes.length > 0 && !f.finishes.includes(c.finish || "normal")) return false;
+              if (f.states.length > 0) {
+                const st = c.misprint ? "misprint" : "correct";
+                if (!f.states.includes(st)) return false;
+              }
               return true;
             });
             // Sort
@@ -5319,16 +5328,23 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     <!-- Colors -->
                     <div style=${{ background:"#fff", border:"1px solid #ddd0b8", borderRadius:8, padding:10 }}>
                       <div style=${{ ...label, marginBottom:6 }}>Colors</div>
-                      <div style=${{ display:"flex", flexWrap:"wrap", gap:4, marginBottom:8 }}>
+                      <div style=${{ display:"flex", flexWrap:"wrap", gap:5, marginBottom:8 }}>
                         ${["W","U","B","R","G"].map(c => {
                           const on = f.colors.includes(c);
                           return html`<button key=${c} onClick=${() => setF({ colors: toggle(f.colors, c) })}
+                            title=${C_LABEL[c]}
                             style=${{
-                              padding:"4px 9px", fontSize:12, fontWeight:700, borderRadius:6,
+                              padding:"3px 5px", borderRadius:"50%",
                               border:"1px solid " + (on ? "#7a2e0e" : "#d0b880"),
-                              background: on ? "#7a2e0e" : "#fff",
-                              color: on ? "#fff" : "#5a3a1a", cursor:"pointer", fontFamily:"inherit",
-                            }}>${c}</button>`;
+                              background: on ? "#fff0e0" : "#fff",
+                              cursor:"pointer", fontFamily:"inherit",
+                              display:"inline-flex", alignItems:"center", justifyContent:"center",
+                              width:30, height:30,
+                              boxShadow: on ? "0 1px 4px rgba(122,46,14,0.35)" : "none",
+                            }}>
+                            <img src=${`https://svgs.scryfall.io/card-symbols/${c}.svg`} alt=${c}
+                              style=${{ width:20, height:20, display:"block" }} />
+                          </button>`;
                         })}
                       </div>
                       <div style=${{ display:"flex", gap:4, fontSize:11 }}>
@@ -5376,6 +5392,57 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       </div>
                     </div>
 
+                    <!-- Condition / Finish / State -->
+                    <div style=${{ background:"#fff", border:"1px solid #ddd0b8", borderRadius:8, padding:10 }}>
+                      <div style=${{ ...label, marginBottom:6 }}>Condition</div>
+                      <div style=${{ display:"flex", flexWrap:"wrap", gap:4, marginBottom:10 }}>
+                        ${CONDITIONS.map(cd => {
+                          const on = f.conditions.includes(cd.code);
+                          return html`<button key=${cd.code} onClick=${() => setF({ conditions: toggle(f.conditions, cd.code) })}
+                            title=${cd.label}
+                            style=${{
+                              display:"inline-flex", alignItems:"center", gap:4,
+                              padding:"3px 7px", fontSize:11, fontWeight:600, borderRadius:12,
+                              border:"1px solid " + (on ? cd.color : "#d0b880"),
+                              background: on ? cd.color : "#fff",
+                              color: on ? "#fff" : "#3a1a00",
+                              cursor:"pointer", fontFamily:"inherit",
+                            }}>
+                            <${ConditionDot} code=${cd.code} size=${8} />
+                            <span>${cd.code}</span>
+                          </button>`;
+                        })}
+                      </div>
+
+                      <div style=${{ ...label, marginBottom:5 }}>Finish</div>
+                      <div style=${{ display:"flex", gap:4, marginBottom:10 }}>
+                        ${[["normal","Normal",""],["foil","Foil","✨"]].map(([v,lab,icon]) => {
+                          const on = f.finishes.includes(v);
+                          return html`<button key=${v} onClick=${() => setF({ finishes: toggle(f.finishes, v) })}
+                            style=${{
+                              flex:1, padding:"3px 6px", fontSize:11, borderRadius:12, fontWeight:600,
+                              border:"1px solid " + (on ? "#7a2e0e" : "#d0b880"),
+                              background: on ? "#7a2e0e" : "#fff",
+                              color: on ? "#fff" : "#3a1a00", cursor:"pointer", fontFamily:"inherit",
+                            }}>${icon ? icon + " " : ""}${lab}</button>`;
+                        })}
+                      </div>
+
+                      <div style=${{ ...label, marginBottom:5 }}>State</div>
+                      <div style=${{ display:"flex", gap:4 }}>
+                        ${[["correct","Correct",""],["misprint","Misprint","⚠️"]].map(([v,lab,icon]) => {
+                          const on = f.states.includes(v);
+                          return html`<button key=${v} onClick=${() => setF({ states: toggle(f.states, v) })}
+                            style=${{
+                              flex:1, padding:"3px 6px", fontSize:11, borderRadius:12, fontWeight:600,
+                              border:"1px solid " + (on ? "#7a2e0e" : "#d0b880"),
+                              background: on ? "#7a2e0e" : "#fff",
+                              color: on ? "#fff" : "#3a1a00", cursor:"pointer", fontFamily:"inherit",
+                            }}>${icon ? icon + " " : ""}${lab}</button>`;
+                        })}
+                      </div>
+                    </div>
+
                     <!-- Sort -->
                     <div style=${{ background:"#fff", border:"1px solid #ddd0b8", borderRadius:8, padding:10 }}>
                       <div style=${{ ...label, marginBottom:6 }}>Sort by</div>
@@ -5393,8 +5460,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       </div>
                     </div>
 
-                    ${(f.colors.length > 0 || f.types.length > 0 || f.query || f.cmcMin > 0 || f.cmcMax < 20 || f.colorMode !== "any") && html`
-                      <button onClick=${() => setBinderFilters(p => ({ colors:[], colorMode:"any", types:[], cmcMin:0, cmcMax:20, query:"", sort: p.sort }))}
+                    ${(f.colors.length > 0 || f.types.length > 0 || f.query || f.cmcMin > 0 || f.cmcMax < 20 || f.colorMode !== "any" || f.conditions.length > 0 || f.finishes.length > 0 || f.states.length > 0) && html`
+                      <button onClick=${() => setBinderFilters(p => ({ colors:[], colorMode:"any", types:[], cmcMin:0, cmcMax:20, query:"", sort: p.sort, conditions:[], finishes:[], states:[] }))}
                         style=${{ ...btnSec, fontSize:11, padding:"6px 10px" }}>Clear filters</button>
                     `}
 
@@ -5550,10 +5617,37 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   <!-- RIGHT: Hover/Pin preview -->
                   <div style=${{ position:"sticky", top:90, alignSelf:"start" }}>
                     ${(() => {
+                      // Aggregate ownership for a card name across all rows in the binder,
+                      // grouped by (condition, finish, misprint).
+                      const ownershipFor = (cardName) => {
+                        if (!cardName) return [];
+                        const matches = (binder.cards || []).filter(c =>
+                          (c.name || "").toLowerCase() === cardName.toLowerCase());
+                        const groups = new Map();
+                        for (const m of matches) {
+                          const cond = m.condition || "NM";
+                          const fin  = m.finish    || "normal";
+                          const state = m.misprint ? "misprint" : "correct";
+                          const key = `${cond}|${fin}|${state}`;
+                          if (!groups.has(key)) groups.set(key, { condition: cond, finish: fin, state, qty: 0 });
+                          groups.get(key).qty += (m.qty || 1);
+                        }
+                        const condRank = code => {
+                          const i = CONDITIONS.findIndex(x => x.code === code);
+                          return i < 0 ? 99 : i;
+                        };
+                        return [...groups.values()].sort((a, b) =>
+                          condRank(a.condition) - condRank(b.condition)
+                          || (a.finish === "foil" ? 1 : 0) - (b.finish === "foil" ? 1 : 0)
+                          || (a.state === "misprint" ? 1 : 0) - (b.state === "misprint" ? 1 : 0));
+                      };
+
                       const PreviewCard = ({ card, pinned }) => {
                         if (!card) return null;
                         const sf = card.scryfall || {};
                         const big = sf.image_uris?.normal || sf.card_faces?.[0]?.image_uris?.normal || card.img;
+                        const breakdown = ownershipFor(card.name);
+                        const totalOwned = breakdown.reduce((s, x) => s + x.qty, 0);
                         return html`
                           <div style=${{
                             background:"#fff", border: pinned ? "2px solid #7a2e0e" : "1px solid #ddd0b8",
@@ -5576,6 +5670,31 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               ? html`<img src=${big} alt=${card.name}
                                   style=${{ width:"100%", height:"auto", display:"block" }} />`
                               : html`<div style=${{ padding:20, textAlign:"center", fontSize:13, color:"#7a5a3a" }}>${card.name}</div>`}
+                            ${breakdown.length > 0 && html`
+                              <div style=${{
+                                padding:"7px 10px 9px", borderTop:"1px solid #f0e0c0",
+                                background:"#fffdf8",
+                              }}>
+                                <div style=${{ ...label, fontSize:9, marginBottom:5,
+                                  display:"flex", justifyContent:"space-between" }}>
+                                  <span>You own</span>
+                                  <span style=${{ color:"#7a5a3a" }}>× ${totalOwned}</span>
+                                </div>
+                                ${breakdown.map((b, i) => html`
+                                  <div key=${i} style=${{
+                                    display:"flex", alignItems:"center", gap:6,
+                                    fontSize:11, color:"#3a1a00",
+                                    padding:"2px 0",
+                                  }}>
+                                    <${ConditionDot} code=${b.condition} size=${9} />
+                                    <span style=${{ minWidth:22, fontWeight:600 }}>${b.condition}</span>
+                                    <span style=${{ color:"#7a5a3a", minWidth:48 }}>${b.finish === "foil" ? "✨ Foil" : "Normal"}</span>
+                                    ${b.state === "misprint" && html`<span title="Misprint">⚠️</span>`}
+                                    <span style=${{ marginLeft:"auto", fontWeight:700, color:"#5a1a00" }}>×${b.qty}</span>
+                                  </div>
+                                `)}
+                              </div>
+                            `}
                           </div>
                         `;
                       };
