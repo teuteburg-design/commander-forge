@@ -1668,6 +1668,9 @@
     const [binderPinned, setBinderPinned] = useState(null);
     const [binderHover,  setBinderHover]  = useState(null);
     const binderHoverTimerRef = useRef(null);
+    // Per-section collapsed state for the type-grouped grid.
+    // Shape: { [typeName]: true } — present = collapsed.
+    const [binderCollapsed, setBinderCollapsed] = useState({});
 
     const [usable,   setUsable]   = useState([]);
     const [enriched, setEnriched] = useState([]);
@@ -3761,6 +3764,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setBinderFilters({ colors:[], colorMode:"any", types:[], cmcMin:0, cmcMax:20, query:"", sort:"type" });
       setBinderPinned(null);
       setBinderHover(null);
+      setBinderCollapsed({});
       setPhase("binder_view");
       if (binderEnriched[binderName]) return; // cached
       const binder = (groups.binders || []).find(b => b.name === binderName);
@@ -5005,19 +5009,20 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
             return html`
               <div style=${{ maxWidth:1400, margin:"0 auto" }}>
-                <!-- Header -->
-                <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:12, marginBottom:14 }}>
+                <!-- Header (3-col grid mirrors the body so the binder name aligns with the card list) -->
+                <div style=${{ display:"grid", gridTemplateColumns:"240px 1fr 260px", gap:16, alignItems:"end", marginBottom:14 }}>
                   <div>
                     <button onClick=${() => { setViewingBinder(null); setPhase("select"); }}
                       style=${{ ...btnSec, fontSize:12, padding:"6px 12px" }}>← Back to Collection</button>
                   </div>
-                  <div style=${{ textAlign:"right" }}>
+                  <div>
                     <h2 style=${{ fontSize:18, color:"#3a1a00", margin:0 }}>${binder.name}</h2>
                     <div style=${{ fontSize:12, color:"#8a6a4a", marginTop:2 }}>
                       ${binder.cards.reduce((s,c) => s + (c.qty||1), 0).toLocaleString()} cards · ${binder.cards.length.toLocaleString()} unique
                       ${binderLoading && html` <span style=${{ color:"#a05010", marginLeft:8 }}>· enriching…</span>`}
                     </div>
                   </div>
+                  <div></div>
                 </div>
 
                 <div style=${{ display:"grid", gridTemplateColumns:"240px 1fr 260px", gap:16, alignItems:"start" }}>
@@ -5171,61 +5176,97 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     <div style=${{ marginBottom:8, fontSize:12, color:"#8a6a4a" }}>
                       Showing <strong>${filtered.length.toLocaleString()}</strong> of ${meta.length.toLocaleString()} unique cards
                     </div>
-                    ${filtered.length === 0
-                      ? html`<div style=${{ padding:30, textAlign:"center", fontSize:13, color:"#a08868", fontStyle:"italic",
-                          background:"#fff", border:"1px dashed #d0b880", borderRadius:8 }}>
-                          No cards match these filters.
-                        </div>`
-                      : html`<div style=${{
-                          display:"grid", gridTemplateColumns:"repeat(5, 1fr)",
-                          gap:10,
-                        }}>
-                          ${filtered.map(c => {
-                            const isPinned = binderPinned?.name === c.name;
-                            return html`
-                            <div key=${c.name}
-                              onMouseEnter=${() => {
-                                clearTimeout(binderHoverTimerRef.current);
-                                binderHoverTimerRef.current = setTimeout(() => setBinderHover(c), 250);
-                              }}
-                              onMouseLeave=${() => {
-                                clearTimeout(binderHoverTimerRef.current);
-                                setBinderHover(null);
-                              }}
-                              onClick=${() => setBinderPinned(prev => prev?.name === c.name ? null : c)}
+                    ${(() => {
+                      if (filtered.length === 0) return html`<div style=${{ padding:30, textAlign:"center", fontSize:13, color:"#a08868", fontStyle:"italic",
+                        background:"#fff", border:"1px dashed #d0b880", borderRadius:8 }}>
+                        No cards match these filters.
+                      </div>`;
+
+                      const renderCard = c => {
+                        const isPinned = binderPinned?.name === c.name;
+                        return html`
+                          <div key=${c.name}
+                            onMouseEnter=${() => {
+                              clearTimeout(binderHoverTimerRef.current);
+                              binderHoverTimerRef.current = setTimeout(() => setBinderHover(c), 250);
+                            }}
+                            onMouseLeave=${() => {
+                              clearTimeout(binderHoverTimerRef.current);
+                              setBinderHover(null);
+                            }}
+                            onClick=${() => setBinderPinned(prev => prev?.name === c.name ? null : c)}
+                            style=${{
+                              position:"relative", borderRadius:8, overflow:"hidden",
+                              background:"#fff",
+                              border: isPinned ? "2px solid #7a2e0e" : "1px solid #ddd0b8",
+                              boxShadow: isPinned ? "0 2px 8px rgba(122,46,14,0.35)" : "0 1px 4px rgba(0,0,0,0.06)",
+                              cursor:"pointer", transition:"transform .12s, box-shadow .12s",
+                            }} title=${c.name}>
+                            ${c.img
+                              ? html`<img src=${c.img} loading="lazy" alt=${c.name}
+                                  style=${{ width:"100%", height:"auto", display:"block" }} />`
+                              : html`<div style=${{
+                                  width:"100%", aspectRatio:"5/7", display:"flex", alignItems:"center",
+                                  justifyContent:"center", padding:8, textAlign:"center",
+                                  fontSize:11, color:"#7a5a3a", background:"#f5e8d0",
+                                }}>${c.name}</div>`}
+                            ${(c.qty || 1) > 1 && html`
+                              <div style=${{
+                                position:"absolute", top:6, right:6,
+                                background:"rgba(122,46,14,0.92)", color:"#fff",
+                                padding:"2px 7px", borderRadius:10, fontSize:11, fontWeight:700,
+                              }}>×${c.qty}</div>
+                            `}
+                            ${isPinned && html`
+                              <div style=${{
+                                position:"absolute", top:6, left:6,
+                                background:"#7a2e0e", color:"#fff",
+                                padding:"2px 6px", borderRadius:10, fontSize:10, fontWeight:700,
+                              }}>📌</div>
+                            `}
+                          </div>
+                        `;
+                      };
+
+                      const gridStyle = {
+                        display:"grid", gridTemplateColumns:"repeat(5, 1fr)", gap:10,
+                      };
+
+                      // Flat list when sort isn't by type.
+                      if (f.sort !== "type") {
+                        return html`<div style=${gridStyle}>${filtered.map(renderCard)}</div>`;
+                      }
+
+                      // Type-grouped sections — always rendered in TYPE_ORDER so the
+                      // section order never flips. Empty sections are omitted.
+                      const buckets = new Map();
+                      TYPE_ORDER.forEach(t => buckets.set(t, []));
+                      buckets.set("Other", []);
+                      filtered.forEach(c => {
+                        const t = TYPE_ORDER.find(x => c.typeList.includes(x)) || "Other";
+                        buckets.get(t).push(c);
+                      });
+                      return html`<div style=${{ display:"flex", flexDirection:"column", gap:14 }}>
+                        ${[...buckets.entries()].filter(([, cs]) => cs.length > 0).map(([t, cs]) => {
+                          const collapsed = !!binderCollapsed[t];
+                          const total = cs.reduce((s,c) => s + (c.qty||1), 0);
+                          return html`<div key=${t}>
+                            <div onClick=${() => setBinderCollapsed(prev => ({ ...prev, [t]: !prev[t] }))}
                               style=${{
-                                position:"relative", borderRadius:8, overflow:"hidden",
-                                background:"#fff",
-                                border: isPinned ? "2px solid #7a2e0e" : "1px solid #ddd0b8",
-                                boxShadow: isPinned ? "0 2px 8px rgba(122,46,14,0.35)" : "0 1px 4px rgba(0,0,0,0.06)",
-                                cursor:"pointer", transition:"transform .12s, box-shadow .12s",
-                              }} title=${c.name}>
-                              ${c.img
-                                ? html`<img src=${c.img} loading="lazy" alt=${c.name}
-                                    style=${{ width:"100%", height:"auto", display:"block" }} />`
-                                : html`<div style=${{
-                                    width:"100%", aspectRatio:"5/7", display:"flex", alignItems:"center",
-                                    justifyContent:"center", padding:8, textAlign:"center",
-                                    fontSize:11, color:"#7a5a3a", background:"#f5e8d0",
-                                  }}>${c.name}</div>`}
-                              ${(c.qty || 1) > 1 && html`
-                                <div style=${{
-                                  position:"absolute", top:6, right:6,
-                                  background:"rgba(122,46,14,0.92)", color:"#fff",
-                                  padding:"2px 7px", borderRadius:10, fontSize:11, fontWeight:700,
-                                }}>×${c.qty}</div>
-                              `}
-                              ${isPinned && html`
-                                <div style=${{
-                                  position:"absolute", top:6, left:6,
-                                  background:"#7a2e0e", color:"#fff",
-                                  padding:"2px 6px", borderRadius:10, fontSize:10, fontWeight:700,
-                                }}>📌</div>
-                              `}
+                                display:"flex", alignItems:"center", gap:8,
+                                padding:"6px 0", marginBottom:8,
+                                borderBottom:"1px solid #d8c090",
+                                cursor:"pointer", userSelect:"none",
+                              }}>
+                              <span style=${{ fontSize:11, color:"#7a5a3a", width:14, display:"inline-block" }}>${collapsed ? "▶" : "▼"}</span>
+                              <span style=${{ fontSize:13, fontWeight:700, color:"#3a1a00", letterSpacing:0.3 }}>${t}</span>
+                              <span style=${{ fontSize:11, color:"#8a6a4a" }}>· ${cs.length} unique${total !== cs.length ? ` · ${total} cards` : ""}</span>
                             </div>
-                          `;
-                          })}
-                        </div>`}
+                            ${!collapsed && html`<div style=${gridStyle}>${cs.map(renderCard)}</div>`}
+                          </div>`;
+                        })}
+                      </div>`;
+                    })()}
                   </div>
 
                   <!-- RIGHT: Hover/Pin preview -->
@@ -5241,37 +5282,27 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             borderRadius:10, overflow:"hidden", marginBottom:10,
                             boxShadow:"0 2px 8px rgba(0,0,0,0.10)",
                           }}>
-                            <div style=${{
-                              padding:"5px 10px", fontSize:10, fontWeight:700, letterSpacing:0.5,
-                              textTransform:"uppercase", display:"flex", justifyContent:"space-between", alignItems:"center",
-                              background: pinned ? "#7a2e0e" : "#f5e8d0",
-                              color: pinned ? "#fff" : "#7a5a3a",
-                            }}>
-                              <span>${pinned ? "📌 Pinned" : "Hover"}</span>
-                              ${pinned && html`<button onClick=${() => setBinderPinned(null)}
-                                style=${{ background:"transparent", border:"none", color:"#fff",
-                                  fontSize:14, cursor:"pointer", padding:0, lineHeight:1 }}>✕</button>`}
-                            </div>
+                            ${pinned && html`
+                              <div style=${{
+                                padding:"5px 10px", fontSize:10, fontWeight:700, letterSpacing:0.5,
+                                textTransform:"uppercase", display:"flex", justifyContent:"space-between", alignItems:"center",
+                                background:"#7a2e0e", color:"#fff",
+                              }}>
+                                <span>📌 Pinned</span>
+                                <button onClick=${() => setBinderPinned(null)}
+                                  style=${{ background:"transparent", border:"none", color:"#fff",
+                                    fontSize:14, cursor:"pointer", padding:0, lineHeight:1 }}>✕</button>
+                              </div>
+                            `}
                             ${big
                               ? html`<img src=${big} alt=${card.name}
                                   style=${{ width:"100%", height:"auto", display:"block" }} />`
                               : html`<div style=${{ padding:20, textAlign:"center", fontSize:13, color:"#7a5a3a" }}>${card.name}</div>`}
-                            <div style=${{ padding:"6px 10px", fontSize:11, color:"#5a3a1a",
-                              display:"flex", justifyContent:"space-between", gap:8 }}>
-                              <span style=${{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>${card.name}</span>
-                              ${(card.qty || 1) > 1 && html`<strong>×${card.qty}</strong>`}
-                            </div>
                           </div>
                         `;
                       };
                       const hover = binderHover && binderHover.name !== binderPinned?.name ? binderHover : null;
-                      if (!binderPinned && !hover) return html`
-                        <div style=${{
-                          padding:16, fontSize:12, color:"#a08868", fontStyle:"italic",
-                          background:"#fffdf8", border:"1px dashed #d8c090", borderRadius:8, textAlign:"center",
-                        }}>
-                          Hover a card to preview · click to pin
-                        </div>`;
+                      if (!binderPinned && !hover) return null;
                       return html`
                         <${PreviewCard} card=${binderPinned} pinned=${true} />
                         <${PreviewCard} card=${hover} pinned=${false} />
