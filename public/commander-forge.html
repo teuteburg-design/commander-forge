@@ -1662,7 +1662,12 @@
       cmcMin: 0,
       cmcMax: 20,
       query: "",
+      sort: "type",          // "type" | "name" | "cmc"
     });
+    // Hover/pin preview for the binder grid right-side panel.
+    const [binderPinned, setBinderPinned] = useState(null);
+    const [binderHover,  setBinderHover]  = useState(null);
+    const binderHoverTimerRef = useRef(null);
 
     const [usable,   setUsable]   = useState([]);
     const [enriched, setEnriched] = useState([]);
@@ -3753,7 +3758,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // filters, and metrics. Subsequent opens hit the in-memory cache.
     const openBinder = async (binderName) => {
       setViewingBinder(binderName);
-      setBinderFilters({ colors:[], colorMode:"any", types:[], cmcMin:0, cmcMax:20, query:"" });
+      setBinderFilters({ colors:[], colorMode:"any", types:[], cmcMin:0, cmcMax:20, query:"", sort:"type" });
+      setBinderPinned(null);
+      setBinderHover(null);
       setPhase("binder_view");
       if (binderEnriched[binderName]) return; // cached
       const binder = (groups.binders || []).find(b => b.name === binderName);
@@ -4948,7 +4955,22 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               }
               if (f.colorMode === "only" && c.ci.length !== 0) return false;
               return true;
-            }).sort((a,b) => a.name.localeCompare(b.name));
+            });
+            // Sort
+            const TYPE_ORDER = ["Creature","Planeswalker","Battle","Instant","Sorcery","Artifact","Enchantment","Land"];
+            const typeRank = c => {
+              for (let i = 0; i < TYPE_ORDER.length; i++) if (c.typeList.includes(TYPE_ORDER[i])) return i;
+              return TYPE_ORDER.length;
+            };
+            if (f.sort === "name") {
+              filtered.sort((a,b) => a.name.localeCompare(b.name));
+            } else if (f.sort === "cmc") {
+              filtered.sort((a,b) => (a.cmc ?? 99) - (b.cmc ?? 99) || a.name.localeCompare(b.name));
+            } else { // "type"
+              filtered.sort((a,b) => typeRank(a) - typeRank(b)
+                || (a.cmc ?? 99) - (b.cmc ?? 99)
+                || a.name.localeCompare(b.name));
+            }
 
             // ── Metrics (over the FILTERED set so the panel reflects what you see) ──
             const totalQty = filtered.reduce((s,c) => s + (c.qty||1), 0);
@@ -4982,7 +5004,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             const setF = patch => setBinderFilters(prev => ({ ...prev, ...patch }));
 
             return html`
-              <div style=${{ maxWidth:1200, margin:"0 auto" }}>
+              <div style=${{ maxWidth:1400, margin:"0 auto" }}>
                 <!-- Header -->
                 <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:12, marginBottom:14 }}>
                   <div>
@@ -4998,7 +5020,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   </div>
                 </div>
 
-                <div style=${{ display:"grid", gridTemplateColumns:"260px 1fr", gap:18, alignItems:"start" }}>
+                <div style=${{ display:"grid", gridTemplateColumns:"240px 1fr 260px", gap:16, alignItems:"start" }}>
 
                   <!-- LEFT: Filters + Metrics -->
                   <div style=${{ display:"flex", flexDirection:"column", gap:14 }}>
@@ -5071,8 +5093,25 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       </div>
                     </div>
 
+                    <!-- Sort -->
+                    <div style=${{ background:"#fff", border:"1px solid #ddd0b8", borderRadius:8, padding:10 }}>
+                      <div style=${{ ...label, marginBottom:6 }}>Sort by</div>
+                      <div style=${{ display:"flex", gap:4 }}>
+                        ${[["type","Type"],["name","Name"],["cmc","CMC"]].map(([k,lab]) => {
+                          const on = f.sort === k;
+                          return html`<button key=${k} onClick=${() => setF({ sort: k })}
+                            style=${{
+                              flex:1, padding:"4px 8px", fontSize:11, borderRadius:5,
+                              border:"1px solid " + (on ? "#7a2e0e" : "#d0b880"),
+                              background: on ? "#7a2e0e" : "#fff",
+                              color: on ? "#fff" : "#5a3a1a", cursor:"pointer", fontFamily:"inherit",
+                            }}>${lab}</button>`;
+                        })}
+                      </div>
+                    </div>
+
                     ${(f.colors.length > 0 || f.types.length > 0 || f.query || f.cmcMin > 0 || f.cmcMax < 20 || f.colorMode !== "any") && html`
-                      <button onClick=${() => setBinderFilters({ colors:[], colorMode:"any", types:[], cmcMin:0, cmcMax:20, query:"" })}
+                      <button onClick=${() => setBinderFilters(p => ({ colors:[], colorMode:"any", types:[], cmcMin:0, cmcMax:20, query:"", sort: p.sort }))}
                         style=${{ ...btnSec, fontSize:11, padding:"6px 10px" }}>Clear filters</button>
                     `}
 
@@ -5138,15 +5177,29 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           No cards match these filters.
                         </div>`
                       : html`<div style=${{
-                          display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(140px, 1fr))",
+                          display:"grid", gridTemplateColumns:"repeat(5, 1fr)",
                           gap:10,
                         }}>
-                          ${filtered.map(c => html`
-                            <div key=${c.name} style=${{
-                              position:"relative", borderRadius:8, overflow:"hidden",
-                              background:"#fff", border:"1px solid #ddd0b8",
-                              boxShadow:"0 1px 4px rgba(0,0,0,0.06)",
-                            }} title=${c.name}>
+                          ${filtered.map(c => {
+                            const isPinned = binderPinned?.name === c.name;
+                            return html`
+                            <div key=${c.name}
+                              onMouseEnter=${() => {
+                                clearTimeout(binderHoverTimerRef.current);
+                                binderHoverTimerRef.current = setTimeout(() => setBinderHover(c), 250);
+                              }}
+                              onMouseLeave=${() => {
+                                clearTimeout(binderHoverTimerRef.current);
+                                setBinderHover(null);
+                              }}
+                              onClick=${() => setBinderPinned(prev => prev?.name === c.name ? null : c)}
+                              style=${{
+                                position:"relative", borderRadius:8, overflow:"hidden",
+                                background:"#fff",
+                                border: isPinned ? "2px solid #7a2e0e" : "1px solid #ddd0b8",
+                                boxShadow: isPinned ? "0 2px 8px rgba(122,46,14,0.35)" : "0 1px 4px rgba(0,0,0,0.06)",
+                                cursor:"pointer", transition:"transform .12s, box-shadow .12s",
+                              }} title=${c.name}>
                               ${c.img
                                 ? html`<img src=${c.img} loading="lazy" alt=${c.name}
                                     style=${{ width:"100%", height:"auto", display:"block" }} />`
@@ -5162,9 +5215,68 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                   padding:"2px 7px", borderRadius:10, fontSize:11, fontWeight:700,
                                 }}>×${c.qty}</div>
                               `}
+                              ${isPinned && html`
+                                <div style=${{
+                                  position:"absolute", top:6, left:6,
+                                  background:"#7a2e0e", color:"#fff",
+                                  padding:"2px 6px", borderRadius:10, fontSize:10, fontWeight:700,
+                                }}>📌</div>
+                              `}
                             </div>
-                          `)}
+                          `;
+                          })}
                         </div>`}
+                  </div>
+
+                  <!-- RIGHT: Hover/Pin preview -->
+                  <div style=${{ position:"sticky", top:90, alignSelf:"start" }}>
+                    ${(() => {
+                      const PreviewCard = ({ card, pinned }) => {
+                        if (!card) return null;
+                        const sf = card.scryfall || {};
+                        const big = sf.image_uris?.normal || sf.card_faces?.[0]?.image_uris?.normal || card.img;
+                        return html`
+                          <div style=${{
+                            background:"#fff", border: pinned ? "2px solid #7a2e0e" : "1px solid #ddd0b8",
+                            borderRadius:10, overflow:"hidden", marginBottom:10,
+                            boxShadow:"0 2px 8px rgba(0,0,0,0.10)",
+                          }}>
+                            <div style=${{
+                              padding:"5px 10px", fontSize:10, fontWeight:700, letterSpacing:0.5,
+                              textTransform:"uppercase", display:"flex", justifyContent:"space-between", alignItems:"center",
+                              background: pinned ? "#7a2e0e" : "#f5e8d0",
+                              color: pinned ? "#fff" : "#7a5a3a",
+                            }}>
+                              <span>${pinned ? "📌 Pinned" : "Hover"}</span>
+                              ${pinned && html`<button onClick=${() => setBinderPinned(null)}
+                                style=${{ background:"transparent", border:"none", color:"#fff",
+                                  fontSize:14, cursor:"pointer", padding:0, lineHeight:1 }}>✕</button>`}
+                            </div>
+                            ${big
+                              ? html`<img src=${big} alt=${card.name}
+                                  style=${{ width:"100%", height:"auto", display:"block" }} />`
+                              : html`<div style=${{ padding:20, textAlign:"center", fontSize:13, color:"#7a5a3a" }}>${card.name}</div>`}
+                            <div style=${{ padding:"6px 10px", fontSize:11, color:"#5a3a1a",
+                              display:"flex", justifyContent:"space-between", gap:8 }}>
+                              <span style=${{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>${card.name}</span>
+                              ${(card.qty || 1) > 1 && html`<strong>×${card.qty}</strong>`}
+                            </div>
+                          </div>
+                        `;
+                      };
+                      const hover = binderHover && binderHover.name !== binderPinned?.name ? binderHover : null;
+                      if (!binderPinned && !hover) return html`
+                        <div style=${{
+                          padding:16, fontSize:12, color:"#a08868", fontStyle:"italic",
+                          background:"#fffdf8", border:"1px dashed #d8c090", borderRadius:8, textAlign:"center",
+                        }}>
+                          Hover a card to preview · click to pin
+                        </div>`;
+                      return html`
+                        <${PreviewCard} card=${binderPinned} pinned=${true} />
+                        <${PreviewCard} card=${hover} pinned=${false} />
+                      `;
+                    })()}
                   </div>
                 </div>
               </div>
