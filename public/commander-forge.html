@@ -4073,6 +4073,169 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // `selCmd` and `deckData`, so we can reconstruct the view identically.
     // Goes to phase "deck" with fromCollection=true so the Back button returns
     // to the Collection rather than the Library.
+    // ── Binder / Deck CRUD (Phase C) ────────────────────────────────────
+    // All mutations go through these helpers so localStorage + sync state
+    // stay consistent. They write LS_BINDERS (the canonical store) and
+    // update the React state in lockstep.
+
+    const persistGroups = (nextGroups, nextDeckInc = deckInc, nextBinInc = binInc) => {
+      setGroups(nextGroups);
+      try {
+        localStorage.setItem(LS_BINDERS, JSON.stringify({
+          groups: nextGroups, deckInc: nextDeckInc, binInc: nextBinInc,
+        }));
+      } catch {}
+    };
+
+    const uniqueName = (base, existing) => {
+      if (!existing.includes(base)) return base;
+      let i = 2;
+      while (existing.includes(`${base} (${i})`)) i++;
+      return `${base} (${i})`;
+    };
+
+    const createBinder = () => {
+      const raw = window.prompt("Name for the new binder:", "New Binder");
+      if (!raw) return;
+      const name = uniqueName(raw.trim(), (groups.binders || []).map(b => b.name));
+      if (!name) return;
+      const newBinder = { name, type: "binder", cards: [], commanderName: null, source: "manual" };
+      const nextGroups = { ...groups, binders: [...(groups.binders || []), newBinder] };
+      const nextBinInc = { ...binInc, [name]: true };
+      setBinInc(nextBinInc);
+      persistGroups(nextGroups, deckInc, nextBinInc);
+    };
+
+    const createDeck = () => {
+      const raw = window.prompt("Name for the new deck:", "New Deck");
+      if (!raw) return;
+      const name = uniqueName(raw.trim(), (groups.decks || []).map(d => d.name));
+      if (!name) return;
+      const newDeck = { name, type: "deck", cards: [], commanderName: null, source: "manual" };
+      const nextGroups = { ...groups, decks: [...(groups.decks || []), newDeck] };
+      persistGroups(nextGroups);
+    };
+
+    const renameBinder = (oldName) => {
+      const raw = window.prompt("New name for this binder:", oldName);
+      if (!raw) return;
+      const trimmed = raw.trim();
+      if (!trimmed || trimmed === oldName) return;
+      if ((groups.binders || []).some(b => b.name === trimmed)) {
+        alert(`A binder named "${trimmed}" already exists.`);
+        return;
+      }
+      const nextBinders = (groups.binders || []).map(b => b.name === oldName ? { ...b, name: trimmed } : b);
+      const nextGroups = { ...groups, binders: nextBinders };
+      // Re-key binInc and binderEnriched onto the new name.
+      const nextBinInc = { ...binInc };
+      if (oldName in nextBinInc) { nextBinInc[trimmed] = nextBinInc[oldName]; delete nextBinInc[oldName]; }
+      setBinInc(nextBinInc);
+      setBinderEnriched(m => {
+        if (!(oldName in m)) return m;
+        const next = { ...m }; next[trimmed] = next[oldName]; delete next[oldName]; return next;
+      });
+      if (viewingBinder === oldName) setViewingBinder(trimmed);
+      persistGroups(nextGroups, deckInc, nextBinInc);
+    };
+
+    const renameDeck = (oldName) => {
+      const raw = window.prompt("New name for this deck:", oldName);
+      if (!raw) return;
+      const trimmed = raw.trim();
+      if (!trimmed || trimmed === oldName) return;
+      if ((groups.decks || []).some(d => d.name === trimmed)) {
+        alert(`A deck named "${trimmed}" already exists.`);
+        return;
+      }
+      const nextDecks = (groups.decks || []).map(d => d.name === oldName ? { ...d, name: trimmed } : d);
+      const nextGroups = { ...groups, decks: nextDecks };
+      const nextDeckInc = { ...deckInc };
+      if (oldName in nextDeckInc) { nextDeckInc[trimmed] = nextDeckInc[oldName]; delete nextDeckInc[oldName]; }
+      setDeckInc(nextDeckInc);
+      persistGroups(nextGroups, nextDeckInc, binInc);
+    };
+
+    const deleteBinder = (name) => {
+      const binder = (groups.binders || []).find(b => b.name === name);
+      if (!binder) return;
+      const cardCount = (binder.cards || []).reduce((s, c) => s + (c.qty || 1), 0);
+      const msg = cardCount > 0
+        ? `Delete binder "${name}"? This removes ${cardCount} cards from your collection. This cannot be undone.`
+        : `Delete empty binder "${name}"?`;
+      if (!window.confirm(msg)) return;
+      const nextBinders = (groups.binders || []).filter(b => b.name !== name);
+      const nextGroups = { ...groups, binders: nextBinders };
+      const nextBinInc = { ...binInc }; delete nextBinInc[name];
+      setBinInc(nextBinInc);
+      setBinderEnriched(m => { const next = { ...m }; delete next[name]; return next; });
+      if (viewingBinder === name) { setViewingBinder(null); setPhase("select"); }
+      persistGroups(nextGroups, deckInc, nextBinInc);
+    };
+
+    const deleteDeck = (name) => {
+      const deck = (groups.decks || []).find(d => d.name === name);
+      if (!deck) return;
+      const cardCount = (deck.cards || []).reduce((s, c) => s + (c.qty || 1), 0);
+      const msg = cardCount > 0
+        ? `Delete deck "${name}"? This removes ${cardCount} cards from your collection. This cannot be undone.`
+        : `Delete empty deck "${name}"?`;
+      if (!window.confirm(msg)) return;
+      const nextDecks = (groups.decks || []).filter(d => d.name !== name);
+      const nextGroups = { ...groups, decks: nextDecks };
+      const nextDeckInc = { ...deckInc }; delete nextDeckInc[name];
+      setDeckInc(nextDeckInc);
+      persistGroups(nextGroups, nextDeckInc, binInc);
+    };
+
+    // Move every row of a printing (rows sharing the same Scryfall id) from
+    // one binder into another. Variants — different conditions, finishes,
+    // misprints — travel together as a block.
+    const movePrintingBetweenBinders = (fromBinder, toBinder, printingId, cardName) => {
+      if (!fromBinder || !toBinder || fromBinder === toBinder) return;
+      const src = (groups.binders || []).find(b => b.name === fromBinder);
+      const dst = (groups.binders || []).find(b => b.name === toBinder);
+      if (!src || !dst) return;
+      const matchRow = c => printingId
+        ? (c.id || "") === printingId
+        : (c.name || "").toLowerCase() === (cardName || "").toLowerCase();
+      const movingRows = (src.cards || []).filter(matchRow);
+      if (movingRows.length === 0) return;
+      const srcCards = (src.cards || []).filter(c => !matchRow(c));
+
+      // Merge into destination, respecting the {id, condition, finish, misprint}
+      // uniqueness used by Add-card → same exact variant increments qty,
+      // anything different becomes its own row.
+      let dstCards = [...(dst.cards || [])];
+      for (const r of movingRows) {
+        const idx = dstCards.findIndex(c =>
+          (c.id || "") === (r.id || "")
+          && (c.name || "").toLowerCase() === (r.name || "").toLowerCase()
+          && (c.condition || "NM") === (r.condition || "NM")
+          && (c.finish || "normal") === (r.finish || "normal")
+          && !!c.misprint === !!r.misprint);
+        if (idx >= 0) {
+          dstCards[idx] = { ...dstCards[idx], qty: (dstCards[idx].qty || 1) + (r.qty || 1) };
+        } else {
+          dstCards.push({ ...r });
+        }
+      }
+
+      const nextBinders = (groups.binders || []).map(b => {
+        if (b.name === fromBinder) return { ...b, cards: srcCards };
+        if (b.name === toBinder)   return { ...b, cards: dstCards };
+        return b;
+      });
+      const nextGroups = { ...groups, binders: nextBinders };
+      persistGroups(nextGroups);
+
+      // Invalidate enriched caches for both binders so the grids refresh.
+      setBinderEnriched(m => { const next = { ...m }; delete next[fromBinder]; delete next[toBinder]; return next; });
+      // Clear hover/pin so we don't display a row that no longer exists here.
+      setBinderHover(null);
+      setBinderPinned(null);
+    };
+
     // Open a binder in the detail view. Enriches its cards on-demand
     // (Scryfall metadata) the first time so we can render thumbnails,
     // filters, and metrics. Subsequent opens hit the in-memory cache.
@@ -5060,11 +5223,15 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
                 <!-- Binders column (LEFT) -->
                 <div>
-                  <div style=${label}>
-                    Binders ${groups.binders.length > 0 && html`<span style=${{ color:"#b0906a", fontWeight:400 }}>· ${groups.binders.length} (included by default)</span>`}
+                  <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+                    <div style=${{ ...label, marginTop:0, marginBottom:0 }}>
+                      Binders ${groups.binders.length > 0 && html`<span style=${{ color:"#b0906a", fontWeight:400 }}>· ${groups.binders.length} (included by default)</span>`}
+                    </div>
+                    <button onClick=${createBinder}
+                      style=${{ ...btnSec, fontSize:11, padding:"4px 9px" }}>+ New binder</button>
                   </div>
                   ${groups.binders.length === 0
-                    ? html`<div style=${{ fontSize:12, color:"#a08868", fontStyle:"italic" }}>No binders found in this CSV.</div>`
+                    ? html`<div style=${{ fontSize:12, color:"#a08868", fontStyle:"italic" }}>No binders yet — create one or import a CSV.</div>`
                     : html`<div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
                         ${sortedBinders.map(b => {
                           const total = cardTotal(b.cards);
@@ -5099,6 +5266,20 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 }}>
                                   ${binInc[b.name] ? "Included" : "Excluded"}
                                 </span>
+                                <button onClick=${e => { e.stopPropagation(); renameBinder(b.name); }}
+                                  title="Rename binder"
+                                  style=${{
+                                    background:"transparent", border:"1px solid #d0b880", borderRadius:6,
+                                    padding:"3px 6px", fontSize:12, color:"#7a5a3a", cursor:"pointer",
+                                    fontFamily:"inherit", flexShrink:0,
+                                  }}>✏️</button>
+                                <button onClick=${e => { e.stopPropagation(); deleteBinder(b.name); }}
+                                  title="Delete binder"
+                                  style=${{
+                                    background:"transparent", border:"1px solid #d0b880", borderRadius:6,
+                                    padding:"3px 6px", fontSize:12, color:"#a04020", cursor:"pointer",
+                                    fontFamily:"inherit", flexShrink:0,
+                                  }}>🗑</button>
                                 <button onClick=${e => { e.stopPropagation(); setExpanded(x => ({ ...x, [expKey]: !x[expKey] })); }}
                                   style=${{
                                     background:"transparent", border:"1px solid #d0b880", borderRadius:6,
@@ -5132,11 +5313,15 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
                 <!-- Decks column (RIGHT) -->
                 <div>
-                  <div style=${label}>
-                    Decks ${groups.decks.length > 0 && html`<span style=${{ color:"#b0906a", fontWeight:400 }}>· ${groups.decks.length} (locked by default)</span>`}
+                  <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+                    <div style=${{ ...label, marginTop:0, marginBottom:0 }}>
+                      Decks ${groups.decks.length > 0 && html`<span style=${{ color:"#b0906a", fontWeight:400 }}>· ${groups.decks.length} (locked by default)</span>`}
+                    </div>
+                    <button onClick=${createDeck}
+                      style=${{ ...btnSec, fontSize:11, padding:"4px 9px" }}>+ New deck</button>
                   </div>
                   ${groups.decks.length === 0
-                    ? html`<div style=${{ fontSize:12, color:"#a08868", fontStyle:"italic" }}>No decks yet. Build one and save it to the collection, or import a Manabox CSV with deck data.</div>`
+                    ? html`<div style=${{ fontSize:12, color:"#a08868", fontStyle:"italic" }}>No decks yet. Create an empty one, build & save, or import a CSV with deck data.</div>`
                     : html`<div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
                         ${sortedDecks.map(d => {
                           const total = cardTotal(d.cards);
@@ -5202,6 +5387,20 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                     🃏 Open
                                   </button>
                                 `}
+                                <button onClick=${e => { e.stopPropagation(); renameDeck(d.name); }}
+                                  title="Rename deck"
+                                  style=${{
+                                    background:"transparent", border:"1px solid #d0b880", borderRadius:6,
+                                    padding:"3px 6px", fontSize:12, color:"#7a5a3a", cursor:"pointer",
+                                    fontFamily:"inherit", flexShrink:0,
+                                  }}>✏️</button>
+                                <button onClick=${e => { e.stopPropagation(); deleteDeck(d.name); }}
+                                  title="Delete deck"
+                                  style=${{
+                                    background:"transparent", border:"1px solid #d0b880", borderRadius:6,
+                                    padding:"3px 6px", fontSize:12, color:"#a04020", cursor:"pointer",
+                                    fontFamily:"inherit", flexShrink:0,
+                                  }}>🗑</button>
                                 <button onClick=${e => { e.stopPropagation(); setExpanded(x => ({ ...x, [expKey]: !x[expKey] })); }}
                                   style=${{
                                     background:"transparent", border:"1px solid #d0b880", borderRadius:6,
@@ -5765,6 +5964,28 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 `)}
                               </div>
                             `}
+                            ${pinned && (() => {
+                              const others = (groups.binders || []).filter(b => b.name !== viewingBinder);
+                              if (others.length === 0) return null;
+                              const printingId = card.id || card.scryfall?.id || "";
+                              return html`<div style=${{
+                                padding:"7px 10px 9px", borderTop:"1px solid #f0e0c0",
+                                background:"#fffaf0",
+                                display:"flex", alignItems:"center", gap:6,
+                              }}>
+                                <span style=${{ fontSize:11, color:"#7a5a3a", whiteSpace:"nowrap" }}>Move to:</span>
+                                <select onChange=${e => {
+                                    const target = e.target.value;
+                                    if (!target) return;
+                                    movePrintingBetweenBinders(viewingBinder, target, printingId, card.name);
+                                    e.target.value = "";
+                                  }}
+                                  style=${{ ...inp, flex:1, padding:"4px 6px", fontSize:11 }}>
+                                  <option value="">Pick a binder…</option>
+                                  ${others.map(o => html`<option key=${o.name} value=${o.name}>${o.name}</option>`)}
+                                </select>
+                              </div>`;
+                            })()}
                           </div>
                         `;
                       };
