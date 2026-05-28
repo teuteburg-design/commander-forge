@@ -1647,6 +1647,23 @@
     const [parseStats, setParseStats] = useState(null);
     const [expanded, setExpanded] = useState({}); // key: "deck::Name" or "binder::Name"
 
+    // ── Binder grid view (Phase A) ────────────────────────────────────────
+    // viewingBinder = name of binder currently open in detail view (or null).
+    // binderEnriched is a per-binder cache: { [binderName]: [card-with-scryfall, …] }.
+    // We enrich on-demand the first time a binder is opened, then keep results
+    // in memory for instant return visits.
+    const [viewingBinder,   setViewingBinder]   = useState(null);
+    const [binderEnriched,  setBinderEnriched]  = useState({});
+    const [binderLoading,   setBinderLoading]   = useState(false);
+    const [binderFilters,   setBinderFilters]   = useState({
+      colors: [],            // subset of WUBRG (empty = any)
+      colorMode: "any",      // "any" | "exact" | "only" (only = colorless)
+      types: [],             // e.g. ["Creature", "Artifact"]
+      cmcMin: 0,
+      cmcMax: 20,
+      query: "",
+    });
+
     const [usable,   setUsable]   = useState([]);
     const [enriched, setEnriched] = useState([]);
     const [cmdrs,    setCmdrs]    = useState([]);   // enriched commander objects
@@ -3731,6 +3748,27 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // `selCmd` and `deckData`, so we can reconstruct the view identically.
     // Goes to phase "deck" with fromCollection=true so the Back button returns
     // to the Collection rather than the Library.
+    // Open a binder in the detail view. Enriches its cards on-demand
+    // (Scryfall metadata) the first time so we can render thumbnails,
+    // filters, and metrics. Subsequent opens hit the in-memory cache.
+    const openBinder = async (binderName) => {
+      setViewingBinder(binderName);
+      setBinderFilters({ colors:[], colorMode:"any", types:[], cmcMin:0, cmcMax:20, query:"" });
+      setPhase("binder_view");
+      if (binderEnriched[binderName]) return; // cached
+      const binder = (groups.binders || []).find(b => b.name === binderName);
+      if (!binder) return;
+      setBinderLoading(true);
+      try {
+        const enr = await fetchAllScryfall(binder.cards, () => {}, () => {});
+        setBinderEnriched(m => ({ ...m, [binderName]: enr }));
+      } catch (e) {
+        setError(`Couldn't enrich binder cards: ${e.message || e}`);
+      } finally {
+        setBinderLoading(false);
+      }
+    };
+
     const loadCollectionDeck = d => {
       if (d.source !== "generated" || !d.deckData || !d.selCmd) return;
       // Preserve any unsaved built deck the same way loadFromLibrary does.
@@ -4712,8 +4750,12 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                   ${binInc[b.name] ? "✅" : "⬜"}
                                 </span>
                                 <div style=${{ flex:1, minWidth:0 }}>
-                                  <div style=${{ fontSize:13, fontWeight:600, color:"#2a1000",
-                                    whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>${b.name}</div>
+                                  <div onClick=${e => { e.stopPropagation(); openBinder(b.name); }}
+                                    title="Browse this binder"
+                                    style=${{ fontSize:13, fontWeight:600, color:"#7a2e0e",
+                                    whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+                                    cursor:"pointer", textDecoration:"underline", textDecorationColor:"#d8b890",
+                                    textUnderlineOffset:2 }}>${b.name}</div>
                                   <div style=${{ fontSize:11, color:"#8a6a4a" }}>Binder · ${total} cards (${b.cards.length} unique)</div>
                                 </div>
                                 <span style=${{
@@ -4863,6 +4905,270 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
             </div>
           `;
+          })()}
+
+          <!-- ── BINDER VIEW (Phase A) ─────────────────────────────────── -->
+          ${phase === "binder_view" && viewingBinder && (() => {
+            const binder = (groups.binders || []).find(b => b.name === viewingBinder);
+            if (!binder) return html`
+              <div style=${{ textAlign:"center", padding:40 }}>
+                <p>Binder not found.</p>
+                <button style=${btnSec} onClick=${() => { setViewingBinder(null); setPhase("select"); }}>← Back</button>
+              </div>`;
+            const enriched = binderEnriched[viewingBinder] || [];
+            // Display rows: prefer enriched data, fall back to raw rows while loading.
+            const rows = enriched.length ? enriched : binder.cards.map(c => ({ ...c, scryfall: null }));
+
+            // Per-card derived metadata for filtering / metrics.
+            const meta = rows.map(c => {
+              const sf = c.scryfall || {};
+              const ci = sf.color_identity || [];
+              const types = (sf.type_line || "").split("—")[0];
+              const cmc = typeof sf.cmc === "number" ? sf.cmc : null;
+              const img = sf.image_uris?.small || sf.card_faces?.[0]?.image_uris?.small || null;
+              const typeList = ["Creature","Planeswalker","Artifact","Enchantment","Instant","Sorcery","Battle","Land"]
+                .filter(t => types.includes(t));
+              return { ...c, ci, types, typeList, cmc, img };
+            });
+
+            // ── Filters ─────────────────────────────────────────────────
+            const f = binderFilters;
+            const filtered = meta.filter(c => {
+              if (f.query && !c.name.toLowerCase().includes(f.query.toLowerCase())) return false;
+              if (f.types.length > 0 && !f.types.some(t => c.typeList.includes(t))) return false;
+              if (c.cmc !== null && (c.cmc < f.cmcMin || c.cmc > f.cmcMax)) return false;
+              if (f.colors.length > 0) {
+                if (f.colorMode === "any") {
+                  if (!f.colors.some(col => c.ci.includes(col))) return false;
+                } else if (f.colorMode === "exact") {
+                  const want = new Set(f.colors), have = new Set(c.ci);
+                  if (want.size !== have.size) return false;
+                  for (const x of want) if (!have.has(x)) return false;
+                }
+              }
+              if (f.colorMode === "only" && c.ci.length !== 0) return false;
+              return true;
+            }).sort((a,b) => a.name.localeCompare(b.name));
+
+            // ── Metrics (over the FILTERED set so the panel reflects what you see) ──
+            const totalQty = filtered.reduce((s,c) => s + (c.qty||1), 0);
+            const colorCounts = { W:0, U:0, B:0, R:0, G:0, C:0, M:0 };
+            const typeCounts  = { Creature:0, Planeswalker:0, Artifact:0, Enchantment:0, Instant:0, Sorcery:0, Battle:0, Land:0 };
+            const curve = [0,0,0,0,0,0,0,0]; // 0,1,2,3,4,5,6,7+
+            filtered.forEach(c => {
+              const q = c.qty || 1;
+              if (c.ci.length === 0) colorCounts.C += q;
+              else if (c.ci.length > 1) colorCounts.M += q;
+              else colorCounts[c.ci[0]] += q;
+              c.typeList.forEach(t => { if (typeCounts[t] !== undefined) typeCounts[t] += q; });
+              if (c.cmc !== null && !c.typeList.includes("Land")) {
+                const b = Math.min(7, Math.floor(c.cmc));
+                curve[b] += q;
+              }
+            });
+            const curveMax = Math.max(1, ...curve);
+
+            const colorRow = [
+              { k:"W", label:"⚪ White", color:"#f8edcf" },
+              { k:"U", label:"🔵 Blue",  color:"#cbe0f5" },
+              { k:"B", label:"⚫ Black", color:"#cfc8c0" },
+              { k:"R", label:"🔴 Red",   color:"#f5c8b8" },
+              { k:"G", label:"🟢 Green", color:"#cfe5c8" },
+              { k:"M", label:"🌈 Multi", color:"#f0d8a0" },
+              { k:"C", label:"⬜ Color­less", color:"#e8e0d0" },
+            ];
+
+            const toggle = (arr, v) => arr.includes(v) ? arr.filter(x => x !== v) : [...arr, v];
+            const setF = patch => setBinderFilters(prev => ({ ...prev, ...patch }));
+
+            return html`
+              <div style=${{ maxWidth:1200, margin:"0 auto" }}>
+                <!-- Header -->
+                <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:12, marginBottom:14 }}>
+                  <div>
+                    <button onClick=${() => { setViewingBinder(null); setPhase("select"); }}
+                      style=${{ ...btnSec, fontSize:12, padding:"6px 12px" }}>← Back to Collection</button>
+                  </div>
+                  <div style=${{ textAlign:"right" }}>
+                    <h2 style=${{ fontSize:18, color:"#3a1a00", margin:0 }}>${binder.name}</h2>
+                    <div style=${{ fontSize:12, color:"#8a6a4a", marginTop:2 }}>
+                      ${binder.cards.reduce((s,c) => s + (c.qty||1), 0).toLocaleString()} cards · ${binder.cards.length.toLocaleString()} unique
+                      ${binderLoading && html` <span style=${{ color:"#a05010", marginLeft:8 }}>· enriching…</span>`}
+                    </div>
+                  </div>
+                </div>
+
+                <div style=${{ display:"grid", gridTemplateColumns:"260px 1fr", gap:18, alignItems:"start" }}>
+
+                  <!-- LEFT: Filters + Metrics -->
+                  <div style=${{ display:"flex", flexDirection:"column", gap:14 }}>
+
+                    <!-- Search -->
+                    <div style=${{ background:"#fff", border:"1px solid #ddd0b8", borderRadius:8, padding:10 }}>
+                      <div style=${{ ...label, marginBottom:6 }}>Search</div>
+                      <input type="text" value=${f.query} onInput=${e => setF({ query: e.target.value })}
+                        placeholder="card name…"
+                        style=${{ ...inp, width:"100%", padding:"6px 8px", fontSize:12 }} />
+                    </div>
+
+                    <!-- Colors -->
+                    <div style=${{ background:"#fff", border:"1px solid #ddd0b8", borderRadius:8, padding:10 }}>
+                      <div style=${{ ...label, marginBottom:6 }}>Colors</div>
+                      <div style=${{ display:"flex", flexWrap:"wrap", gap:4, marginBottom:8 }}>
+                        ${["W","U","B","R","G"].map(c => {
+                          const on = f.colors.includes(c);
+                          return html`<button key=${c} onClick=${() => setF({ colors: toggle(f.colors, c) })}
+                            style=${{
+                              padding:"4px 9px", fontSize:12, fontWeight:700, borderRadius:6,
+                              border:"1px solid " + (on ? "#7a2e0e" : "#d0b880"),
+                              background: on ? "#7a2e0e" : "#fff",
+                              color: on ? "#fff" : "#5a3a1a", cursor:"pointer", fontFamily:"inherit",
+                            }}>${c}</button>`;
+                        })}
+                      </div>
+                      <div style=${{ display:"flex", gap:4, fontSize:11 }}>
+                        ${[["any","Any"],["exact","Exact"],["only","Colorless only"]].map(([k,lab]) => {
+                          const on = f.colorMode === k;
+                          return html`<button key=${k} onClick=${() => setF({ colorMode: k })}
+                            style=${{
+                              flex:1, padding:"3px 6px", fontSize:11, borderRadius:5,
+                              border:"1px solid " + (on ? "#7a2e0e" : "#d0b880"),
+                              background: on ? "#fff0e0" : "#fff",
+                              color:"#5a3a1a", cursor:"pointer", fontFamily:"inherit",
+                            }}>${lab}</button>`;
+                        })}
+                      </div>
+                    </div>
+
+                    <!-- Types -->
+                    <div style=${{ background:"#fff", border:"1px solid #ddd0b8", borderRadius:8, padding:10 }}>
+                      <div style=${{ ...label, marginBottom:6 }}>Types</div>
+                      <div style=${{ display:"flex", flexWrap:"wrap", gap:4 }}>
+                        ${Object.keys(typeCounts).map(t => {
+                          const on = f.types.includes(t);
+                          return html`<button key=${t} onClick=${() => setF({ types: toggle(f.types, t) })}
+                            style=${{
+                              padding:"3px 8px", fontSize:11, borderRadius:5,
+                              border:"1px solid " + (on ? "#7a2e0e" : "#d0b880"),
+                              background: on ? "#7a2e0e" : "#fff",
+                              color: on ? "#fff" : "#5a3a1a", cursor:"pointer", fontFamily:"inherit",
+                            }}>${t}</button>`;
+                        })}
+                      </div>
+                    </div>
+
+                    <!-- CMC range -->
+                    <div style=${{ background:"#fff", border:"1px solid #ddd0b8", borderRadius:8, padding:10 }}>
+                      <div style=${{ ...label, marginBottom:6 }}>Mana cost (CMC)</div>
+                      <div style=${{ display:"flex", gap:6, alignItems:"center" }}>
+                        <input type="number" min="0" max="20" value=${f.cmcMin}
+                          onInput=${e => setF({ cmcMin: Math.max(0, +e.target.value || 0) })}
+                          style=${{ ...inp, width:60, padding:"4px 6px", fontSize:12 }} />
+                        <span style=${{ color:"#8a6a4a" }}>—</span>
+                        <input type="number" min="0" max="20" value=${f.cmcMax}
+                          onInput=${e => setF({ cmcMax: Math.max(0, +e.target.value || 0) })}
+                          style=${{ ...inp, width:60, padding:"4px 6px", fontSize:12 }} />
+                      </div>
+                    </div>
+
+                    ${(f.colors.length > 0 || f.types.length > 0 || f.query || f.cmcMin > 0 || f.cmcMax < 20 || f.colorMode !== "any") && html`
+                      <button onClick=${() => setBinderFilters({ colors:[], colorMode:"any", types:[], cmcMin:0, cmcMax:20, query:"" })}
+                        style=${{ ...btnSec, fontSize:11, padding:"6px 10px" }}>Clear filters</button>
+                    `}
+
+                    <!-- Metrics -->
+                    <div style=${{ background:"#fff8ee", border:"1px solid #e8d8b8", borderRadius:8, padding:10 }}>
+                      <div style=${{ ...label, marginBottom:6 }}>Metrics
+                        <span style=${{ fontWeight:400, color:"#8a6a4a" }}>· ${totalQty.toLocaleString()} of ${binder.cards.reduce((s,c) => s + (c.qty||1), 0).toLocaleString()}</span>
+                      </div>
+
+                      <!-- Colors -->
+                      <div style=${{ marginBottom:10 }}>
+                        <div style=${{ fontSize:10, color:"#8a6a4a", marginBottom:3, textTransform:"uppercase", letterSpacing:0.5 }}>Color</div>
+                        ${colorRow.map(({ k, label: lab, color }) => {
+                          const n = colorCounts[k];
+                          if (!n) return null;
+                          const pct = Math.round((n / Math.max(1,totalQty)) * 100);
+                          return html`<div key=${k} style=${{ display:"flex", alignItems:"center", gap:6, fontSize:11, marginBottom:2 }}>
+                            <span style=${{ width:64, flexShrink:0, color:"#3a1a00" }}>${lab}</span>
+                            <div style=${{ flex:1, height:8, background:"#f5e8d0", borderRadius:4, overflow:"hidden" }}>
+                              <div style=${{ width: pct + "%", height:"100%", background: color }}></div>
+                            </div>
+                            <span style=${{ width:38, textAlign:"right", color:"#5a3a1a", fontVariantNumeric:"tabular-nums" }}>${n}</span>
+                          </div>`;
+                        })}
+                      </div>
+
+                      <!-- Types -->
+                      <div style=${{ marginBottom:10 }}>
+                        <div style=${{ fontSize:10, color:"#8a6a4a", marginBottom:3, textTransform:"uppercase", letterSpacing:0.5 }}>Type</div>
+                        ${Object.entries(typeCounts).filter(([, n]) => n > 0).map(([t, n]) => html`
+                          <div key=${t} style=${{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:1 }}>
+                            <span style=${{ color:"#3a1a00" }}>${t}</span>
+                            <span style=${{ color:"#5a3a1a", fontVariantNumeric:"tabular-nums" }}>${n}</span>
+                          </div>
+                        `)}
+                      </div>
+
+                      <!-- Curve -->
+                      <div>
+                        <div style=${{ fontSize:10, color:"#8a6a4a", marginBottom:3, textTransform:"uppercase", letterSpacing:0.5 }}>Mana curve (non-land)</div>
+                        <div style=${{ display:"flex", alignItems:"flex-end", gap:3, height:60 }}>
+                          ${curve.map((n, i) => {
+                            const h = Math.round((n / curveMax) * 50);
+                            return html`<div key=${i} style=${{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:2 }}>
+                              <div style=${{ fontSize:9, color:"#5a3a1a" }}>${n || ""}</div>
+                              <div style=${{ width:"100%", height: h + "px", background:"#c07030", borderRadius:"2px 2px 0 0" }}></div>
+                              <div style=${{ fontSize:9, color:"#8a6a4a" }}>${i === 7 ? "7+" : i}</div>
+                            </div>`;
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- RIGHT: Card grid -->
+                  <div>
+                    <div style=${{ marginBottom:8, fontSize:12, color:"#8a6a4a" }}>
+                      Showing <strong>${filtered.length.toLocaleString()}</strong> of ${meta.length.toLocaleString()} unique cards
+                    </div>
+                    ${filtered.length === 0
+                      ? html`<div style=${{ padding:30, textAlign:"center", fontSize:13, color:"#a08868", fontStyle:"italic",
+                          background:"#fff", border:"1px dashed #d0b880", borderRadius:8 }}>
+                          No cards match these filters.
+                        </div>`
+                      : html`<div style=${{
+                          display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(140px, 1fr))",
+                          gap:10,
+                        }}>
+                          ${filtered.map(c => html`
+                            <div key=${c.name} style=${{
+                              position:"relative", borderRadius:8, overflow:"hidden",
+                              background:"#fff", border:"1px solid #ddd0b8",
+                              boxShadow:"0 1px 4px rgba(0,0,0,0.06)",
+                            }} title=${c.name}>
+                              ${c.img
+                                ? html`<img src=${c.img} loading="lazy" alt=${c.name}
+                                    style=${{ width:"100%", height:"auto", display:"block" }} />`
+                                : html`<div style=${{
+                                    width:"100%", aspectRatio:"5/7", display:"flex", alignItems:"center",
+                                    justifyContent:"center", padding:8, textAlign:"center",
+                                    fontSize:11, color:"#7a5a3a", background:"#f5e8d0",
+                                  }}>${c.name}</div>`}
+                              ${(c.qty || 1) > 1 && html`
+                                <div style=${{
+                                  position:"absolute", top:6, right:6,
+                                  background:"rgba(122,46,14,0.92)", color:"#fff",
+                                  padding:"2px 7px", borderRadius:10, fontSize:11, fontWeight:700,
+                                }}>×${c.qty}</div>
+                              `}
+                            </div>
+                          `)}
+                        </div>`}
+                  </div>
+                </div>
+              </div>
+            `;
           })()}
 
           <!-- ── LOADING (commanders / analyzing / building) ───────────── -->
