@@ -5665,19 +5665,28 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   <!-- RIGHT: Hover/Pin preview -->
                   <div style=${{ position:"sticky", top:90, alignSelf:"start" }}>
                     ${(() => {
-                      // Aggregate ownership for a card name across all rows in the binder,
-                      // grouped by (condition, finish, misprint).
-                      const ownershipFor = (cardName) => {
-                        if (!cardName) return [];
-                        const matches = (binder.cards || []).filter(c =>
-                          (c.name || "").toLowerCase() === cardName.toLowerCase());
+                      // Ownership for the exact printing — foil and non-foil
+                      // have different Scryfall IDs so they're tracked as
+                      // separate cards. Match by id when present, otherwise
+                      // fall back to name+finish for legacy rows that never
+                      // got a Scryfall id from the original CSV.
+                      const ownershipFor = (card) => {
+                        if (!card) return [];
+                        const targetId = card.id || card.scryfall?.id || "";
+                        const targetName = (card.name || "").toLowerCase();
+                        const targetFinish = card.finish || "normal";
+                        const matches = (binder.cards || []).filter(c => {
+                          if (targetId && (c.id || "") === targetId) return true;
+                          if (!targetId && (c.name || "").toLowerCase() === targetName
+                              && (c.finish || "normal") === targetFinish) return true;
+                          return false;
+                        });
                         const groups = new Map();
                         for (const m of matches) {
                           const cond = m.condition || "NM";
-                          const fin  = m.finish    || "normal";
                           const state = m.misprint ? "misprint" : "correct";
-                          const key = `${cond}|${fin}|${state}`;
-                          if (!groups.has(key)) groups.set(key, { condition: cond, finish: fin, state, qty: 0 });
+                          const key = `${cond}|${state}`;
+                          if (!groups.has(key)) groups.set(key, { condition: cond, state, qty: 0 });
                           groups.get(key).qty += (m.qty || 1);
                         }
                         const condRank = code => {
@@ -5686,7 +5695,6 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         };
                         return [...groups.values()].sort((a, b) =>
                           condRank(a.condition) - condRank(b.condition)
-                          || (a.finish === "foil" ? 1 : 0) - (b.finish === "foil" ? 1 : 0)
                           || (a.state === "misprint" ? 1 : 0) - (b.state === "misprint" ? 1 : 0));
                       };
 
@@ -5694,7 +5702,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         if (!card) return null;
                         const sf = card.scryfall || {};
                         const big = sf.image_uris?.normal || sf.card_faces?.[0]?.image_uris?.normal || card.img;
-                        const breakdown = ownershipFor(card.name);
+                        const breakdown = ownershipFor(card);
                         const totalOwned = breakdown.reduce((s, x) => s + x.qty, 0);
                         return html`
                           <div style=${{
@@ -5728,19 +5736,20 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                   <span>You own</span>
                                   <span style=${{ color:"#7a5a3a" }}>× ${totalOwned}</span>
                                 </div>
-                                ${breakdown.map((b, i) => html`
-                                  <div key=${i} style=${{
-                                    display:"flex", alignItems:"center", gap:6,
+                                ${breakdown.map((b, i) => {
+                                  const cdMeta = CONDITION_BY_CODE[b.condition] || {};
+                                  return html`<div key=${i} style=${{
+                                    display:"flex", alignItems:"center", gap:8,
                                     fontSize:11, color:"#3a1a00",
                                     padding:"2px 0",
                                   }}>
-                                    <${ConditionDot} code=${b.condition} size=${9} />
-                                    <span style=${{ minWidth:22, fontWeight:600 }}>${b.condition}</span>
-                                    <span style=${{ color:"#7a5a3a", minWidth:48 }}>${b.finish === "foil" ? "✨ Foil" : "Normal"}</span>
+                                    <${ConditionDot} code=${b.condition} size=${10} />
+                                    <span style=${{ minWidth:22, fontWeight:700 }}>${b.condition}</span>
+                                    <span style=${{ color:"#7a5a3a" }}>${cdMeta.label || ""}</span>
                                     ${b.state === "misprint" && html`<span title="Misprint">⚠️</span>`}
                                     <span style=${{ marginLeft:"auto", fontWeight:700, color:"#5a1a00" }}>×${b.qty}</span>
-                                  </div>
-                                `)}
+                                  </div>`;
+                                })}
                               </div>
                             `}
                           </div>
