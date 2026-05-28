@@ -1673,9 +1673,15 @@
     const [binderCollapsed, setBinderCollapsed] = useState({});
 
     // "Add card" modal state (Phase B).
-    //   step "search"   → typing name, autocomplete suggestions
-    //   step "printings" → name picked, choose which printing
+    // Two input modes:
+    //   "name" → Scryfall autocomplete → printings picker → single add
+    //   "set"  → set code + collector # + condition/finish/state →
+    //            staging list → bulk add to chosen binder
     const [addCardOpen, setAddCardOpen] = useState(false);
+    const [addMode, setAddMode] = useState("name");      // "name" | "set"
+    const [addTargetBinder, setAddTargetBinder] = useState("");
+
+    // Name-search state
     const [addQuery, setAddQuery] = useState("");
     const [addSuggestions, setAddSuggestions] = useState([]);
     const [addSugBusy, setAddSugBusy] = useState(false);
@@ -1685,11 +1691,32 @@
     const [addSelectedName, setAddSelectedName] = useState("");
     const [addSelectedPrinting, setAddSelectedPrinting] = useState(null);
     const [addQty, setAddQty] = useState(1);
+
+    // Set+number state
+    const [addSetCode, setAddSetCode] = useState("");
+    const [addCollNum, setAddCollNum] = useState("");
+    const [addCondition, setAddCondition] = useState("NM");  // NM | LP | MP | HP | DMG
+    const [addFinish, setAddFinish] = useState("normal");    // normal | foil
+    const [addPiece, setAddPiece] = useState("correct");     // correct | misprint
+    const [addSetBusy, setAddSetBusy] = useState(false);
+    const [addStaging, setAddStaging] = useState([]);        // [{ printing, qty, condition, finish, misprint }]
+
     const [addError, setAddError] = useState("");
     const addQueryTimerRef = useRef(null);
+    const addCollNumRef = useRef(null);
+
+    const openAddCard = (presetBinder) => {
+      const target = presetBinder
+        || viewingBinder
+        || ((groups.binders || [])[0]?.name)
+        || "";
+      setAddTargetBinder(target);
+      setAddCardOpen(true);
+    };
 
     const closeAddCard = () => {
       setAddCardOpen(false);
+      setAddMode("name");
       setAddQuery("");
       setAddSuggestions([]);
       setAddStep("search");
@@ -1697,6 +1724,12 @@
       setAddSelectedName("");
       setAddSelectedPrinting(null);
       setAddQty(1);
+      setAddSetCode("");
+      setAddCollNum("");
+      setAddCondition("NM");
+      setAddFinish("normal");
+      setAddPiece("correct");
+      setAddStaging([]);
       setAddError("");
     };
 
@@ -1745,23 +1778,82 @@
       }
     };
 
-    // Add the picked printing × qty to the currently-open binder.
-    const addCardToBinder = () => {
-      if (!viewingBinder || !addSelectedPrinting || addQty < 1) return;
-      const printing = addSelectedPrinting;
-      const qty = addQty;
-      const binder = (groups.binders || []).find(b => b.name === viewingBinder);
-      if (!binder) return;
-      // Merge by name (matches the Manabox CSV-parse behaviour). The most-recent
-      // printing wins for the stored `id`.
-      const existing = binder.cards.find(c => c.name.toLowerCase() === printing.name.toLowerCase());
-      const nextCards = existing
-        ? binder.cards.map(c => c === existing
-            ? { ...c, qty: (c.qty || 1) + qty, id: printing.id }
-            : c)
-        : [...binder.cards, { name: printing.name, qty, id: printing.id }];
+    // Lookup a printing by set code + collector number (Scryfall) and stage it.
+    // Keeps the set code in place so the user can chain entries within the
+    // same set; the collector # input is refocused for the next card.
+    const lookupAndStage = async () => {
+      const setCode = addSetCode.trim().toLowerCase();
+      const cn      = addCollNum.trim();
+      if (!setCode || !cn) { setAddError("Set code and collector number required."); return; }
+      setAddError("");
+      setAddSetBusy(true);
+      try {
+        const r = await fetch(`https://api.scryfall.com/cards/${encodeURIComponent(setCode)}/${encodeURIComponent(cn)}`);
+        if (r.status === 404) throw new Error(`No ${setCode.toUpperCase()} #${cn}.`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const printing = await r.json();
+        setAddStaging(s => [...s, {
+          printing, qty: 1,
+          condition: addCondition,
+          finish:    addFinish,
+          misprint:  addPiece === "misprint",
+        }]);
+        setAddCollNum("");
+        // Refocus collector # so user can keep typing.
+        setTimeout(() => { addCollNumRef.current?.focus(); }, 0);
+      } catch (e) {
+        setAddError(e?.message || "Lookup failed.");
+      } finally {
+        setAddSetBusy(false);
+      }
+    };
+
+    // Card-equality used to merge duplicates when committing. Differs on any
+    // of {name, printing id, condition, finish, misprint} = new row.
+    const sameCardRow = (a, printing, condition, finish, misprint) =>
+      a.name.toLowerCase() === printing.name.toLowerCase()
+      && (a.id || "") === (printing.id || "")
+      && (a.condition || "NM") === condition
+      && (a.finish || "normal") === finish
+      && !!a.misprint === !!misprint;
+
+    // Write a list of {printing, qty, condition, finish, misprint} entries
+    // into a binder. Used by both the "By name" and "By set" flows.
+    const writeEntriesToBinder = (binderName, entries) => {
+      if (!binderName || !entries.length) return false;
+      const binder = (groups.binders || []).find(b => b.name === binderName);
+      if (!binder) { setAddError(`Binder "${binderName}" not found.`); return false; }
+
+      let nextCards = [...binder.cards];
+      const cache = getSFCache();
+      const ts = Date.now();
+
+      for (const e of entries) {
+        const { printing, qty, condition, finish, misprint } = e;
+        const idx = nextCards.findIndex(c => sameCardRow(c, printing, condition, finish, misprint));
+        const row = {
+          name: printing.name,
+          qty,
+          id: printing.id,
+          condition,
+          finish,
+          ...(misprint ? { misprint: true } : {}),
+        };
+        if (idx >= 0) {
+          nextCards[idx] = { ...nextCards[idx], qty: (nextCards[idx].qty || 1) + qty };
+        } else {
+          nextCards.push(row);
+        }
+        try {
+          const slim = slimSF(printing);
+          cache[(printing.id   || "").toLowerCase()] = { d: slim, ts };
+          cache[(printing.name || "").toLowerCase()] = { d: slim, ts };
+        } catch {}
+      }
+      try { setSFCache(cache); } catch {}
+
       const nextBinders = groups.binders.map(b =>
-        b.name === viewingBinder ? { ...b, cards: nextCards } : b);
+        b.name === binderName ? { ...b, cards: nextCards } : b);
       const nextGroups = { decks: groups.decks, binders: nextBinders };
       setGroups(nextGroups);
       try {
@@ -1770,30 +1862,52 @@
         }));
       } catch {}
 
-      // Slot the printing into the Scryfall slim cache so the grid renders
-      // it without a round-trip.
-      try {
-        const cache = getSFCache();
-        const slim = slimSF(printing);
-        const ts = Date.now();
-        cache[(printing.id || "").toLowerCase()]     = { d: slim, ts };
-        cache[(printing.name || "").toLowerCase()]   = { d: slim, ts };
-        setSFCache(cache);
-      } catch {}
-
-      // Push into the in-memory enriched list for instant grid refresh.
+      // Update in-memory enriched cache for the target binder.
       setBinderEnriched(m => {
-        const list = m[viewingBinder] || [];
-        const enrExisting = list.find(c => c.name.toLowerCase() === printing.name.toLowerCase());
-        const next = enrExisting
-          ? list.map(c => c === enrExisting
-              ? { ...c, qty: (c.qty || 1) + qty, id: printing.id, scryfall: printing }
-              : c)
-          : [...list, { name: printing.name, qty, id: printing.id, scryfall: printing }];
-        return { ...m, [viewingBinder]: next };
+        const list = m[binderName] || [];
+        let next = [...list];
+        for (const e of entries) {
+          const { printing, qty, condition, finish, misprint } = e;
+          const idx = next.findIndex(c => sameCardRow(c, printing, condition, finish, misprint));
+          if (idx >= 0) {
+            next[idx] = { ...next[idx], qty: (next[idx].qty || 1) + qty };
+          } else {
+            next.push({
+              name: printing.name, qty, id: printing.id,
+              condition, finish,
+              ...(misprint ? { misprint: true } : {}),
+              scryfall: printing,
+            });
+          }
+        }
+        return { ...m, [binderName]: next };
       });
 
-      closeAddCard();
+      // Auto-include the target binder so freshly added cards count toward the
+      // analysis pool right away.
+      setBinInc(bi => bi[binderName] ? bi : { ...bi, [binderName]: true });
+
+      return true;
+    };
+
+    // "By name" single add — uses the staging API with one entry.
+    const addCardToBinder = () => {
+      if (!addTargetBinder || !addSelectedPrinting || addQty < 1) return;
+      const ok = writeEntriesToBinder(addTargetBinder, [{
+        printing: addSelectedPrinting,
+        qty: addQty,
+        condition: "NM",
+        finish: "normal",
+        misprint: false,
+      }]);
+      if (ok) closeAddCard();
+    };
+
+    // "By set" commit — flushes the staging list to the chosen binder.
+    const commitStagingToBinder = () => {
+      if (!addTargetBinder || addStaging.length === 0) return;
+      const ok = writeEntriesToBinder(addTargetBinder, addStaging);
+      if (ok) closeAddCard();
     };
 
     const [usable,   setUsable]   = useState([]);
@@ -4810,6 +4924,12 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     style=${{ ...btnSec, fontSize:12, padding:"7px 14px", whiteSpace:"nowrap" }}>
                     ⬆ Update Collection
                   </button>
+                  ${(groups.binders || []).length > 0 && html`
+                    <button onClick=${() => openAddCard(null)}
+                      style=${{ ...btnSec, fontSize:12, padding:"7px 14px", whiteSpace:"nowrap" }}>
+                      + Add card
+                    </button>
+                  `}
                   <button onClick=${confirmSelection}
                     style=${{ ...btn, fontSize:12, padding:"7px 16px", whiteSpace:"nowrap" }}>
                     Confirm Selection →
@@ -5147,7 +5267,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         ${binderLoading && html` <span style=${{ color:"#a05010", marginLeft:8 }}>· enriching…</span>`}
                       </div>
                     </div>
-                    <button onClick=${() => setAddCardOpen(true)}
+                    <button onClick=${() => openAddCard(viewingBinder)}
                       style=${{ ...btn, fontSize:12, padding:"7px 14px", whiteSpace:"nowrap" }}>
                       + Add card
                     </button>
@@ -5441,157 +5561,6 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   </div>
                 </div>
 
-                <!-- ── Add card modal (Phase B) ─────────────────────────── -->
-                ${addCardOpen && html`
-                  <div onClick=${closeAddCard}
-                    style=${{
-                      position:"fixed", inset:0, background:"rgba(20,10,0,0.45)",
-                      display:"flex", alignItems:"flex-start", justifyContent:"center",
-                      paddingTop:60, zIndex:9999,
-                    }}>
-                    <div onClick=${e => e.stopPropagation()}
-                      style=${{
-                        background:"#fffaf0", border:"1px solid #d8b890", borderRadius:12,
-                        width:"min(720px, 92vw)", maxHeight:"82vh", overflow:"hidden",
-                        boxShadow:"0 8px 32px rgba(0,0,0,0.35)",
-                        display:"flex", flexDirection:"column",
-                      }}>
-                      <!-- header -->
-                      <div style=${{
-                        padding:"12px 16px", borderBottom:"1px solid #e8d8b8",
-                        display:"flex", justifyContent:"space-between", alignItems:"center", gap:10,
-                      }}>
-                        <div>
-                          <div style=${{ fontSize:14, fontWeight:700, color:"#3a1a00" }}>
-                            ${addStep === "search" ? "Add card to" : "Pick a printing"}
-                          </div>
-                          <div style=${{ fontSize:11, color:"#8a6a4a", marginTop:2 }}>
-                            Binder: <strong>${viewingBinder}</strong>
-                            ${addStep === "printings" && html` · ${addSelectedName}`}
-                          </div>
-                        </div>
-                        <button onClick=${closeAddCard}
-                          style=${{
-                            background:"transparent", border:"none", fontSize:20,
-                            cursor:"pointer", color:"#7a5a3a", padding:"0 4px", lineHeight:1,
-                          }}>✕</button>
-                      </div>
-
-                      <!-- body -->
-                      <div style=${{ padding:16, overflowY:"auto", flex:1 }}>
-                        ${addStep === "search" && html`
-                          <input type="text" autoFocus=${true}
-                            value=${addQuery}
-                            onInput=${e => { setAddQuery(e.target.value); runAutocomplete(e.target.value); }}
-                            placeholder="Start typing a card name…"
-                            style=${{ ...inp, width:"100%", padding:"9px 12px", fontSize:14 }} />
-                          <div style=${{ marginTop:10, fontSize:11, color:"#8a6a4a", minHeight:14 }}>
-                            ${addSugBusy ? "Searching…"
-                              : addQuery.trim().length < 2 ? "Type at least 2 characters."
-                              : addSuggestions.length === 0 ? "No matches."
-                              : `${addSuggestions.length} suggestion${addSuggestions.length === 1 ? "" : "s"}`}
-                          </div>
-                          ${addSuggestions.length > 0 && html`
-                            <div style=${{
-                              marginTop:8, border:"1px solid #e8d8b8", borderRadius:8,
-                              background:"#fff", maxHeight:360, overflowY:"auto",
-                            }}>
-                              ${addSuggestions.map(name => html`
-                                <div key=${name} onClick=${() => loadPrintings(name)}
-                                  style=${{
-                                    padding:"8px 12px", fontSize:13, color:"#3a1a00",
-                                    borderBottom:"1px solid #f0e0c0", cursor:"pointer",
-                                  }}
-                                  onMouseEnter=${e => e.currentTarget.style.background = "#fff0e0"}
-                                  onMouseLeave=${e => e.currentTarget.style.background = "#fff"}>
-                                  ${name}
-                                </div>
-                              `)}
-                            </div>
-                          `}
-                        `}
-
-                        ${addStep === "printings" && html`
-                          <button onClick=${() => { setAddStep("search"); setAddPrintings([]); setAddSelectedPrinting(null); }}
-                            style=${{ ...btnSec, fontSize:11, padding:"5px 10px", marginBottom:10 }}>
-                            ← Choose a different card
-                          </button>
-                          ${addError && html`<div style=${{
-                            padding:"8px 12px", background:"#fde8e0", border:"1px solid #e8b0a0",
-                            borderRadius:6, color:"#a02010", fontSize:12, marginBottom:10,
-                          }}>${addError}</div>`}
-                          ${addPrintingsBusy
-                            ? html`<div style=${{ padding:20, textAlign:"center", color:"#7a5a3a" }}>Loading printings…</div>`
-                            : addPrintings.length === 0
-                              ? html`<div style=${{ padding:20, textAlign:"center", color:"#8a6a4a" }}>No printings found.</div>`
-                              : html`
-                                <div style=${{
-                                  display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(120px, 1fr))",
-                                  gap:10, marginBottom:14,
-                                }}>
-                                  ${addPrintings.map(p => {
-                                    const img = p.image_uris?.small || p.card_faces?.[0]?.image_uris?.small;
-                                    const sel = addSelectedPrinting?.id === p.id;
-                                    return html`
-                                      <div key=${p.id} onClick=${() => setAddSelectedPrinting(p)}
-                                        title=${`${p.set_name} (${(p.set || "").toUpperCase()}) #${p.collector_number}`}
-                                        style=${{
-                                          position:"relative", borderRadius:8, overflow:"hidden",
-                                          background:"#fff", cursor:"pointer",
-                                          border: sel ? "2px solid #7a2e0e" : "1px solid #ddd0b8",
-                                          boxShadow: sel ? "0 2px 8px rgba(122,46,14,0.35)" : "0 1px 3px rgba(0,0,0,0.06)",
-                                        }}>
-                                        ${img
-                                          ? html`<img src=${img} loading="lazy" alt=${p.set_name}
-                                              style=${{ width:"100%", height:"auto", display:"block" }} />`
-                                          : html`<div style=${{ padding:16, fontSize:11, textAlign:"center" }}>${p.name}</div>`}
-                                        <div style=${{
-                                          padding:"5px 7px", fontSize:10, color:"#3a1a00",
-                                          background:"#fff8ee", borderTop:"1px solid #e8d8b8",
-                                        }}>
-                                          <div style=${{
-                                            fontWeight:700, textTransform:"uppercase", letterSpacing:0.5,
-                                            whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
-                                          }}>${(p.set || "").toUpperCase()} · #${p.collector_number}</div>
-                                          <div style=${{ color:"#8a6a4a", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
-                                            ${p.set_name}
-                                          </div>
-                                          ${p.prices?.usd && html`<div style=${{ color:"#5a3a1a", marginTop:1 }}>$${p.prices.usd}</div>`}
-                                        </div>
-                                      </div>
-                                    `;
-                                  })}
-                                </div>
-                              `}
-                        `}
-                      </div>
-
-                      <!-- footer -->
-                      ${addStep === "printings" && addSelectedPrinting && html`
-                        <div style=${{
-                          padding:"10px 16px", borderTop:"1px solid #e8d8b8",
-                          background:"#fff8ee",
-                          display:"flex", justifyContent:"space-between", alignItems:"center", gap:10,
-                        }}>
-                          <div style=${{ fontSize:12, color:"#5a3a1a" }}>
-                            <strong>${addSelectedPrinting.name}</strong> ·
-                            ${(addSelectedPrinting.set || "").toUpperCase()} #${addSelectedPrinting.collector_number}
-                          </div>
-                          <div style=${{ display:"flex", alignItems:"center", gap:8 }}>
-                            <label style=${{ fontSize:11, color:"#7a5a3a" }}>Qty</label>
-                            <input type="number" min="1" max="99" value=${addQty}
-                              onInput=${e => setAddQty(Math.max(1, Math.min(99, parseInt(e.target.value) || 1)))}
-                              style=${{ ...inp, width:60, padding:"5px 8px", fontSize:13 }} />
-                            <button onClick=${addCardToBinder}
-                              style=${{ ...btn, fontSize:12, padding:"7px 14px" }}>
-                              Add to binder
-                            </button>
-                          </div>
-                        </div>
-                      `}
-                    </div>
-                  </div>
-                `}
               </div>
             `;
           })()}
@@ -7078,6 +7047,302 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             display:"flex", alignItems:"center", justifyContent:"center",
             animation:"fadeIn .2s ease", fontFamily:"inherit", lineHeight:1,
           }}>↑</button>
+      `}
+
+      <!-- ── Add card modal (global — works from Collection or Binder view) ── -->
+      ${addCardOpen && html`
+        <div onClick=${closeAddCard}
+          style=${{
+            position:"fixed", inset:0, background:"rgba(20,10,0,0.45)",
+            display:"flex", alignItems:"flex-start", justifyContent:"center",
+            paddingTop:60, zIndex:9999,
+          }}>
+          <div onClick=${e => e.stopPropagation()}
+            style=${{
+              background:"#fffaf0", border:"1px solid #d8b890", borderRadius:12,
+              width:"min(780px, 94vw)", maxHeight:"86vh", overflow:"hidden",
+              boxShadow:"0 8px 32px rgba(0,0,0,0.35)",
+              display:"flex", flexDirection:"column",
+            }}>
+            <!-- header -->
+            <div style=${{
+              padding:"12px 16px", borderBottom:"1px solid #e8d8b8",
+              display:"flex", justifyContent:"space-between", alignItems:"center", gap:10,
+            }}>
+              <div>
+                <div style=${{ fontSize:14, fontWeight:700, color:"#3a1a00" }}>Add cards</div>
+                <div style=${{ fontSize:11, color:"#8a6a4a", marginTop:2,
+                  display:"flex", alignItems:"center", gap:6 }}>
+                  <span>Target binder:</span>
+                  <select value=${addTargetBinder}
+                    onChange=${e => setAddTargetBinder(e.target.value)}
+                    style=${{ ...inp, padding:"3px 6px", fontSize:11 }}>
+                    ${(groups.binders || []).length === 0 && html`<option value="">(no binders)</option>`}
+                    ${(groups.binders || []).map(b => html`<option key=${b.name} value=${b.name}>${b.name}</option>`)}
+                  </select>
+                </div>
+              </div>
+              <button onClick=${closeAddCard}
+                style=${{
+                  background:"transparent", border:"none", fontSize:20,
+                  cursor:"pointer", color:"#7a5a3a", padding:"0 4px", lineHeight:1,
+                }}>✕</button>
+            </div>
+
+            <!-- mode tabs -->
+            <div style=${{
+              display:"flex", borderBottom:"1px solid #e8d8b8", background:"#fff8ee",
+            }}>
+              ${[["name","By name"],["set","By set + number"]].map(([k,lab]) => {
+                const on = addMode === k;
+                return html`<button key=${k} onClick=${() => setAddMode(k)}
+                  style=${{
+                    flex:1, padding:"9px 12px", fontSize:12, fontWeight:600,
+                    border:"none", borderBottom: on ? "2px solid #7a2e0e" : "2px solid transparent",
+                    background: on ? "#fff" : "transparent",
+                    color: on ? "#7a2e0e" : "#7a5a3a", cursor:"pointer", fontFamily:"inherit",
+                  }}>${lab}</button>`;
+              })}
+            </div>
+
+            <!-- body -->
+            <div style=${{ padding:16, overflowY:"auto", flex:1 }}>
+              ${addError && html`<div style=${{
+                padding:"8px 12px", background:"#fde8e0", border:"1px solid #e8b0a0",
+                borderRadius:6, color:"#a02010", fontSize:12, marginBottom:10,
+              }}>${addError}</div>`}
+
+              ${addMode === "name" && addStep === "search" && html`
+                <input type="text" autoFocus=${true}
+                  value=${addQuery}
+                  onInput=${e => { setAddQuery(e.target.value); runAutocomplete(e.target.value); }}
+                  placeholder="Start typing a card name…"
+                  style=${{ ...inp, width:"100%", padding:"9px 12px", fontSize:14 }} />
+                <div style=${{ marginTop:10, fontSize:11, color:"#8a6a4a", minHeight:14 }}>
+                  ${addSugBusy ? "Searching…"
+                    : addQuery.trim().length < 2 ? "Type at least 2 characters."
+                    : addSuggestions.length === 0 ? "No matches."
+                    : `${addSuggestions.length} suggestion${addSuggestions.length === 1 ? "" : "s"}`}
+                </div>
+                ${addSuggestions.length > 0 && html`
+                  <div style=${{
+                    marginTop:8, border:"1px solid #e8d8b8", borderRadius:8,
+                    background:"#fff", maxHeight:360, overflowY:"auto",
+                  }}>
+                    ${addSuggestions.map(name => html`
+                      <div key=${name} onClick=${() => loadPrintings(name)}
+                        style=${{
+                          padding:"8px 12px", fontSize:13, color:"#3a1a00",
+                          borderBottom:"1px solid #f0e0c0", cursor:"pointer",
+                        }}
+                        onMouseEnter=${e => e.currentTarget.style.background = "#fff0e0"}
+                        onMouseLeave=${e => e.currentTarget.style.background = "#fff"}>
+                        ${name}
+                      </div>
+                    `)}
+                  </div>
+                `}
+              `}
+
+              ${addMode === "name" && addStep === "printings" && html`
+                <button onClick=${() => { setAddStep("search"); setAddPrintings([]); setAddSelectedPrinting(null); }}
+                  style=${{ ...btnSec, fontSize:11, padding:"5px 10px", marginBottom:10 }}>
+                  ← Choose a different card
+                </button>
+                <div style=${{ fontSize:12, color:"#7a5a3a", marginBottom:10 }}>${addSelectedName}</div>
+                ${addPrintingsBusy
+                  ? html`<div style=${{ padding:20, textAlign:"center", color:"#7a5a3a" }}>Loading printings…</div>`
+                  : addPrintings.length === 0
+                    ? html`<div style=${{ padding:20, textAlign:"center", color:"#8a6a4a" }}>No printings found.</div>`
+                    : html`
+                      <div style=${{
+                        display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(120px, 1fr))",
+                        gap:10, marginBottom:14,
+                      }}>
+                        ${addPrintings.map(p => {
+                          const img = p.image_uris?.small || p.card_faces?.[0]?.image_uris?.small;
+                          const sel = addSelectedPrinting?.id === p.id;
+                          return html`
+                            <div key=${p.id} onClick=${() => setAddSelectedPrinting(p)}
+                              title=${`${p.set_name} (${(p.set || "").toUpperCase()}) #${p.collector_number}`}
+                              style=${{
+                                position:"relative", borderRadius:8, overflow:"hidden",
+                                background:"#fff", cursor:"pointer",
+                                border: sel ? "2px solid #7a2e0e" : "1px solid #ddd0b8",
+                                boxShadow: sel ? "0 2px 8px rgba(122,46,14,0.35)" : "0 1px 3px rgba(0,0,0,0.06)",
+                              }}>
+                              ${img
+                                ? html`<img src=${img} loading="lazy" alt=${p.set_name}
+                                    style=${{ width:"100%", height:"auto", display:"block" }} />`
+                                : html`<div style=${{ padding:16, fontSize:11, textAlign:"center" }}>${p.name}</div>`}
+                              <div style=${{
+                                padding:"5px 7px", fontSize:10, color:"#3a1a00",
+                                background:"#fff8ee", borderTop:"1px solid #e8d8b8",
+                              }}>
+                                <div style=${{
+                                  fontWeight:700, textTransform:"uppercase", letterSpacing:0.5,
+                                  whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+                                }}>${(p.set || "").toUpperCase()} · #${p.collector_number}</div>
+                                <div style=${{ color:"#8a6a4a", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                                  ${p.set_name}
+                                </div>
+                                ${p.prices?.usd && html`<div style=${{ color:"#5a3a1a", marginTop:1 }}>$${p.prices.usd}</div>`}
+                              </div>
+                            </div>
+                          `;
+                        })}
+                      </div>
+                    `}
+              `}
+
+              ${addMode === "set" && html`
+                <div style=${{ fontSize:11, color:"#8a6a4a", marginBottom:10, lineHeight:1.5 }}>
+                  Enter set code (e.g. <strong>CLB</strong>), collector number, condition and finish.
+                  Press <strong>Enter</strong> or click <strong>Look up</strong> to add the card to the list below.
+                  The set code stays — keep typing collector numbers for fast bulk entry.
+                </div>
+
+                <div style=${{ display:"grid", gridTemplateColumns:"110px 130px 1fr", gap:8, alignItems:"end", marginBottom:10 }}>
+                  <div>
+                    <div style=${{ ...label, marginBottom:4 }}>Set</div>
+                    <input type="text" value=${addSetCode}
+                      onInput=${e => setAddSetCode(e.target.value.toUpperCase().slice(0, 6))}
+                      placeholder="CLB"
+                      style=${{ ...inp, width:"100%", padding:"7px 9px", fontSize:13, textTransform:"uppercase" }} />
+                  </div>
+                  <div>
+                    <div style=${{ ...label, marginBottom:4 }}>Collector #</div>
+                    <input type="text" ref=${addCollNumRef} value=${addCollNum}
+                      onInput=${e => setAddCollNum(e.target.value.trim())}
+                      onKeyDown=${e => { if (e.key === "Enter" && !addSetBusy) lookupAndStage(); }}
+                      placeholder="123"
+                      style=${{ ...inp, width:"100%", padding:"7px 9px", fontSize:13 }} />
+                  </div>
+                  <button onClick=${lookupAndStage}
+                    disabled=${addSetBusy || !addSetCode.trim() || !addCollNum.trim()}
+                    style=${{
+                      ...btn, fontSize:12, padding:"8px 14px",
+                      opacity: (addSetBusy || !addSetCode.trim() || !addCollNum.trim()) ? 0.5 : 1,
+                    }}>${addSetBusy ? "Looking up…" : "Look up & add to list"}</button>
+                </div>
+
+                <div style=${{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10, marginBottom:14 }}>
+                  <div>
+                    <div style=${{ ...label, marginBottom:4 }}>Condition</div>
+                    <select value=${addCondition} onChange=${e => setAddCondition(e.target.value)}
+                      style=${{ ...inp, width:"100%", padding:"6px 8px", fontSize:12 }}>
+                      ${[["NM","NM (Near Mint)"],["LP","LP (Lightly Played)"],["MP","MP (Moderately Played)"],["HP","HP (Heavily Played)"],["DMG","DMG (Damaged)"]].map(([v,lab]) =>
+                        html`<option key=${v} value=${v}>${lab}</option>`)}
+                    </select>
+                  </div>
+                  <div>
+                    <div style=${{ ...label, marginBottom:4 }}>Finish</div>
+                    <select value=${addFinish} onChange=${e => setAddFinish(e.target.value)}
+                      style=${{ ...inp, width:"100%", padding:"6px 8px", fontSize:12 }}>
+                      <option value="normal">Normal</option>
+                      <option value="foil">Foil</option>
+                    </select>
+                  </div>
+                  <div>
+                    <div style=${{ ...label, marginBottom:4 }}>State</div>
+                    <select value=${addPiece} onChange=${e => setAddPiece(e.target.value)}
+                      style=${{ ...inp, width:"100%", padding:"6px 8px", fontSize:12 }}>
+                      <option value="correct">Correct</option>
+                      <option value="misprint">Misprint</option>
+                    </select>
+                  </div>
+                </div>
+
+                <!-- staging list -->
+                <div style=${{
+                  borderTop:"1px solid #e8d8b8", paddingTop:10, marginTop:6,
+                }}>
+                  <div style=${{ ...label, marginBottom:6 }}>
+                    To add ${addStaging.length > 0 && html`<span style=${{ color:"#7a5a3a", fontWeight:400 }}>· ${addStaging.length} card${addStaging.length === 1 ? "" : "s"}</span>`}
+                  </div>
+                  ${addStaging.length === 0
+                    ? html`<div style=${{ padding:14, textAlign:"center", fontSize:12,
+                        color:"#a08868", fontStyle:"italic",
+                        background:"#fffdf8", border:"1px dashed #d8c090", borderRadius:8,
+                      }}>Nothing staged yet. Look up a card to add it here.</div>`
+                    : html`<div style=${{
+                        border:"1px solid #e8d8b8", borderRadius:8,
+                        background:"#fff", maxHeight:240, overflowY:"auto",
+                      }}>
+                        ${addStaging.map((s, i) => {
+                          const p = s.printing;
+                          const img = p.image_uris?.small || p.card_faces?.[0]?.image_uris?.small;
+                          return html`<div key=${i} style=${{
+                            display:"flex", gap:10, padding:"6px 10px", alignItems:"center",
+                            borderBottom: i < addStaging.length - 1 ? "1px solid #f0e0c0" : "none",
+                          }}>
+                            ${img && html`<img src=${img} alt=${p.name}
+                              style=${{ width:34, height:48, objectFit:"cover", borderRadius:3, flexShrink:0 }} />`}
+                            <div style=${{ flex:1, minWidth:0 }}>
+                              <div style=${{ fontSize:12, color:"#3a1a00", fontWeight:600,
+                                whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                                ${p.name}
+                              </div>
+                              <div style=${{ fontSize:10, color:"#8a6a4a" }}>
+                                ${(p.set || "").toUpperCase()} #${p.collector_number} · ${s.condition} · ${s.finish}${s.misprint ? " · misprint" : ""}
+                              </div>
+                            </div>
+                            <input type="number" min="1" max="99" value=${s.qty}
+                              onInput=${e => {
+                                const q = Math.max(1, Math.min(99, parseInt(e.target.value) || 1));
+                                setAddStaging(arr => arr.map((x, idx) => idx === i ? { ...x, qty: q } : x));
+                              }}
+                              style=${{ ...inp, width:54, padding:"3px 6px", fontSize:12 }} />
+                            <button onClick=${() => setAddStaging(arr => arr.filter((_, idx) => idx !== i))}
+                              title="Remove"
+                              style=${{
+                                background:"transparent", border:"none", color:"#a05030",
+                                cursor:"pointer", fontSize:16, padding:"0 4px", lineHeight:1,
+                              }}>✕</button>
+                          </div>`;
+                        })}
+                      </div>`}
+                </div>
+              `}
+            </div>
+
+            <!-- footer -->
+            <div style=${{
+              padding:"10px 16px", borderTop:"1px solid #e8d8b8",
+              background:"#fff8ee",
+              display:"flex", justifyContent:"flex-end", alignItems:"center", gap:10,
+            }}>
+              ${addMode === "name" && addStep === "printings" && addSelectedPrinting && html`
+                <div style=${{ fontSize:12, color:"#5a3a1a", marginRight:"auto",
+                  overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                  <strong>${addSelectedPrinting.name}</strong> ·
+                  ${(addSelectedPrinting.set || "").toUpperCase()} #${addSelectedPrinting.collector_number}
+                </div>
+                <label style=${{ fontSize:11, color:"#7a5a3a" }}>Qty</label>
+                <input type="number" min="1" max="99" value=${addQty}
+                  onInput=${e => setAddQty(Math.max(1, Math.min(99, parseInt(e.target.value) || 1)))}
+                  style=${{ ...inp, width:60, padding:"5px 8px", fontSize:13 }} />
+                <button onClick=${addCardToBinder}
+                  disabled=${!addTargetBinder}
+                  style=${{ ...btn, fontSize:12, padding:"7px 14px",
+                    opacity: addTargetBinder ? 1 : 0.5 }}>
+                  Add to ${addTargetBinder ? `"${addTargetBinder}"` : "binder"}
+                </button>
+              `}
+              ${addMode === "set" && html`
+                <span style=${{ fontSize:11, color:"#8a6a4a", marginRight:"auto" }}>
+                  ${addStaging.length === 0 ? "Nothing staged" : `${addStaging.length} card${addStaging.length === 1 ? "" : "s"} staged · ${addStaging.reduce((s,x) => s + (x.qty||1), 0)} total`}
+                </span>
+                <button onClick=${commitStagingToBinder}
+                  disabled=${!addTargetBinder || addStaging.length === 0}
+                  style=${{ ...btn, fontSize:12, padding:"7px 14px",
+                    opacity: (addTargetBinder && addStaging.length > 0) ? 1 : 0.5 }}>
+                  Add to ${addTargetBinder ? `"${addTargetBinder}"` : "binder"}
+                </button>
+              `}
+            </div>
+          </div>
+        </div>
       `}
 
       <!-- (commander sidebar now rendered inline as sticky flex column) -->
