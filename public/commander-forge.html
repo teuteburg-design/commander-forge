@@ -5289,6 +5289,20 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               }
               return true;
             });
+            // Collapse rows that share a Scryfall printing into a single tile.
+            // Multiple physical variants (NM normal + LP foil + misprint, etc.)
+            // all point at the same printing and would otherwise show as
+            // duplicate-looking tiles. Qty is summed across the variants that
+            // survived filtering; the hover/pin panel reveals the breakdown.
+            const groupedMap = new Map();
+            for (const c of filtered.splice(0)) {
+              const key = ((c.id || "") + "|" + c.name).toLowerCase();
+              if (!groupedMap.has(key)) {
+                groupedMap.set(key, { ...c, qty: 0 });
+              }
+              groupedMap.get(key).qty += (c.qty || 1);
+            }
+            filtered.push(...groupedMap.values());
             // Sort
             const TYPE_ORDER = ["Creature","Planeswalker","Battle","Instant","Sorcery","Artifact","Enchantment","Land"];
             const typeRank = c => {
@@ -5665,28 +5679,27 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   <!-- RIGHT: Hover/Pin preview -->
                   <div style=${{ position:"sticky", top:90, alignSelf:"start" }}>
                     ${(() => {
-                      // Ownership for the exact printing — foil and non-foil
-                      // have different Scryfall IDs so they're tracked as
-                      // separate cards. Match by id when present, otherwise
-                      // fall back to name+finish for legacy rows that never
-                      // got a Scryfall id from the original CSV.
+                      // Ownership breakdown for a printing (a single Scryfall
+                      // id can have many physical variants: NM normal, LP foil,
+                      // misprint…). Match by id when present, otherwise by
+                      // name for legacy rows that never got a scryfall id.
+                      // Group by (condition, finish, misprint) — those are the
+                      // axes that move the card's market price.
                       const ownershipFor = (card) => {
                         if (!card) return [];
-                        const targetId = card.id || card.scryfall?.id || "";
+                        const targetId   = card.id || card.scryfall?.id || "";
                         const targetName = (card.name || "").toLowerCase();
-                        const targetFinish = card.finish || "normal";
                         const matches = (binder.cards || []).filter(c => {
-                          if (targetId && (c.id || "") === targetId) return true;
-                          if (!targetId && (c.name || "").toLowerCase() === targetName
-                              && (c.finish || "normal") === targetFinish) return true;
-                          return false;
+                          if (targetId) return (c.id || "") === targetId;
+                          return (c.name || "").toLowerCase() === targetName;
                         });
                         const groups = new Map();
                         for (const m of matches) {
                           const cond = m.condition || "NM";
+                          const fin  = m.finish    || "normal";
                           const state = m.misprint ? "misprint" : "correct";
-                          const key = `${cond}|${state}`;
-                          if (!groups.has(key)) groups.set(key, { condition: cond, state, qty: 0 });
+                          const key = `${cond}|${fin}|${state}`;
+                          if (!groups.has(key)) groups.set(key, { condition: cond, finish: fin, state, qty: 0 });
                           groups.get(key).qty += (m.qty || 1);
                         }
                         const condRank = code => {
@@ -5695,6 +5708,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         };
                         return [...groups.values()].sort((a, b) =>
                           condRank(a.condition) - condRank(b.condition)
+                          || (a.finish === "foil" ? 1 : 0) - (b.finish === "foil" ? 1 : 0)
                           || (a.state === "misprint" ? 1 : 0) - (b.state === "misprint" ? 1 : 0));
                       };
 
@@ -5736,20 +5750,19 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                   <span>You own</span>
                                   <span style=${{ color:"#7a5a3a" }}>× ${totalOwned}</span>
                                 </div>
-                                ${breakdown.map((b, i) => {
-                                  const cdMeta = CONDITION_BY_CODE[b.condition] || {};
-                                  return html`<div key=${i} style=${{
-                                    display:"flex", alignItems:"center", gap:8,
+                                ${breakdown.map((b, i) => html`
+                                  <div key=${i} style=${{
+                                    display:"flex", alignItems:"center", gap:6,
                                     fontSize:11, color:"#3a1a00",
                                     padding:"2px 0",
                                   }}>
-                                    <${ConditionDot} code=${b.condition} size=${10} />
+                                    <${ConditionDot} code=${b.condition} size=${9} />
                                     <span style=${{ minWidth:22, fontWeight:700 }}>${b.condition}</span>
-                                    <span style=${{ color:"#7a5a3a" }}>${cdMeta.label || ""}</span>
+                                    <span style=${{ color:"#7a5a3a", minWidth:54 }}>${b.finish === "foil" ? "✨ Foil" : "Normal"}</span>
                                     ${b.state === "misprint" && html`<span title="Misprint">⚠️</span>`}
                                     <span style=${{ marginLeft:"auto", fontWeight:700, color:"#5a1a00" }}>×${b.qty}</span>
-                                  </div>`;
-                                })}
+                                  </div>
+                                `)}
                               </div>
                             `}
                           </div>
