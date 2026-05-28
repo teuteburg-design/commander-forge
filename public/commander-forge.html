@@ -1747,6 +1747,10 @@
     const [binderCollapsed, setBinderCollapsed] = useState({});
     // 3-dot menu next to the binder name in the binder view header.
     const [binderMenuOpen, setBinderMenuOpen] = useState(false);
+    // "Delete binder & move its cards" modal — name of binder being deleted,
+    // plus the chosen destination (real binder name or "__uncategorised__").
+    const [binderDeleteName,   setBinderDeleteName]   = useState(null);
+    const [binderDeleteTarget, setBinderDeleteTarget] = useState("__uncategorised__");
 
     // "Add card" modal state (Phase B).
     // Two input modes:
@@ -4158,21 +4162,89 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       persistGroups(nextGroups, nextDeckInc, binInc);
     };
 
+    // Sentinel used by the delete modal's target dropdown to mean "auto-create
+    // (or reuse) a binder called 'Uncategorised'". Any literal binder name
+    // selected by the user is treated as a normal merge target.
+    const UNCATEGORISED = "Uncategorised";
+
     const deleteBinder = (name) => {
       const binder = (groups.binders || []).find(b => b.name === name);
       if (!binder) return;
       const cardCount = (binder.cards || []).reduce((s, c) => s + (c.qty || 1), 0);
-      const msg = cardCount > 0
-        ? `Delete binder "${name}"? This removes ${cardCount} cards from your collection. This cannot be undone.`
-        : `Delete empty binder "${name}"?`;
-      if (!window.confirm(msg)) return;
-      const nextBinders = (groups.binders || []).filter(b => b.name !== name);
-      const nextGroups = { ...groups, binders: nextBinders };
-      const nextBinInc = { ...binInc }; delete nextBinInc[name];
+      if (cardCount === 0) {
+        if (!window.confirm(`Delete empty binder "${name}"?`)) return;
+        const nextBinders = (groups.binders || []).filter(b => b.name !== name);
+        const nextGroups = { ...groups, binders: nextBinders };
+        const nextBinInc = { ...binInc }; delete nextBinInc[name];
+        setBinInc(nextBinInc);
+        setBinderEnriched(m => { const next = { ...m }; delete next[name]; return next; });
+        if (viewingBinder === name) { setViewingBinder(null); setPhase("select"); }
+        persistGroups(nextGroups, deckInc, nextBinInc);
+        return;
+      }
+      // Open the "what should happen to the cards?" picker. Default to
+      // moving everything into the auto-created Uncategorised binder.
+      setBinderDeleteName(name);
+      setBinderDeleteTarget("__uncategorised__");
+    };
+
+    // Commit the deletion picked in the modal — move every row of the source
+    // binder into the chosen target (creating an "Uncategorised" binder if
+    // that's what the user picked), then drop the source.
+    const confirmDeleteBinderMove = () => {
+      const fromName   = binderDeleteName;
+      const targetSel  = binderDeleteTarget;
+      if (!fromName || !targetSel) return;
+      const src = (groups.binders || []).find(b => b.name === fromName);
+      if (!src) { setBinderDeleteName(null); return; }
+      const movingRows = src.cards || [];
+
+      let nextBinders = (groups.binders || []).filter(b => b.name !== fromName);
+      let resolvedTarget = targetSel;
+      if (targetSel === "__uncategorised__") {
+        resolvedTarget = UNCATEGORISED;
+        const exists = nextBinders.some(b => b.name === resolvedTarget);
+        if (!exists) {
+          nextBinders = [...nextBinders, {
+            name: resolvedTarget, type: "binder", cards: [],
+            commanderName: null, source: "manual",
+          }];
+        }
+      }
+
+      nextBinders = nextBinders.map(b => {
+        if (b.name !== resolvedTarget) return b;
+        let dstCards = [...(b.cards || [])];
+        for (const r of movingRows) {
+          const idx = dstCards.findIndex(c =>
+            (c.id || "") === (r.id || "")
+            && (c.name || "").toLowerCase() === (r.name || "").toLowerCase()
+            && (c.condition || "NM") === (r.condition || "NM")
+            && (c.finish || "normal") === (r.finish || "normal")
+            && !!c.misprint === !!r.misprint);
+          if (idx >= 0) {
+            dstCards[idx] = { ...dstCards[idx], qty: (dstCards[idx].qty || 1) + (r.qty || 1) };
+          } else {
+            dstCards.push({ ...r });
+          }
+        }
+        return { ...b, cards: dstCards };
+      });
+
+      const nextBinInc = { ...binInc };
+      delete nextBinInc[fromName];
+      if (!(resolvedTarget in nextBinInc)) nextBinInc[resolvedTarget] = true;
       setBinInc(nextBinInc);
-      setBinderEnriched(m => { const next = { ...m }; delete next[name]; return next; });
-      if (viewingBinder === name) { setViewingBinder(null); setPhase("select"); }
-      persistGroups(nextGroups, deckInc, nextBinInc);
+      setBinderEnriched(m => {
+        const next = { ...m };
+        delete next[fromName];
+        delete next[resolvedTarget];   // force re-enrich since it gained cards
+        return next;
+      });
+      if (viewingBinder === fromName) { setViewingBinder(null); setPhase("select"); }
+      persistGroups({ ...groups, binders: nextBinders }, deckInc, nextBinInc);
+      setBinderDeleteName(null);
+      setBinderDeleteTarget("__uncategorised__");
     };
 
     const deleteDeck = (name) => {
@@ -7843,6 +7915,79 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           </div>
         </div>
       `}
+
+      <!-- ── Delete-binder modal: pick where the cards go ─────────────────── -->
+      ${binderDeleteName && (() => {
+        const src = (groups.binders || []).find(b => b.name === binderDeleteName);
+        if (!src) return null;
+        const cardCount   = (src.cards || []).reduce((s, c) => s + (c.qty || 1), 0);
+        const uniqueCount = (src.cards || []).length;
+        const others = (groups.binders || []).filter(b => b.name !== binderDeleteName);
+        const closeDelete = () => { setBinderDeleteName(null); setBinderDeleteTarget("__uncategorised__"); };
+        return html`
+          <div onClick=${closeDelete}
+            style=${{
+              position:"fixed", inset:0, background:"rgba(20,10,0,0.45)",
+              display:"flex", alignItems:"flex-start", justifyContent:"center",
+              paddingTop:80, zIndex:9999,
+            }}>
+            <div onClick=${e => e.stopPropagation()}
+              style=${{
+                background:"#fffaf0", border:"1px solid #d8b890", borderRadius:12,
+                width:"min(520px, 94vw)", overflow:"hidden",
+                boxShadow:"0 8px 32px rgba(0,0,0,0.35)",
+              }}>
+              <div style=${{
+                padding:"12px 16px", borderBottom:"1px solid #e8d8b8",
+                display:"flex", justifyContent:"space-between", alignItems:"center", gap:10,
+              }}>
+                <div style=${{ fontSize:14, fontWeight:700, color:"#3a1a00" }}>
+                  Delete "${binderDeleteName}"
+                </div>
+                <button onClick=${closeDelete}
+                  style=${{
+                    background:"transparent", border:"none", fontSize:20,
+                    cursor:"pointer", color:"#7a5a3a", padding:"0 4px", lineHeight:1,
+                  }}>✕</button>
+              </div>
+              <div style=${{ padding:16 }}>
+                <div style=${{ fontSize:12, color:"#5a3a1a", marginBottom:14, lineHeight:1.55 }}>
+                  This binder has <strong>${cardCount.toLocaleString()}</strong> cards
+                  (${uniqueCount.toLocaleString()} unique). Pick where they should go before the binder is removed —
+                  the cards themselves stay in your collection.
+                </div>
+                <div style=${{ ...label, marginBottom:6 }}>Move cards to</div>
+                <select value=${binderDeleteTarget}
+                  onChange=${e => setBinderDeleteTarget(e.target.value)}
+                  style=${{ ...inp, width:"100%", padding:"7px 9px", fontSize:13 }}>
+                  <option value="__uncategorised__">
+                    📦 ${others.some(b => b.name === UNCATEGORISED) ? `Existing "${UNCATEGORISED}" binder` : `New "${UNCATEGORISED}" binder (auto-created)`}
+                  </option>
+                  ${others.filter(b => b.name !== UNCATEGORISED).map(b => html`
+                    <option key=${b.name} value=${b.name}>${b.name}</option>
+                  `)}
+                </select>
+                <div style=${{ fontSize:11, color:"#8a6a4a", marginTop:8, lineHeight:1.5 }}>
+                  Matching variants on the destination side will combine their qty;
+                  distinct printings or conditions stay as separate rows.
+                </div>
+              </div>
+              <div style=${{
+                padding:"10px 16px", borderTop:"1px solid #e8d8b8",
+                background:"#fff8ee",
+                display:"flex", justifyContent:"flex-end", gap:8,
+              }}>
+                <button onClick=${closeDelete}
+                  style=${{ ...btnSec, fontSize:12, padding:"7px 14px" }}>Cancel</button>
+                <button onClick=${confirmDeleteBinderMove}
+                  style=${{ ...btn, fontSize:12, padding:"7px 14px" }}>
+                  Move ${cardCount.toLocaleString()} cards & delete binder
+                </button>
+              </div>
+            </div>
+          </div>
+        `;
+      })()}
 
       <!-- (commander sidebar now rendered inline as sticky flex column) -->
 
