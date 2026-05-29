@@ -7287,7 +7287,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       </button>
                     `;
                   })()}
-                  ${fromCollection && html`
+                  ${(deck && (groups.decks || []).some(d => d.name === deck.theme)) && html`
                     <button onClick=${() => { setAddToDeckQuery(""); setAddToDeckOpen(true); }}
                       title="Pull a card from one of your binders into this deck"
                       style=${{ ...btn, padding:"6px 14px", fontSize:11,
@@ -7779,7 +7779,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             </div>
                             <div style=${{ color:"#7a5a3a", fontSize:10, lineHeight:1.4 }}>${card.reason}</div>
                           </div>
-                          ${fromCollection && !isBasic && html`
+                          ${((groups.decks || []).some(d => d.name === deck.theme)) && !isBasic && html`
                             <button class="deck-card-remove"
                               onClick=${e => {
                                 e.stopPropagation();
@@ -8525,7 +8525,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       `}
 
       <!-- ── Add card from collection to the open deck ────────────────────── -->
-      ${addToDeckOpen && deck && fromCollection && (() => {
+      ${addToDeckOpen && deck && (groups.decks || []).some(d => d.name === deck.theme) && (() => {
         const deckName = deck.theme;
         // Flatten all binder rows into pickable entries. Each row knows
         // which binder it came from so the click handler can find it back.
