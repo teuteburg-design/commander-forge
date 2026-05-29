@@ -1426,12 +1426,19 @@
     `;
   }
 
-  function Pip({ c }) {
-    return html`<span title=${C_LABEL[c]||"Colorless"} style=${{
-      display:"inline-block", width:14, height:14, borderRadius:"50%",
-      background:C_BG[c]||"#888", border:"1px solid rgba(0,0,0,0.2)",
-      marginRight:2, verticalAlign:"middle",
-    }}></span>`;
+  // Color-identity pip — single mana symbol from Scryfall's SVG set.
+  // Used everywhere we want to display a deck/commander's colors so the
+  // look matches the existing in-card mana cost rendering.
+  function Pip({ c, size = 14 }) {
+    const sym = c || "C";
+    return html`<img
+      src=${`https://svgs.scryfall.io/card-symbols/${sym}.svg`}
+      alt=${C_LABEL[sym] || sym}
+      title=${C_LABEL[sym] || sym}
+      style=${{
+        width:size, height:size,
+        display:"inline-block", verticalAlign:"middle", marginRight:2,
+      }} />`;
   }
 
   // Card-condition scale — mirrors Cardmarket's 7-tier ladder
@@ -1747,6 +1754,10 @@
     const [binderCollapsed, setBinderCollapsed] = useState({});
     // 3-dot menu next to the binder name in the binder view header.
     const [binderMenuOpen, setBinderMenuOpen] = useState(false);
+    // 3-dot menu next to the deck title in the deck view header (only shown
+    // when the open deck corresponds to a real entry in groups.decks).
+    const [deckMenuOpen, setDeckMenuOpen] = useState(false);
+    const [deckRenameValue, setDeckRenameValue] = useState(null);
     // Inline rename: when set, the name h2 is replaced by an editable input.
     const [binderRenameValue, setBinderRenameValue] = useState(null);
     // "Delete binder & move its cards" modal — name of binder being deleted,
@@ -4266,21 +4277,32 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       if (raw) applyBinderRename(oldName, raw);
     };
 
-    const renameDeck = (oldName) => {
-      const raw = window.prompt("New name for this deck:", oldName);
-      if (!raw) return;
-      const trimmed = raw.trim();
-      if (!trimmed || trimmed === oldName) return;
+    // Apply a deck rename given an explicit new name. Also propagates the
+    // change into deck.theme (the in-memory deck object used by the deck
+    // view), so a freshly-renamed open deck shows the new label without
+    // having to be re-opened.
+    const applyDeckRename = (oldName, rawNewName) => {
+      const trimmed = (rawNewName || "").trim();
+      if (!trimmed || trimmed === oldName) return false;
       if ((groups.decks || []).some(d => d.name === trimmed)) {
         alert(`A deck named "${trimmed}" already exists.`);
-        return;
+        return false;
       }
-      const nextDecks = (groups.decks || []).map(d => d.name === oldName ? { ...d, name: trimmed } : d);
-      const nextGroups = { ...groups, decks: nextDecks };
+      const nextDecks = (groups.decks || []).map(d =>
+        d.name === oldName
+          ? { ...d, name: trimmed, deckData: d.deckData ? { ...d.deckData, theme: trimmed } : d.deckData }
+          : d);
       const nextDeckInc = { ...deckInc };
       if (oldName in nextDeckInc) { nextDeckInc[trimmed] = nextDeckInc[oldName]; delete nextDeckInc[oldName]; }
       setDeckInc(nextDeckInc);
-      persistGroups(nextGroups, nextDeckInc, binInc);
+      if (deck && deck.theme === oldName) setDeck(d2 => ({ ...d2, theme: trimmed }));
+      persistGroups({ ...groups, decks: nextDecks }, nextDeckInc, binInc);
+      return true;
+    };
+
+    const renameDeck = (oldName) => {
+      const raw = window.prompt("New name for this deck:", oldName);
+      if (raw) applyDeckRename(oldName, raw);
     };
 
     // Sentinel used by the delete modal's target dropdown to mean "auto-create
@@ -4369,9 +4391,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     };
 
     const deleteDeck = (name) => {
-      const deck = (groups.decks || []).find(d => d.name === name);
-      if (!deck) return;
-      const cardCount = (deck.cards || []).reduce((s, c) => s + (c.qty || 1), 0);
+      const target = (groups.decks || []).find(d => d.name === name);
+      if (!target) return;
+      const cardCount = (target.cards || []).reduce((s, c) => s + (c.qty || 1), 0);
       const msg = cardCount > 0
         ? `Delete deck "${name}"? This removes ${cardCount} cards from your collection. This cannot be undone.`
         : `Delete empty deck "${name}"?`;
@@ -4380,6 +4402,13 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       const nextGroups = { ...groups, decks: nextDecks };
       const nextDeckInc = { ...deckInc }; delete nextDeckInc[name];
       setDeckInc(nextDeckInc);
+      // If the user is currently viewing the deck we just removed, bail
+      // back to the Collection so we don't render stale state.
+      if (deck && deck.theme === name) {
+        setDeck(null); setSelCmd(null);
+        setFromCollection(false); setFromSaved(false);
+        setPhase("select");
+      }
       persistGroups(nextGroups, nextDeckInc, binInc);
     };
 
@@ -4437,11 +4466,21 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // which enriches on demand (and caches the result back on the entry).
     // Empty manual decks have nothing to show yet — surface that.
     const openDeck = (d) => {
-      if (d.deckData && d.selCmd) return loadCollectionDeck(d);
-      if (!(d.cards || []).length) {
+      // Reset menu/rename state so it doesn't bleed across decks.
+      setDeckMenuOpen(false);
+      setDeckRenameValue(null);
+      // Forge-generated decks have their own opener that resets some
+      // collection-specific flags (libSaved etc.) correctly.
+      if (d.source === "generated" && d.deckData && d.selCmd) {
+        return loadCollectionDeck(d);
+      }
+      if (!(d.cards || []).length && !d.deckData) {
         alert(`"${d.name}" is empty — add cards via the Build flow or import a CSV first.`);
         return;
       }
+      // Everything else — including already-enriched imported decks — routes
+      // through openImportedDeck. Its cached-path opens instantly when
+      // deckData + selCmd are present; otherwise it runs enrichment.
       return openImportedDeck(d, "collection");
     };
 
@@ -5494,11 +5533,23 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 cursor:"pointer",
                                 display:"flex", alignItems:"center", gap:12, padding:"11px 14px",
                               }}>
-                              <span onClick=${e => { e.stopPropagation(); setBinInc(bi => ({ ...bi, [b.name]: !bi[b.name] })); }}
-                                title=${included ? "Click to exclude from analysis pool" : "Click to include in analysis pool"}
-                                style=${{ fontSize:18, width:24, textAlign:"center", flexShrink:0, cursor:"pointer" }}>
-                                ${included ? "✅" : "⬜"}
-                              </span>
+                              <button onClick=${e => { e.stopPropagation(); setBinInc(bi => ({ ...bi, [b.name]: !bi[b.name] })); }}
+                                title=${included ? "Included in analysis pool — click to exclude" : "Excluded from analysis pool — click to include"}
+                                style=${{
+                                  display:"inline-flex", alignItems:"center", gap:6,
+                                  padding:"5px 11px", borderRadius:16,
+                                  border:"none", cursor:"pointer", fontFamily:"inherit",
+                                  fontSize:11, fontWeight:600, whiteSpace:"nowrap", flexShrink:0,
+                                  background: included ? "#7a2e0e" : "#e8d8c0",
+                                  color: included ? "#fff" : "#8a6a4a",
+                                  boxShadow: included ? "inset 0 1px 2px rgba(0,0,0,0.18)" : "none",
+                                }}>
+                                <span style=${{
+                                  display:"inline-block", width:8, height:8, borderRadius:"50%",
+                                  background: included ? "#cdee9c" : "#8a6a4a",
+                                }}></span>
+                                ${included ? "Included" : "Excluded"}
+                              </button>
                               <div style=${{ flex:1, minWidth:0 }}>
                                 <div style=${{ fontSize:13, fontWeight:600, color:"#2a1000",
                                   whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>${b.name}</div>
@@ -5510,11 +5561,6 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                   }}>${t}</span>`)}
                                 </div>
                               </div>
-                              <span style=${{
-                                padding:"3px 10px", borderRadius:20, fontSize:11, fontWeight:600, flexShrink:0,
-                                background: included ? "#7a2e0e" : "#e8d8c0",
-                                color: included ? "#fff" : "#8a6a4a",
-                              }}>${included ? "Included" : "Excluded"}</span>
                             </div>
                           `;
                         })}
@@ -5564,18 +5610,13 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 cursor:"pointer",
                                 display:"flex", alignItems:"center", gap:12, padding:"11px 14px",
                               }}>
-                              <span onClick=${e => { e.stopPropagation(); setDeckInc(di => ({ ...di, [d.name]: !di[d.name] })); }}
-                                title=${included ? "Click to exclude from analysis pool" : "Click to include in analysis pool"}
-                                style=${{ fontSize:20, width:24, textAlign:"center", flexShrink:0, cursor:"pointer" }}>
-                                ${included ? "🔓" : "🔒"}
-                              </span>
                               <div style=${{ flex:1, minWidth:0 }}>
                                 <div style=${{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
                                   <span style=${{ fontSize:13, fontWeight:600, color:"#2a1000",
                                     whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", minWidth:0 }}>${d.name}</span>
                                   ${colors.length > 0 && html`
                                     <span style=${{ display:"inline-flex", gap:2, alignItems:"center" }}>
-                                      ${colors.map(c => html`<${Pip} key=${c} c=${c} />`)}
+                                      ${colors.map(c => html`<${Pip} key=${c} c=${c} size=${14} />`)}
                                     </span>
                                   `}
                                   ${isGen && html`
@@ -5599,25 +5640,23 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                   ${isCmdr && d.commanderName && html`<span style=${{ color:"#7a3010" }}>· 👑 ${d.commanderName}</span>`}
                                 </div>
                               </div>
-                              <span style=${{
-                                padding:"3px 10px", borderRadius:20, fontSize:11, fontWeight:600, flexShrink:0,
-                                background: included ? "#7a2e0e" : "#e8d8c0",
-                                color: included ? "#fff" : "#8a6a4a",
-                              }}>${included ? "Included" : "Excluded"}</span>
-                              <button onClick=${e => { e.stopPropagation(); renameDeck(d.name); }}
-                                title="Rename deck"
+                              <button onClick=${e => { e.stopPropagation(); setDeckInc(di => ({ ...di, [d.name]: !di[d.name] })); }}
+                                title=${included ? "Included in analysis pool — click to exclude" : "Excluded from analysis pool — click to include"}
                                 style=${{
-                                  background:"transparent", border:"1px solid #d0b880", borderRadius:6,
-                                  padding:"3px 6px", fontSize:12, color:"#7a5a3a", cursor:"pointer",
-                                  fontFamily:"inherit", flexShrink:0,
-                                }}>✏️</button>
-                              <button onClick=${e => { e.stopPropagation(); deleteDeck(d.name); }}
-                                title="Delete deck"
-                                style=${{
-                                  background:"transparent", border:"1px solid #d0b880", borderRadius:6,
-                                  padding:"3px 6px", fontSize:12, color:"#a04020", cursor:"pointer",
-                                  fontFamily:"inherit", flexShrink:0,
-                                }}>🗑</button>
+                                  display:"inline-flex", alignItems:"center", gap:6,
+                                  padding:"5px 11px", borderRadius:16,
+                                  border:"none", cursor:"pointer", fontFamily:"inherit",
+                                  fontSize:11, fontWeight:600, whiteSpace:"nowrap", flexShrink:0,
+                                  background: included ? "#7a2e0e" : "#e8d8c0",
+                                  color: included ? "#fff" : "#8a6a4a",
+                                  boxShadow: included ? "inset 0 1px 2px rgba(0,0,0,0.18)" : "none",
+                                }}>
+                                <span style=${{
+                                  display:"inline-block", width:8, height:8, borderRadius:"50%",
+                                  background: included ? "#cdee9c" : "#8a6a4a",
+                                }}></span>
+                                ${included ? "Included" : "Excluded"}
+                              </button>
                             </div>
                           `;
                         })}
@@ -6828,8 +6867,79 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       ${selCmd.card?.scryfall?.type_line}
                     </span>
                   </div>
-                  <div style=${{ fontSize:12, color:"#5a3a1a", marginBottom:3 }}>
-                    <strong>Theme:</strong> ${deck.theme}
+                  <div style=${{ fontSize:12, color:"#5a3a1a", marginBottom:3,
+                    display:"flex", alignItems:"center", gap:6, position:"relative" }}>
+                    <strong>Theme:</strong>
+                    ${deckRenameValue === null
+                      ? html`<span>${deck.theme}</span>`
+                      : html`<input
+                          autoFocus=${true}
+                          value=${deckRenameValue}
+                          onInput=${e => setDeckRenameValue(e.target.value)}
+                          onKeyDown=${e => {
+                            if (e.key === "Enter") {
+                              if (applyDeckRename(deck.theme, deckRenameValue)) setDeckRenameValue(null);
+                            } else if (e.key === "Escape") {
+                              setDeckRenameValue(null);
+                            }
+                          }}
+                          onBlur=${() => {
+                            const v = (deckRenameValue || "").trim();
+                            if (v && v !== deck.theme) {
+                              if (!applyDeckRename(deck.theme, deckRenameValue)) setDeckRenameValue(null);
+                              else setDeckRenameValue(null);
+                            } else {
+                              setDeckRenameValue(null);
+                            }
+                          }}
+                          style=${{
+                            fontSize:12, color:"#3a1a00",
+                            background:"#fffaf0", border:"1px solid #c07030", borderRadius:6,
+                            padding:"2px 7px", fontFamily:"inherit",
+                            outline:"none", minWidth:200,
+                          }} />`}
+                    ${fromCollection && deckRenameValue === null && html`
+                      <button onClick=${() => setDeckMenuOpen(o => !o)}
+                        title="Deck actions"
+                        style=${{
+                          background:"transparent", border:"1px solid #d0b880", borderRadius:6,
+                          padding:"1px 6px", fontSize:13, color:"#7a5a3a", cursor:"pointer",
+                          fontFamily:"inherit", lineHeight:1,
+                        }}>⋯</button>
+                    `}
+                    ${deckMenuOpen && html`
+                      <div onClick=${() => setDeckMenuOpen(false)}
+                        style=${{ position:"fixed", inset:0, zIndex:50 }}></div>
+                      <div style=${{
+                        position:"absolute", top:"110%", left:90, zIndex:60,
+                        background:"#fff", border:"1px solid #d8b890", borderRadius:8,
+                        boxShadow:"0 4px 16px rgba(0,0,0,0.18)",
+                        minWidth:180, padding:4,
+                      }}>
+                        <button onClick=${() => { setDeckMenuOpen(false); setDeckRenameValue(deck.theme); }}
+                          style=${{
+                            display:"block", width:"100%", textAlign:"left",
+                            padding:"7px 10px", fontSize:12, color:"#3a1a00",
+                            background:"transparent", border:"none", borderRadius:5,
+                            cursor:"pointer", fontFamily:"inherit",
+                          }}
+                          onMouseEnter=${e => e.currentTarget.style.background = "#fff0e0"}
+                          onMouseLeave=${e => e.currentTarget.style.background = "transparent"}>
+                          ✏️ Rename deck
+                        </button>
+                        <button onClick=${() => { setDeckMenuOpen(false); deleteDeck(deck.theme); }}
+                          style=${{
+                            display:"block", width:"100%", textAlign:"left",
+                            padding:"7px 10px", fontSize:12, color:"#a04020",
+                            background:"transparent", border:"none", borderRadius:5,
+                            cursor:"pointer", fontFamily:"inherit",
+                          }}
+                          onMouseEnter=${e => e.currentTarget.style.background = "#fde8e0"}
+                          onMouseLeave=${e => e.currentTarget.style.background = "transparent"}>
+                          🗑 Delete deck…
+                        </button>
+                      </div>
+                    `}
                   </div>
                   <div style=${{ fontSize:11, color:"#8a6a4a" }}>
                     ${(() => {
