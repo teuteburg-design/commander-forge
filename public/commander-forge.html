@@ -5533,6 +5533,17 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 cursor:"pointer",
                                 display:"flex", alignItems:"center", gap:12, padding:"11px 14px",
                               }}>
+                              <div style=${{ flex:1, minWidth:0 }}>
+                                <div style=${{ fontSize:13, fontWeight:600, color:"#2a1000",
+                                  whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>${b.name}</div>
+                                <div style=${{ fontSize:11, color:"#8a6a4a", display:"flex", flexWrap:"wrap", gap:6, alignItems:"center" }}>
+                                  <span>Binder · ${total} cards (${b.cards.length} unique)</span>
+                                  ${(b.tags || []).length > 0 && (b.tags || []).map(t => html`<span key=${t} style=${{
+                                    padding:"1px 7px", borderRadius:10, fontSize:10,
+                                    background:"#f0e0c0", color:"#5a3a1a",
+                                  }}>${t}</span>`)}
+                                </div>
+                              </div>
                               <button onClick=${e => { e.stopPropagation(); setBinInc(bi => ({ ...bi, [b.name]: !bi[b.name] })); }}
                                 title=${included ? "Included in analysis pool — click to exclude" : "Excluded from analysis pool — click to include"}
                                 style=${{
@@ -5550,17 +5561,6 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 }}></span>
                                 ${included ? "Included" : "Excluded"}
                               </button>
-                              <div style=${{ flex:1, minWidth:0 }}>
-                                <div style=${{ fontSize:13, fontWeight:600, color:"#2a1000",
-                                  whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>${b.name}</div>
-                                <div style=${{ fontSize:11, color:"#8a6a4a", display:"flex", flexWrap:"wrap", gap:6, alignItems:"center" }}>
-                                  <span>Binder · ${total} cards (${b.cards.length} unique)</span>
-                                  ${(b.tags || []).length > 0 && (b.tags || []).map(t => html`<span key=${t} style=${{
-                                    padding:"1px 7px", borderRadius:10, fontSize:10,
-                                    background:"#f0e0c0", color:"#5a3a1a",
-                                  }}>${t}</span>`)}
-                                </div>
-                              </div>
                             </div>
                           `;
                         })}
