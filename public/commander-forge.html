@@ -4786,16 +4786,20 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                    reachable via the contextual sub-nav rendered below. -->
               <div style=${{ display:"flex", gap:0, marginTop:10, flexWrap:"wrap" }}>
                 ${[
-                  // "Home" is active for any phase that ISN'T a top-level
-                  // destination — pick/deck/building all show inside Home.
+                  // "Home" is active for the build flow itself; once a deck
+                  // has been opened FROM a stored source (Collection / Library)
+                  // we treat the deck view as belonging to that section
+                  // rather than to Home.
                   { label:"🏠 Home",
-                    active: ["ready", "pick", "deck", "building", "analyzing", "loading_cmdr"].includes(phase),
+                    active: (["ready", "pick", "building", "analyzing", "loading_cmdr"].includes(phase))
+                      || (phase === "deck" && !fromCollection && !fromSaved),
                     onClick: resetHome },
                   { label:"📋 Collection",
-                    active: phase==="select"||phase==="import",
+                    active: phase==="select" || phase==="import" || phase==="binder_view",
                     onClick: navToCollection },
                   { label:`📚 Library${(library.length + (groups.decks?.length || 0)) > 0 ? " ("+(library.length + (groups.decks?.length || 0))+")" : ""}`,
-                    active: phase==="saved_list",
+                    active: phase==="saved_list"
+                      || (phase === "deck" && (fromCollection || fromSaved)),
                     onClick: () => setPhase("saved_list") },
                   { label:"⚙ Settings",    active: phase==="setup",
                     onClick: () => { setPrev(phase); setAKI(apiKeys); setPhase("setup"); } },
@@ -4820,7 +4824,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                    that's part of the build flow). The sub-items navigate
                    between Commanders list, AI Suggestions, and the Deck
                    view without leaving Home. -->
-              ${["ready", "pick", "deck", "building", "analyzing", "loading_cmdr"].includes(phase) && html`
+              ${(["ready", "pick", "building", "analyzing", "loading_cmdr"].includes(phase)
+                  || (phase === "deck" && !fromCollection && !fromSaved)) && html`
                 <div style=${{
                   display:"flex", gap:0, marginTop:6, paddingLeft:6, flexWrap:"wrap",
                   borderTop:"1px solid rgba(255,255,255,0.08)",
@@ -5587,7 +5592,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 background: included ? "#fff0e0" : "#fff",
                                 border: included ? "1px solid #c07030" : "1px solid #ddd0b8",
                                 boxShadow:"0 1px 4px rgba(0,0,0,0.05)", overflow:"hidden",
-                                cursor:"pointer",
+                                cursor:"pointer", minHeight:64, boxSizing:"border-box",
                                 display:"flex", alignItems:"center", gap:12, padding:"11px 14px",
                               }}>
                               <div style=${{ flex:1, minWidth:0 }}>
@@ -5664,7 +5669,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 background: included ? "#fff0e0" : "#fff",
                                 border: included ? "1px solid #c07030" : "1px solid #ddd0b8",
                                 boxShadow:"0 1px 4px rgba(0,0,0,0.05)", overflow:"hidden",
-                                cursor:"pointer",
+                                cursor:"pointer", minHeight:64, boxSizing:"border-box",
                                 display:"flex", alignItems:"center", gap:12, padding:"11px 14px",
                               }}>
                               <div style=${{ flex:1, minWidth:0 }}>
