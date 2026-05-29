@@ -1187,6 +1187,48 @@
     return { format: "unknown", decks: [], binders: [], stats: { totalRows: 0, included: 0, skippedNoName: 0 } };
   }
 
+  // Card-language metadata. Uses Scryfall's language codes (a superset of
+  // Manabox's) so we can talk to both stores without translation. Flags are
+  // shown next to the code in the binder preview — unknown codes get a
+  // generic 🏳️ marker.
+  const LANGUAGES = {
+    en:  { label: "English",            flag: "🇬🇧" },
+    de:  { label: "German",             flag: "🇩🇪" },
+    fr:  { label: "French",             flag: "🇫🇷" },
+    it:  { label: "Italian",            flag: "🇮🇹" },
+    es:  { label: "Spanish",            flag: "🇪🇸" },
+    pt:  { label: "Portuguese",         flag: "🇵🇹" },
+    ja:  { label: "Japanese",           flag: "🇯🇵" },
+    ko:  { label: "Korean",             flag: "🇰🇷" },
+    ru:  { label: "Russian",            flag: "🇷🇺" },
+    zhs: { label: "Chinese (Simpl.)",   flag: "🇨🇳" },
+    zht: { label: "Chinese (Trad.)",    flag: "🇹🇼" },
+    he:  { label: "Hebrew",             flag: "🇮🇱" },
+    la:  { label: "Latin",              flag: "🇻🇦" },
+    grc: { label: "Ancient Greek",      flag: "🇬🇷" },
+    ar:  { label: "Arabic",             flag: "🇸🇦" },
+    sa:  { label: "Sanskrit",           flag: "🇮🇳" },
+    ph:  { label: "Phyrexian",          flag: "🛸" },
+  };
+  // Normalise Manabox/Moxfield language codes (lowercase, common synonyms).
+  function normaliseLang(raw) {
+    const s = (raw || "").toLowerCase().trim();
+    if (!s) return "en";
+    // Common variants → Scryfall code
+    if (s === "english")      return "en";
+    if (s === "german" || s === "deutsch") return "de";
+    if (s === "french" || s === "francais" || s === "français") return "fr";
+    if (s === "italian" || s === "italiano") return "it";
+    if (s === "spanish" || s === "español" || s === "espanol") return "es";
+    if (s === "portuguese" || s === "português" || s === "portugues") return "pt";
+    if (s === "japanese")     return "ja";
+    if (s === "korean")       return "ko";
+    if (s === "russian")      return "ru";
+    if (s === "zh-cn" || s === "zh_cn" || s === "zh-hans" || s === "chinese-s" || s === "chinese (simplified)") return "zhs";
+    if (s === "zh-tw" || s === "zh_tw" || s === "zh-hant" || s === "chinese-t" || s === "chinese (traditional)") return "zht";
+    return s;
+  }
+
   // Manabox uses the TCG-style 5/6-tier condition ladder; map to our
   // Cardmarket-style 7-tier scale.
   const MANABOX_CONDITION_MAP = {
@@ -1227,6 +1269,7 @@
     const iFoil = hdr.findIndex(h => h === "foil" || h === "finish");
     const iCond = hdr.findIndex(h => h === "condition");
     const iMis  = hdr.findIndex(h => h === "misprint" || h === "is_misprint");
+    const iLang = hdr.findIndex(h => h === "language" || h === "lang");
     if (iName < 0) return { decks: [], binders: [], stats };
 
     const groups = new Map();
@@ -1247,22 +1290,25 @@
       const foilRaw = iFoil >= 0 ? (cols[iFoil] || "").trim().toLowerCase() : "";
       const condRaw = iCond >= 0 ? (cols[iCond] || "").trim().toLowerCase() : "";
       const misRaw  = iMis  >= 0 ? (cols[iMis]  || "").trim() : "";
+      const langRaw = iLang >= 0 ? (cols[iLang] || "").trim() : "";
       const finish    = MANABOX_FINISH_MAP[foilRaw] || (foilRaw ? "foil" : "normal");
       const condition = MANABOX_CONDITION_MAP[condRaw] || "NM";
       const misprint  = /^(true|1|yes)$/i.test(misRaw);
+      const lang      = normaliseLang(langRaw);
 
       const key = `${bt}::${bn}`;
       if (!groups.has(key)) groups.set(key, { type: bt, name: bn, cards: new Map() });
       const g = groups.get(key);
       if (isCmdr) g.commanderName = name;
 
-      // Row key includes finish/condition/misprint so foils stay distinct
-      // from non-foils and damaged copies stay distinct from NM copies.
-      const rowKey = `${name.toLowerCase()}|${sfid}|${condition}|${finish}|${misprint ? "1" : "0"}`;
+      // Row key includes finish/condition/misprint/lang so each distinct
+      // physical variant (foil vs non-foil, NM vs LP, en vs de) keeps its
+      // own row instead of being silently merged.
+      const rowKey = `${name.toLowerCase()}|${sfid}|${condition}|${finish}|${misprint ? "1" : "0"}|${lang}`;
       if (g.cards.has(rowKey)) {
         g.cards.get(rowKey).qty += qty;
       } else {
-        const row = { name, qty, id: sfid, condition, finish };
+        const row = { name, qty, id: sfid, condition, finish, lang };
         if (misprint) row.misprint = true;
         g.cards.set(rowKey, row);
       }
@@ -1816,6 +1862,7 @@
     const [addCondition, setAddCondition] = useState("NM");  // NM | LP | MP | HP | DMG
     const [addFinish, setAddFinish] = useState("normal");    // normal | foil
     const [addPiece, setAddPiece] = useState("correct");     // correct | misprint
+    const [addLang,  setAddLang]  = useState("en");          // Scryfall language code
     const [addSetBusy, setAddSetBusy] = useState(false);
     const [addStaging, setAddStaging] = useState([]);        // [{ printing, qty, condition, finish, misprint }]
 
@@ -1846,6 +1893,7 @@
       setAddCondition("NM");
       setAddFinish("normal");
       setAddPiece("correct");
+      setAddLang("en");
       setAddStaging([]);
       setAddError("");
     };
@@ -1914,6 +1962,7 @@
           condition: addCondition,
           finish:    addFinish,
           misprint:  addPiece === "misprint",
+          lang:      addLang,
         }]);
         setAddCollNum("");
         // Refocus collector # so user can keep typing.
@@ -1927,12 +1976,13 @@
 
     // Card-equality used to merge duplicates when committing. Differs on any
     // of {name, printing id, condition, finish, misprint} = new row.
-    const sameCardRow = (a, printing, condition, finish, misprint) =>
+    const sameCardRow = (a, printing, condition, finish, misprint, lang) =>
       a.name.toLowerCase() === printing.name.toLowerCase()
       && (a.id || "") === (printing.id || "")
       && (a.condition || "NM") === condition
       && (a.finish || "normal") === finish
-      && !!a.misprint === !!misprint;
+      && !!a.misprint === !!misprint
+      && (a.lang || "en") === (lang || "en");
 
     // Write a list of {printing, qty, condition, finish, misprint} entries
     // into a binder. Used by both the "By name" and "By set" flows.
@@ -1947,13 +1997,15 @@
 
       for (const e of entries) {
         const { printing, qty, condition, finish, misprint } = e;
-        const idx = nextCards.findIndex(c => sameCardRow(c, printing, condition, finish, misprint));
+        const lang = e.lang || "en";
+        const idx = nextCards.findIndex(c => sameCardRow(c, printing, condition, finish, misprint, lang));
         const row = {
           name: printing.name,
           qty,
           id: printing.id,
           condition,
           finish,
+          lang,
           ...(misprint ? { misprint: true } : {}),
         };
         if (idx >= 0) {
@@ -1985,13 +2037,14 @@
         let next = [...list];
         for (const e of entries) {
           const { printing, qty, condition, finish, misprint } = e;
-          const idx = next.findIndex(c => sameCardRow(c, printing, condition, finish, misprint));
+          const lang = e.lang || "en";
+          const idx = next.findIndex(c => sameCardRow(c, printing, condition, finish, misprint, lang));
           if (idx >= 0) {
             next[idx] = { ...next[idx], qty: (next[idx].qty || 1) + qty };
           } else {
             next.push({
               name: printing.name, qty, id: printing.id,
-              condition, finish,
+              condition, finish, lang,
               ...(misprint ? { misprint: true } : {}),
               scryfall: printing,
             });
@@ -2017,6 +2070,7 @@
         condition: addCondition,
         finish: addFinish,
         misprint: addPiece === "misprint",
+        lang: addLang,
       }]);
       setAddQty(1);
       setAddQuery("");
@@ -2165,7 +2219,9 @@
         const x = (rect.right + 14 + popW <= window.innerWidth - 20)
           ? rect.right + 14
           : Math.max(8, rect.left - popW - 14);
-        const y = Math.max(8, Math.min(rect.top, window.innerHeight - 430));
+        // Keep the tooltip clear of the sticky header — default to 12 px below it.
+        const minY = (headerH || 60) + 12;
+        const y = Math.max(minY, Math.min(rect.top, window.innerHeight - 430));
         setCardTooltip({ img: normalImg, name, x, y });
       }, 420);
     };
@@ -4364,7 +4420,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             && (c.name || "").toLowerCase() === (r.name || "").toLowerCase()
             && (c.condition || "NM") === (r.condition || "NM")
             && (c.finish || "normal") === (r.finish || "normal")
-            && !!c.misprint === !!r.misprint);
+            && !!c.misprint === !!r.misprint
+            && (c.lang || "en") === (r.lang || "en"));
           if (idx >= 0) {
             dstCards[idx] = { ...dstCards[idx], qty: (dstCards[idx].qty || 1) + (r.qty || 1) };
           } else {
@@ -6175,7 +6232,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   </div>
 
                   <!-- RIGHT: Hover/Pin preview -->
-                  <div style=${{ position:"sticky", top:90, alignSelf:"start" }}>
+                  <div style=${{ position:"sticky", top:(headerH || 60) + 16, alignSelf:"start" }}>
                     ${(() => {
                       // Ownership breakdown for a printing (a single Scryfall
                       // id can have many physical variants: NM normal, LP foil,
@@ -6210,12 +6267,33 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           || (a.state === "misprint" ? 1 : 0) - (b.state === "misprint" ? 1 : 0));
                       };
 
+                      // Language summary for the printing the user is looking
+                      // at — grouped by lang, sorted by qty desc.
+                      const languagesFor = (card) => {
+                        if (!card) return [];
+                        const targetId   = card.id || card.scryfall?.id || "";
+                        const targetName = (card.name || "").toLowerCase();
+                        const matches = (binder.cards || []).filter(c => {
+                          if (targetId) return (c.id || "") === targetId;
+                          return (c.name || "").toLowerCase() === targetName;
+                        });
+                        const groups = new Map();
+                        for (const m of matches) {
+                          const lang = (m.lang || "en").toLowerCase();
+                          groups.set(lang, (groups.get(lang) || 0) + (m.qty || 1));
+                        }
+                        return [...groups.entries()]
+                          .map(([code, qty]) => ({ code, qty }))
+                          .sort((a, b) => b.qty - a.qty || a.code.localeCompare(b.code));
+                      };
+
                       const PreviewCard = ({ card, pinned }) => {
                         if (!card) return null;
                         const sf = card.scryfall || {};
                         const big = sf.image_uris?.normal || sf.card_faces?.[0]?.image_uris?.normal || card.img;
                         const breakdown = ownershipFor(card);
                         const totalOwned = breakdown.reduce((s, x) => s + x.qty, 0);
+                        const langs = languagesFor(card);
                         return html`
                           <div style=${{
                             background:"#fff", border: pinned ? "2px solid #7a2e0e" : "1px solid #ddd0b8",
@@ -6261,6 +6339,30 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                     <span style=${{ marginLeft:"auto", fontWeight:700, color:"#5a1a00" }}>×${b.qty}</span>
                                   </div>
                                 `)}
+                              </div>
+                            `}
+                            ${langs.length > 0 && html`
+                              <div style=${{
+                                padding:"7px 10px 9px", borderTop:"1px solid #f0e0c0",
+                                background:"#fffdf8",
+                              }}>
+                                <div style=${{ ...label, fontSize:9, marginBottom:5 }}>Languages</div>
+                                <div style=${{ display:"flex", flexWrap:"wrap", gap:6, fontSize:11, color:"#3a1a00" }}>
+                                  ${langs.map(l => {
+                                    const meta = LANGUAGES[l.code] || { label: l.code, flag: "🏳️" };
+                                    return html`<span key=${l.code}
+                                      title=${meta.label}
+                                      style=${{
+                                        display:"inline-flex", alignItems:"center", gap:3,
+                                        padding:"2px 7px", borderRadius:10,
+                                        background:"#fff", border:"1px solid #e0c890",
+                                      }}>
+                                      <span>${meta.flag}</span>
+                                      <span style=${{ fontWeight:700 }}>${l.code.toUpperCase()}</span>
+                                      <span style=${{ color:"#7a5a3a" }}>×${l.qty}</span>
+                                    </span>`;
+                                  })}
+                                </div>
                               </div>
                             `}
                             ${pinned && (() => {
@@ -7967,6 +8069,17 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     </div>
                   </div>
                 </div>
+
+                <!-- Language picker — applies to all subsequent staging entries -->
+                <div style=${{ marginTop:10 }}>
+                  <div style=${{ ...label, marginBottom:5 }}>Language</div>
+                  <select value=${addLang} onChange=${e => setAddLang(e.target.value)}
+                    style=${{ ...inp, width:"100%", padding:"6px 8px", fontSize:12 }}>
+                    ${Object.entries(LANGUAGES).map(([code, meta]) => html`
+                      <option key=${code} value=${code}>${meta.flag} ${meta.label} (${code.toUpperCase()})</option>
+                    `)}
+                  </select>
+                </div>
               </div>
 
               <!-- ── By set + number ─────────────────────────────────────── -->
@@ -8142,6 +8255,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               <span>${s.condition}</span>
                               <span>·</span>
                               <span>${s.finish === "foil" ? "✨ Foil" : "Normal"}</span>
+                              <span>·</span>
+                              <span title=${LANGUAGES[s.lang || "en"]?.label || s.lang}>${LANGUAGES[s.lang || "en"]?.flag || "🏳️"} ${(s.lang || "en").toUpperCase()}</span>
                               ${s.misprint && html`<span>·</span><span title="Misprint">⚠️</span>`}
                             </div>
                           </div>
