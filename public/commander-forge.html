@@ -18,8 +18,10 @@
     .card { background: #fff; border: 1px solid #ddd0b8; border-radius: 12px; padding: 20px 24px; box-shadow: 0 1px 6px rgba(0,0,0,0.07); }
     .pick-card { cursor: pointer; transition: border-color .15s, transform .15s, box-shadow .15s; }
     .pick-card:hover { border-color: #8a3010 !important; transform: translateY(-2px); box-shadow: 0 6px 18px rgba(0,0,0,0.12) !important; }
-    .deck-card { background: #fdf8f2; border: 1px solid #e8d8b8; border-radius: 8px; padding: 7px 10px; display: flex; gap: 8px; align-items: center; }
+    .deck-card { background: #fdf8f2; border: 1px solid #e8d8b8; border-radius: 8px; padding: 7px 10px; display: flex; gap: 8px; align-items: center; position: relative; }
     .deck-card:hover { border-color: #b87030; }
+    .deck-card .deck-card-remove { opacity: 0; transition: opacity .15s; }
+    .deck-card:hover .deck-card-remove { opacity: 1; }
     .cmd-img { border-radius: 7px; box-shadow: 0 3px 12px rgba(0,0,0,0.18); }
   </style>
 </head>
@@ -1804,6 +1806,10 @@
     // when the open deck corresponds to a real entry in groups.decks).
     const [deckMenuOpen, setDeckMenuOpen] = useState(false);
     const [deckRenameValue, setDeckRenameValue] = useState(null);
+    // "Add from collection" modal — when open, lists binder rows filtered
+    // by query so the user can pick a card to move into the open deck.
+    const [addToDeckOpen,  setAddToDeckOpen]  = useState(false);
+    const [addToDeckQuery, setAddToDeckQuery] = useState("");
     // Inline rename: when set, the name h2 is replaced by an editable input.
     const [binderRenameValue, setBinderRenameValue] = useState(null);
     // "Delete binder & move its cards" modal — name of binder being deleted,
@@ -4522,6 +4528,194 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // Imported / manual decks with cards → run them through openImportedDeck
     // which enriches on demand (and caches the result back on the entry).
     // Empty manual decks have nothing to show yet — surface that.
+    // ── Deck ↔ Collection mutation helpers ─────────────────────────────────
+    // Map a card to its deck.categories bucket from its type_line. Mirrors
+    // the bucketing the enrichment pipeline produces so manually-added
+    // cards slot into the same sections.
+    const categoryForType = (typeLine) => {
+      const t = (typeLine || "").toLowerCase();
+      if (t.includes("land"))         return "Lands";
+      if (t.includes("creature"))     return "Creatures";
+      if (t.includes("planeswalker")) return "Planeswalkers";
+      if (t.includes("battle"))       return "Battles";
+      if (t.includes("instant"))      return "Instants";
+      if (t.includes("sorcery"))      return "Sorceries";
+      if (t.includes("artifact"))     return "Artifacts";
+      if (t.includes("enchantment"))  return "Enchantments";
+      return "Other";
+    };
+
+    // Add one copy of a binder row to a deck. Decrements the binder qty
+    // (removes the row when it hits 0), appends a new entry into the
+    // deck's raw cards list (merging by name), and pushes a card into the
+    // matching deck.categories bucket so the deck view reflects it right
+    // away without re-enrichment.
+    const moveCardCollectionToDeck = (deckName, binderName, rowIndex) => {
+      const binder = (groups.binders || []).find(b => b.name === binderName);
+      const target = (groups.decks   || []).find(d => d.name === deckName);
+      if (!binder || !target) return;
+      const row = (binder.cards || [])[rowIndex];
+      if (!row || (row.qty || 1) < 1) return;
+
+      // Slim Scryfall data for the printing — needed for the categories
+      // entry so we have type_line / img / mana_cost / color_identity.
+      const cache = getSFCache();
+      const slim = cache[(row.id   || "").toLowerCase()]?.d
+                || cache[(row.name || "").toLowerCase()]?.d
+                || null;
+
+      // 1) decrement / drop from binder
+      const nextBinderCards = (binder.cards || [])
+        .map((c, i) => i === rowIndex ? { ...c, qty: (c.qty || 1) - 1 } : c)
+        .filter(c => (c.qty || 0) > 0);
+
+      // 2) add to deck raw cards (merge by name)
+      let nextDeckCards = [...(target.cards || [])];
+      const dIdx = nextDeckCards.findIndex(c =>
+        (c.name || "").toLowerCase() === row.name.toLowerCase());
+      if (dIdx >= 0) {
+        nextDeckCards[dIdx] = { ...nextDeckCards[dIdx], qty: (nextDeckCards[dIdx].qty || 1) + 1 };
+      } else {
+        nextDeckCards.push({
+          name: row.name, qty: 1, id: row.id || "",
+          condition: row.condition || "NM",
+          finish: row.finish || "normal",
+          lang: row.lang || "en",
+          ...(row.misprint ? { misprint: true } : {}),
+        });
+      }
+
+      // 3) update enriched deckData.categories if present
+      let nextDeckData = target.deckData;
+      if (nextDeckData) {
+        const catName = categoryForType(slim?.type_line);
+        const newCat = (nextDeckData.categories || []).map(c => ({ ...c, cards: [...(c.cards || [])] }));
+        let cat = newCat.find(c => c.name === catName);
+        if (!cat) {
+          cat = { name: catName, cards: [] };
+          newCat.push(cat);
+        }
+        // Avoid duplicating if the card already appears in this category
+        // (e.g. user clicks twice quickly).
+        const alreadyThere = cat.cards.some(c => (c.name || "").toLowerCase() === row.name.toLowerCase());
+        if (!alreadyThere) {
+          cat.cards.push({
+            name: row.name,
+            mana_cost: slim?.mana_cost,
+            type_line: slim?.type_line,
+            cmc: slim?.cmc,
+            color_identity: slim?.color_identity || [],
+            img: slim?.image_uris?.small || slim?.card_faces?.[0]?.image_uris?.small || null,
+            reason: "Added from collection.",
+            category: catName,
+          });
+        }
+        nextDeckData = { ...nextDeckData, categories: newCat };
+      }
+
+      const nextBinders = (groups.binders || []).map(b =>
+        b.name === binderName ? { ...b, cards: nextBinderCards } : b);
+      const nextDecks = (groups.decks || []).map(d =>
+        d.name === deckName ? { ...d, cards: nextDeckCards, deckData: nextDeckData } : d);
+      persistGroups({ ...groups, binders: nextBinders, decks: nextDecks });
+
+      // If we're viewing this deck right now, refresh the in-memory deck
+      // object so the categories panel re-renders immediately.
+      if (deck && deck.theme === deckName && nextDeckData) {
+        setDeck(nextDeckData);
+      }
+      // Drop the binder's enriched cache so the binder view re-fetches the
+      // up-to-date counts the next time it opens.
+      setBinderEnriched(m => { const next = { ...m }; delete next[binderName]; return next; });
+    };
+
+    // Pull one copy of a named card out of the open deck and drop it into
+    // the Uncategorised binder (creating it if missing). Mirrors the
+    // structure of moveCardCollectionToDeck in reverse.
+    const moveCardDeckToCollection = (deckName, cardName, targetBinder) => {
+      const target = (groups.decks || []).find(d => d.name === deckName);
+      if (!target) return;
+      const dIdx = (target.cards || []).findIndex(c =>
+        (c.name || "").toLowerCase() === (cardName || "").toLowerCase());
+      const dRow = dIdx >= 0 ? target.cards[dIdx] : null;
+      // Best-effort recovery of slim Scryfall data so the binder row knows
+      // its printing-level fields (used elsewhere for filtering).
+      const cache = getSFCache();
+      const slim = cache[((dRow?.id) || "").toLowerCase()]?.d
+                || cache[(cardName || "").toLowerCase()]?.d
+                || null;
+
+      // 1) decrement the deck row (or drop it entirely)
+      let nextDeckCards = [...(target.cards || [])];
+      if (dIdx >= 0) {
+        const nextQty = (dRow.qty || 1) - 1;
+        if (nextQty <= 0) nextDeckCards.splice(dIdx, 1);
+        else nextDeckCards[dIdx] = { ...dRow, qty: nextQty };
+      }
+
+      // 2) remove the first matching card from deckData.categories so the
+      //    deck view loses one tile.
+      let nextDeckData = target.deckData;
+      if (nextDeckData) {
+        const newCats = (nextDeckData.categories || []).map(c => ({ ...c, cards: [...(c.cards || [])] }));
+        for (const cat of newCats) {
+          const i = cat.cards.findIndex(c => (c.name || "").toLowerCase() === cardName.toLowerCase());
+          if (i >= 0) { cat.cards.splice(i, 1); break; }
+        }
+        nextDeckData = { ...nextDeckData, categories: newCats.filter(c => c.cards.length > 0) };
+      }
+
+      // 3) move into the chosen (or auto-created) binder, merging on
+      //    {id, condition, finish, lang, misprint}.
+      const binderName = targetBinder || UNCATEGORISED;
+      let nextBinders = (groups.binders || []);
+      if (!nextBinders.some(b => b.name === binderName)) {
+        nextBinders = [...nextBinders, {
+          name: binderName, type: "binder", cards: [],
+          commanderName: null, source: "manual",
+        }];
+      }
+      nextBinders = nextBinders.map(b => {
+        if (b.name !== binderName) return b;
+        const cond  = dRow?.condition || "NM";
+        const fin   = dRow?.finish    || "normal";
+        const lang  = dRow?.lang      || "en";
+        const mis   = !!dRow?.misprint;
+        const idx = (b.cards || []).findIndex(c =>
+          (c.id || "") === (dRow?.id || "")
+          && (c.name || "").toLowerCase() === cardName.toLowerCase()
+          && (c.condition || "NM") === cond
+          && (c.finish || "normal") === fin
+          && !!c.misprint === mis
+          && (c.lang || "en") === lang);
+        let nextCards;
+        if (idx >= 0) {
+          nextCards = b.cards.map((c, i) => i === idx ? { ...c, qty: (c.qty || 1) + 1 } : c);
+        } else {
+          nextCards = [...(b.cards || []), {
+            name: cardName, qty: 1, id: dRow?.id || (slim?.id || ""),
+            condition: cond, finish: fin, lang,
+            ...(mis ? { misprint: true } : {}),
+          }];
+        }
+        return { ...b, cards: nextCards };
+      });
+
+      const nextDecks = (groups.decks || []).map(d =>
+        d.name === deckName ? { ...d, cards: nextDeckCards, deckData: nextDeckData } : d);
+
+      // Auto-include the destination binder so the moved-back card counts.
+      const nextBinInc = binInc[binderName] ? binInc : { ...binInc, [binderName]: true };
+      setBinInc(nextBinInc);
+      setBinderEnriched(m => { const next = { ...m }; delete next[binderName]; return next; });
+
+      persistGroups({ ...groups, binders: nextBinders, decks: nextDecks }, deckInc, nextBinInc);
+
+      if (deck && deck.theme === deckName && nextDeckData) {
+        setDeck(nextDeckData);
+      }
+    };
+
     const openDeck = (d) => {
       // Reset menu/rename state so it doesn't bleed across decks.
       setDeckMenuOpen(false);
@@ -7093,6 +7287,14 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       </button>
                     `;
                   })()}
+                  ${fromCollection && html`
+                    <button onClick=${() => { setAddToDeckQuery(""); setAddToDeckOpen(true); }}
+                      title="Pull a card from one of your binders into this deck"
+                      style=${{ ...btn, padding:"6px 14px", fontSize:11,
+                        background:"linear-gradient(135deg,#5a3a10,#a06030)" }}>
+                      ➕ Add from collection
+                    </button>
+                  `}
                   <button onClick=${exportDeck} style=${{ ...btnSec, padding:"6px 14px", fontSize:11 }}>
                     ⬇ Export .txt
                   </button>
@@ -7577,6 +7779,23 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             </div>
                             <div style=${{ color:"#7a5a3a", fontSize:10, lineHeight:1.4 }}>${card.reason}</div>
                           </div>
+                          ${fromCollection && !isBasic && html`
+                            <button class="deck-card-remove"
+                              onClick=${e => {
+                                e.stopPropagation();
+                                if (window.confirm(`Move "${card.name}" back into the Uncategorised binder?`)) {
+                                  moveCardDeckToCollection(deck.theme, card.name);
+                                }
+                              }}
+                              title="Move this card back into the collection"
+                              style=${{
+                                position:"absolute", top:4, right:4,
+                                background:"#fff", border:"1px solid #d8b890", borderRadius:6,
+                                padding:"2px 7px", fontSize:11, color:"#7a3010",
+                                cursor:"pointer", fontFamily:"inherit", lineHeight:1,
+                                boxShadow:"0 1px 3px rgba(0,0,0,0.15)",
+                              }}>↩</button>
+                          `}
                         </div>
                       `;
                     })}
@@ -8304,6 +8523,122 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           </div>
         </div>
       `}
+
+      <!-- ── Add card from collection to the open deck ────────────────────── -->
+      ${addToDeckOpen && deck && fromCollection && (() => {
+        const deckName = deck.theme;
+        // Flatten all binder rows into pickable entries. Each row knows
+        // which binder it came from so the click handler can find it back.
+        const q = (addToDeckQuery || "").trim().toLowerCase();
+        const allRows = [];
+        for (const b of (groups.binders || [])) {
+          (b.cards || []).forEach((row, i) => {
+            if ((row.qty || 0) <= 0) return;
+            if (q && !(row.name || "").toLowerCase().includes(q)) return;
+            allRows.push({ binder: b.name, rowIndex: i, row });
+          });
+        }
+        // Cap the rendered list so very large collections don't paint thousands of rows.
+        const SHOW = 80;
+        const visible = allRows.slice(0, SHOW);
+
+        const cache = getSFCache();
+        const slimOf = (row) =>
+          cache[(row.id || "").toLowerCase()]?.d
+          || cache[(row.name || "").toLowerCase()]?.d
+          || null;
+
+        const close = () => { setAddToDeckOpen(false); setAddToDeckQuery(""); };
+        return html`
+          <div onClick=${close}
+            style=${{
+              position:"fixed", inset:0, background:"rgba(20,10,0,0.45)",
+              display:"flex", alignItems:"flex-start", justifyContent:"center",
+              paddingTop:60, zIndex:9999,
+            }}>
+            <div onClick=${e => e.stopPropagation()}
+              style=${{
+                background:"#fffaf0", border:"1px solid #d8b890", borderRadius:12,
+                width:"min(720px, 94vw)", maxHeight:"82vh", overflow:"hidden",
+                boxShadow:"0 8px 32px rgba(0,0,0,0.35)",
+                display:"flex", flexDirection:"column",
+              }}>
+              <div style=${{
+                padding:"12px 16px", borderBottom:"1px solid #e8d8b8",
+                display:"flex", justifyContent:"space-between", alignItems:"center", gap:10,
+              }}>
+                <div>
+                  <div style=${{ fontSize:14, fontWeight:700, color:"#3a1a00" }}>
+                    Add card to "${deckName}"
+                  </div>
+                  <div style=${{ fontSize:11, color:"#8a6a4a", marginTop:2 }}>
+                    Pick a card from any binder — one copy moves into the deck.
+                  </div>
+                </div>
+                <button onClick=${close}
+                  style=${{ background:"transparent", border:"none", fontSize:20,
+                    cursor:"pointer", color:"#7a5a3a", padding:"0 4px", lineHeight:1 }}>✕</button>
+              </div>
+              <div style=${{ padding:"10px 16px", borderBottom:"1px solid #e8d8b8" }}>
+                <input type="text" autoFocus=${true}
+                  value=${addToDeckQuery}
+                  onInput=${e => setAddToDeckQuery(e.target.value)}
+                  placeholder="Filter by card name…"
+                  style=${{ ...inp, width:"100%", padding:"7px 10px", fontSize:13 }} />
+                <div style=${{ marginTop:6, fontSize:11, color:"#8a6a4a" }}>
+                  ${allRows.length === 0
+                    ? "No cards match in your binders."
+                    : `${allRows.length} match${allRows.length === 1 ? "" : "es"}${allRows.length > SHOW ? ` — showing first ${SHOW}` : ""}`}
+                </div>
+              </div>
+              <div style=${{ flex:1, overflowY:"auto", padding:"6px 8px" }}>
+                ${visible.map(({ binder: bn, rowIndex, row }) => {
+                  const slim = slimOf(row);
+                  const img = slim?.image_uris?.small || slim?.card_faces?.[0]?.image_uris?.small;
+                  return html`<div key=${bn + "::" + rowIndex}
+                    style=${{
+                      display:"flex", gap:10, alignItems:"center",
+                      padding:"6px 8px", borderRadius:8,
+                      borderBottom:"1px solid #f0e0c0",
+                    }}>
+                    ${img && html`<img src=${img}
+                      onMouseEnter=${e => showTooltip(e, slim.image_uris?.normal || img, row.name)}
+                      onMouseLeave=${hideTooltip}
+                      style=${{ width:34, height:48, objectFit:"cover", borderRadius:3, flexShrink:0, cursor:"zoom-in" }} />`}
+                    <div style=${{ flex:1, minWidth:0 }}>
+                      <div style=${{ fontSize:13, fontWeight:600, color:"#3a1a00",
+                        whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>${row.name}</div>
+                      <div style=${{ fontSize:10, color:"#8a6a4a",
+                        display:"inline-flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
+                        <span style=${{
+                          padding:"1px 6px", borderRadius:8, fontSize:9, fontWeight:700,
+                          background:"#fff0e0", color:"#5a3a1a",
+                        }}>📦 ${bn}</span>
+                        <${ConditionDot} code=${row.condition || "NM"} size=${8} />
+                        <span>${row.condition || "NM"}</span>
+                        <span>${(row.finish || "normal") === "foil" ? "✨ Foil" : "Normal"}</span>
+                        <span title=${LANGUAGES[row.lang || "en"]?.label || row.lang}>${LANGUAGES[row.lang || "en"]?.flag || "🏳️"} ${(row.lang || "en").toUpperCase()}</span>
+                        <span>· ×${row.qty}</span>
+                      </div>
+                    </div>
+                    <button onClick=${() => moveCardCollectionToDeck(deckName, bn, rowIndex)}
+                      style=${{ ...btn, fontSize:11, padding:"5px 10px" }}>
+                      → Add
+                    </button>
+                  </div>`;
+                })}
+              </div>
+              <div style=${{
+                padding:"10px 16px", borderTop:"1px solid #e8d8b8",
+                background:"#fff8ee",
+                display:"flex", justifyContent:"flex-end",
+              }}>
+                <button onClick=${close} style=${{ ...btnSec, fontSize:12, padding:"7px 14px" }}>Done</button>
+              </div>
+            </div>
+          </div>
+        `;
+      })()}
 
       <!-- ── Delete-binder modal: pick where the cards go ─────────────────── -->
       ${binderDeleteName && (() => {
