@@ -5517,6 +5517,45 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setPhase("deck");
     };
 
+    // Swap the displayed primary commander with the partner. Works for any
+    // deck where deck.partner is populated and both commanders have
+    // resolved Scryfall data. For an imported deck (i.e. it lives in
+    // groups.decks under deck.theme) the swap is persisted, so re-opening
+    // remembers the user's choice. For a precon preview it's in-memory.
+    const swapPartnerCommander = () => {
+      if (!deck?.partner?.card?.scryfall || !selCmd?.card?.scryfall) return;
+      const newSelCmd = {
+        ...selCmd,
+        name: deck.partner.name,
+        card: deck.partner.card,
+      };
+      const newPartner = {
+        name: selCmd.name,
+        card: selCmd.card,
+      };
+      setSelCmd(newSelCmd);
+      setDeck(d => ({ ...d, partner: newPartner }));
+      // Persist when this deck is part of the saved Collection / Library.
+      if (!previewingPrecon && deck?.theme) {
+        const matchName = deck.theme;
+        const updated = (groups.decks || []).map(d => {
+          if (d.name !== matchName) return d;
+          return {
+            ...d,
+            commanderName: newSelCmd.name,
+            partnerName: newPartner.name,
+            selCmd: newSelCmd,
+            partner: newPartner,
+            ...(d.deckData ? { deckData: { ...d.deckData, partner: newPartner } } : {}),
+          };
+        });
+        if (updated !== groups.decks) {
+          const next = { ...groups, decks: updated };
+          persistGroups(next);
+        }
+      }
+    };
+
     const resetHome = () => {
       setPhase("ready"); setDeck(null); setSelCmd(null);
       setCands([]); setLog([]); setEnriched([]); setDeckSvd(false);
@@ -5821,6 +5860,22 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         const isCommanderFormat = preconCategory(entry.type) === "commander";
         const fmt = isCommanderFormat ? "commander" : "casual";
 
+        // Build the fully-categorised deckData up front, mirroring what
+        // enrichImportedDeck would compute on first open. We pass the
+        // FRESH cache map (slimSF objects) we just populated so every
+        // card lookup hits — no re-fetch. EDHRec / Spellbook arrays stay
+        // empty; the user can opt-in to enrich a precon later if wanted.
+        let preconDeckData = null;
+        let preconSelCmd = null;
+        if (isCommanderFormat) {
+          const built = buildPreconDeckData(entry, detail, cache);
+          preconSelCmd = built.selCmd;
+          preconDeckData = built.deck;
+          // Override the preview-only theme name with the imported deck's
+          // unique name so the deck view header shows the user-visible name.
+          if (preconDeckData) preconDeckData.theme = deckName;
+        }
+
         const newDeck = {
           name: deckName,
           type: "deck",
@@ -5835,14 +5890,22 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           },
           tags: ["precon"],
           cards: rows,
+          // Cached deck-view data: opening this deck from the Collection
+          // skips enrichImportedDeck and lands on the deck view immediately.
+          ...(preconDeckData ? { deckData: preconDeckData, enrichedAt: Date.now() } : {}),
         };
-        if (isCommanderFormat && primary?.sf) {
+        if (preconSelCmd) {
+          newDeck.selCmd = preconSelCmd;
+        } else if (isCommanderFormat && primary?.sf) {
           newDeck.selCmd = {
             name: primary.name,
             card: { name: primary.name, scryfall: primary.sf },
             commanderCandidates: [],
           };
         }
+        // Partner: buildPreconDeckData already attached deck.partner if there
+        // are 2 commanders. Also stash partnerName + partner on the deck-entry
+        // top level for the Collection-overview badge / future Library lookup.
         if (isCommanderFormat && partner?.sf) {
           newDeck.partnerName = partner.name;
           newDeck.partner = {
@@ -5980,7 +6043,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   { label:"⚒ Forge",
                     active: (["pick", "building", "analyzing", "loading_cmdr"].includes(phase))
                       || (phase === "ready" && activeTab !== "home")
-                      || (phase === "deck" && !fromCollection && !fromSaved),
+                      || (phase === "deck" && !fromCollection && !fromSaved && !previewingPrecon),
                     onClick: () => { setPhase("ready"); setTab(activeTab === "home" ? "build" : activeTab); } },
                   { label:"📋 Collection",
                     active: phase==="select" || phase==="import" || phase==="binder_view" || phase==="precons" || (phase==="deck" && !!previewingPrecon),
@@ -6011,7 +6074,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                    deck-building flow (not on Home / dashboard). -->
               ${((["pick", "building", "analyzing", "loading_cmdr"].includes(phase))
                   || (phase === "ready" && activeTab !== "home")
-                  || (phase === "deck" && !fromCollection && !fromSaved)) && html`
+                  || (phase === "deck" && !fromCollection && !fromSaved && !previewingPrecon)) && html`
                 <div style=${{
                   display:"flex", gap:0, marginTop:6, paddingLeft:6, flexWrap:"wrap",
                   borderTop:"1px solid var(--header-overlay)",
@@ -6967,13 +7030,17 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       const total = cardTotal(d.cards);
                       const fmt = (d.format || "commander");
                       const isCmdr = fmt === "commander";
+                      // Partner deck → 2 commanders in the command zone, so
+                      // the maindeck-only side targets 98 (total still 100).
+                      const hasPartner = !!d.partner || !!d.partnerName;
                       const target = isCmdr ? 100 : 60;
+                      const cmdrMin = hasPartner ? 98 : 99;
                       const complete = isCmdr
-                        ? (total >= 99 && total <= 100)
+                        ? (total >= cmdrMin && total <= 100)
                         : (total >= target);
                       const badge = isCmdr
                         ? (total === 100 ? "✓ 100/100"
-                          : total === 99 ? "✓ 99 + cmdr"
+                          : total === cmdrMin ? (hasPartner ? "✓ 98 + 2 cmdrs" : "✓ 99 + cmdr")
                           : `${total}/100`)
                         : `${total}/${target}`;
                       const isGen = d.source === "generated" && d.deckData;
@@ -8670,8 +8737,22 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   padding:"14px 14px 20px",
                   boxShadow:"0 4px 20px rgba(0,0,0,0.12)",
                 }}>
-                  <div style=${{ fontSize:9, letterSpacing:3, color:"var(--accent-text)",
-                    textTransform:"uppercase", fontWeight:700, marginBottom:10 }}>👑 Commander</div>
+                  <div style=${{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
+                    <div style=${{ fontSize:9, letterSpacing:3, color:"var(--accent-text)",
+                      textTransform:"uppercase", fontWeight:700 }}>👑 Commander${deck.partner ? " · Partner" : ""}</div>
+                    ${deck.partner && deck.partner.card?.scryfall && html`
+                      <button onClick=${swapPartnerCommander}
+                        title=${`Switch primary commander to ${deck.partner.name}`}
+                        style=${{
+                          background:"var(--bg-surface-soft)", border:"1px solid var(--border)",
+                          borderRadius:14, padding:"3px 9px", fontFamily:"inherit", cursor:"pointer",
+                          fontSize:10, color:"var(--accent-dark)", fontWeight:700,
+                          display:"inline-flex", alignItems:"center", gap:4,
+                        }}>
+                        ⇄ ${deck.partner.name.split(",")[0]}
+                      </button>
+                    `}
+                  </div>
 
                   ${img && html`
                     <img src=${img} alt=${selCmd.card.name}
@@ -8863,14 +8944,19 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   <div style=${{ fontSize:11, color:"var(--fg-text-muted)" }}>
                     ${(() => {
                       const t = deck.categories.reduce((s,c) => s+c.cards.length, 0);
-                      const ok = t === 99;
+                      // Partner decks have two commanders in the command zone,
+                      // so the maindeck target is 98 instead of 99.
+                      const hasPartner = !!deck.partner;
+                      const target = hasPartner ? 98 : 99;
+                      const ok = t === target;
+                      const okLabel = hasPartner ? "✓ 98 + 2 commanders" : "✓ 99 + commander";
                       return html`
                         <span>${t} cards · ${deck.categories.length} categories</span>
                         <span style=${{
                           marginLeft:8, padding:"1px 8px", borderRadius:10, fontSize:10, fontWeight:700,
                           background: ok ? "var(--success-soft)" : "var(--warning-bg)",
                           color: ok ? "var(--success-text)" : "var(--warning)",
-                        }}>${ok ? "✓ 99 + commander" : `${t}/99 ⚠`}</span>
+                        }}>${ok ? okLabel : `${t}/${target} ⚠`}</span>
                       `;
                     })()}
                   </div>
