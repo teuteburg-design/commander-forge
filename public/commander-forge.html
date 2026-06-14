@@ -2392,7 +2392,6 @@
     const [preconLoading,   setPreconLoading]   = useState(false);
     const [preconError,     setPreconError]     = useState("");
     const [preconQuery,     setPreconQuery]     = useState("");
-    const [preconCategory,  setPreconCategory]  = useState("commander"); // "commander"|"theme"|"welcome"|"jumpstart"|"other"
     const [preconCollector, setPreconCollector] = useState(false);
     const [preconExpanded,  setPreconExpanded]  = useState(null);   // "<set>/<slug>" currently expanded, or null
     const [preconDetail,    setPreconDetail]    = useState({});     // { "set/slug": parsedDeck }
@@ -6888,16 +6887,13 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
           <!-- ── PRE-CON BROWSER (mtg.wtf) ─────────────────────────────── -->
           ${phase === "precons" && (() => {
-            const CATEGORIES = [
-              { id:"commander", label:"Commander (~100)" },
-              { id:"theme",     label:"Theme / Starter (~60)" },
-              { id:"welcome",   label:"Welcome (~30)" },
-              { id:"jumpstart", label:"Jumpstart (~20)" },
-              { id:"other",     label:"Other" },
-            ];
             const q = (preconQuery || "").trim().toLowerCase();
+            // The worker filters the index to Commander-format decks only,
+            // so all entries here are guaranteed ~100 cards. The local
+            // fallback parser produces every category — keep a guard so
+            // local dev still gets the same Commander-only view.
             const filtered = (preconIndex || []).filter(e => {
-              if (e.category !== preconCategory) return false;
+              if (e.category && e.category !== "commander") return false;
               if (!preconCollector && e.collector) return false;
               if (preconCollector && !e.collector) return false;
               if (!q) return true;
@@ -6921,8 +6917,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   <div>
                     <h2 style=${{ fontSize:18, color:"var(--fg-text-heading)", marginBottom:6 }}>Pre-constructed decks</h2>
                     <p style=${{ fontSize:13, color:"var(--fg-text-soft)", maxWidth:680, lineHeight:1.55 }}>
-                      Every Wizards-published preconstructed deck, sourced from <strong>mtg.wtf/deck</strong> and cached here.
-                      A daily refresh checks for new decks; you can also force one below. Partner decks bring both commanders in automatically.
+                      Wizards-published <strong>Commander pre-cons</strong> (~100 cards), sourced from <strong>mtg.wtf/deck</strong> and cached here.
+                      A monthly refresh sweeps for new releases; you can force one below. Partner decks bring both commanders in automatically.
                     </p>
                   </div>
                   <div style=${{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:6, flexShrink:0 }}>
@@ -6963,29 +6959,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 `}
 
                 ${preconIndex !== null && html`
-                  <!-- Category + collector + search row -->
+                  <!-- Collector toggle + search row (category fixed to Commander) -->
                   <div style=${{
                     marginBottom:14, display:"flex", flexWrap:"wrap", alignItems:"center", gap:10,
                   }}>
-                    <div style=${{ display:"flex", gap:4, flexWrap:"wrap" }}>
-                      ${CATEGORIES.map(c => {
-                        const active = preconCategory === c.id;
-                        const count = (preconIndex || []).filter(e => e.category === c.id
-                          && (preconCollector ? e.collector : !e.collector)).length;
-                        return html`
-                          <button key=${c.id} onClick=${() => setPreconCategory(c.id)}
-                            style=${{
-                              padding:"6px 12px", borderRadius:8, fontSize:12, fontFamily:"inherit", cursor:"pointer",
-                              border: active ? "1px solid var(--accent)" : "1px solid var(--border)",
-                              background: active ? "var(--accent)" : "var(--bg-surface)",
-                              color: active ? "var(--on-accent)" : "var(--fg-text-body)",
-                              fontWeight: active ? 700 : 500,
-                            }}>
-                            ${c.label}${count > 0 ? ` · ${count}` : ""}
-                          </button>
-                        `;
-                      })}
-                    </div>
                     <label style=${{ display:"inline-flex", alignItems:"center", gap:6, cursor:"pointer", fontSize:12, color:"var(--fg-text-body)" }}>
                       <input type="checkbox" checked=${preconCollector}
                         onChange=${e => setPreconCollector(e.target.checked)}

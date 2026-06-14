@@ -288,7 +288,16 @@ async function refreshPrecons(env, { reason = "unknown", force = false } = {}) {
 
   const startedAt = Date.now();
   const indexHtml = await fetchText("https://mtg.wtf/deck", "index");
-  const upstream  = parseMtgWtfIndexHtml(indexHtml);
+  // Filter to Commander-format decks only. mtg.wtf lists Welcome / Jumpstart /
+  // Starter Kit / MTGO Redemption / Planeswalker decks etc. alongside, but
+  // those aren't useful as Commander Forge sources. Commander products land
+  // at 99–111 cards depending on the bundle (Commander Legends is 100,
+  // standard precon is 100 inc. the commander, some retail packs are 99).
+  const upstream = parseMtgWtfIndexHtml(indexHtml).filter(e =>
+    e.category === "commander"
+    && typeof e.cardCount === "number"
+    && e.cardCount >= 95 && e.cardCount <= 115
+  );
 
   const current = await readPreconIndex(env);
   const seenKey = new Map();
