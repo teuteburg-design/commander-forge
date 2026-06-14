@@ -426,6 +426,43 @@
     return { suggestions: [], status: "network", slug, http: lastHttp, error: lastErr };
   }
 
+  // Fetch the EDHRec top-salt page and return { saltByName, status }.
+  // saltByName: Map<lowercaseCardName, saltScore (0..4)>. Covers the top ~200
+  // saltiest cards in EDH — enough to score most decks' meaningful saltiness,
+  // since cards outside that list are by definition not salty. Cards not in
+  // the map are treated as salt 0 by callers.
+  async function fetchEDHRecSalt() {
+    const target = "https://json.edhrec.com/pages/top/salt.json";
+    for (const { name, wrap } of EDHREC_PROXIES) {
+      let r;
+      try { r = await fetch(wrap(target)); }
+      catch { continue; }
+      if (!r.ok) continue;
+      let data;
+      try { data = await r.json(); } catch { continue; }
+      const cardlists = data?.container?.json_dict?.cardlists || [];
+      const m = new Map();
+      cardlists.forEach(list => {
+        (list.cardviews || []).forEach(cv => {
+          if (!cv.name) return;
+          // EDHRec stores salt on cardviews as either `salt` or `label`.
+          // The /top/salt page uses `salt` (number 0..4). Fall back to
+          // parsing the label string ("salt 3.42") just in case.
+          let salt = typeof cv.salt === "number" ? cv.salt : null;
+          if (salt == null && typeof cv.label === "string") {
+            const m2 = cv.label.match(/([0-9]+(?:\.[0-9]+)?)/);
+            if (m2) salt = parseFloat(m2[1]);
+          }
+          if (typeof salt === "number" && !Number.isNaN(salt)) {
+            m.set(cv.name.toLowerCase(), salt);
+          }
+        });
+      });
+      if (m.size > 0) return { saltByName: m, status: "ok", via: name };
+    }
+    return { saltByName: new Map(), status: "network" };
+  }
+
   // ── Commander Spellbook ──────────────────────────────────────────────────────
   // Public combo database. Given a commander + card pool, returns:
   //   - `have`:   combos achievable with cards already in the pool
@@ -1822,6 +1859,7 @@
     // We enrich on-demand the first time a binder is opened, then keep results
     // in memory for instant return visits.
     const [collQuery,       setCollQuery]       = useState("");
+    const [saltMap,         setSaltMap]         = useState(null); // Map<lcName, salt> | null while loading
     const [viewingBinder,   setViewingBinder]   = useState(null);
     const [binderEnriched,  setBinderEnriched]  = useState({});
     const [binderLoading,   setBinderLoading]   = useState(false);
@@ -2180,7 +2218,7 @@
       reader.onerror = () => setError("Couldn't read that file — paste the contents instead.");
       reader.readAsText(file);
     };
-    const [activeTab,setTab]      = useState("build");
+    const [activeTab,setTab]      = useState("home");
     const [log,      setLog]      = useState([]);
     const [progress, setProg]     = useState(0);
     const [error,    setError]    = useState("");
@@ -2563,6 +2601,19 @@
         window.scrollTo({ top: 0 });
       }
     }, [phase]);
+
+    // Lazy-fetch the EDHRec top-salt map once on first ready/select view —
+    // it powers the "Most salty deck" stat on the Forge dashboard. We don't
+    // block the UI on it; the stat just hides until the map arrives.
+    useEffect(() => {
+      if (saltMap !== null) return;
+      if (!["ready","select","saved_list","deck","binder_view"].includes(phase)) return;
+      let cancelled = false;
+      fetchEDHRecSalt().then(({ saltByName }) => {
+        if (!cancelled) setSaltMap(saltByName);
+      }).catch(() => { if (!cancelled) setSaltMap(new Map()); });
+      return () => { cancelled = true; };
+    }, [phase, saltMap]);
 
     // Track scroll, viewport width and header height.
     useEffect(() => {
@@ -4931,7 +4982,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setPhase("ready"); setDeck(null); setSelCmd(null);
       setCands([]); setLog([]); setEnriched([]); setDeckSvd(false);
       setLibSaved(false); setFromSaved(false); setFromCollection(false); setUnsavedDeck(null);
-      setError(""); setTab("build");
+      setError(""); setTab("home");
     };
 
     const navToCollection = () => {
@@ -6719,6 +6770,274 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           <!-- ── READY (home hub) ──────────────────────────────────────── -->
           ${phase === "ready" && html`
             <div>
+              <!-- Home / Dashboard tab -->
+              ${activeTab === "home" && (() => {
+                // ── Aggregate stats from current groups ───────────────────
+                const allBinderCards = (groups.binders || []).flatMap(b => b.cards || []);
+                const allDeckCards   = (groups.decks   || []).flatMap(d => d.cards || []);
+                const totalQty = (cards) => cards.reduce((s, c) => s + (c.qty || 1), 0);
+                const binderQty = totalQty(allBinderCards);
+                const deckQty   = totalQty(allDeckCards);
+                const totalQtyAll = binderQty + deckQty;
+                const uniqueNames = new Set([
+                  ...allBinderCards.map(c => c.name?.toLowerCase()).filter(Boolean),
+                  ...allDeckCards.map(c => c.name?.toLowerCase()).filter(Boolean),
+                ]);
+                const deckCardNames = new Set(allDeckCards.map(c => c.name?.toLowerCase()).filter(Boolean));
+                const unusedQty = allBinderCards
+                  .filter(c => !deckCardNames.has((c.name || "").toLowerCase()))
+                  .reduce((s, c) => s + (c.qty || 1), 0);
+
+                // Cards by color — uses enriched binder data when available;
+                // when binders haven't been opened, we silently fall back to
+                // counting only cards we already have scryfall info for.
+                const colorCounts = { W:0, U:0, B:0, R:0, G:0, C:0 };
+                let coloredCount = 0;
+                Object.values(binderEnriched || {}).forEach(rows => {
+                  (rows || []).forEach(c => {
+                    const ci = c.scryfall?.color_identity;
+                    if (!Array.isArray(ci)) return;
+                    coloredCount++;
+                    if (ci.length === 0) colorCounts.C += (c.qty || 1);
+                    else ci.forEach(col => { if (colorCounts[col] != null) colorCounts[col] += (c.qty || 1); });
+                  });
+                });
+
+                // ── Per-deck price + salt ─────────────────────────────────
+                const deckPrice = (d) => {
+                  if (d.deckData?.prices?.tcg) return d.deckData.prices.tcg;
+                  if (d.deckData?.prices?.cardmarket) return d.deckData.prices.cardmarket;
+                  // Fall back to summing scryfall usd from enriched cards.
+                  let s = 0, hits = 0;
+                  (d.cards || []).forEach(c => {
+                    const usd = parseFloat(c.scryfall?.prices?.usd || "");
+                    if (!Number.isNaN(usd)) { s += usd * (c.qty || 1); hits++; }
+                  });
+                  return hits > 0 ? Math.round(s * 100) / 100 : null;
+                };
+                const deckSalt = (d) => {
+                  if (d.deckData?.salt != null) return d.deckData.salt;
+                  if (!saltMap || saltMap.size === 0) return null;
+                  let s = 0, hits = 0;
+                  (d.cards || []).forEach(c => {
+                    const v = saltMap.get((c.name || "").toLowerCase());
+                    if (typeof v === "number") { s += v * (c.qty || 1); hits++; }
+                  });
+                  return hits > 0 ? Math.round(s * 100) / 100 : 0;
+                };
+                const isFullDeck = (d) => {
+                  const t = totalQty(d.cards || []);
+                  const fmt = d.format || "commander";
+                  return fmt === "commander" ? (t >= 99 && t <= 100) : (t >= 60);
+                };
+                const enrichedDecks = (groups.decks || []).map(d => ({
+                  d, price: deckPrice(d), salt: deckSalt(d), full: isFullDeck(d),
+                }));
+                const decksWithPrice = enrichedDecks.filter(x => typeof x.price === "number");
+                const totalDeckValue = decksWithPrice.reduce((s, x) => s + x.price, 0);
+                const mostExpensive = decksWithPrice.length
+                  ? [...decksWithPrice].sort((a, b) => b.price - a.price)[0] : null;
+                const cheapestFull  = decksWithPrice.filter(x => x.full).length
+                  ? [...decksWithPrice].filter(x => x.full).sort((a, b) => a.price - b.price)[0] : null;
+                const decksWithSalt = enrichedDecks.filter(x => typeof x.salt === "number" && x.salt > 0);
+                const saltiest = decksWithSalt.length
+                  ? [...decksWithSalt].sort((a, b) => b.salt - a.salt)[0] : null;
+
+                const onUpdate = () => { setCsv(""); setError(""); setPhase("import"); };
+                const onCheck  = () => setPhase("saved_list");
+                const onForge  = () => setTab("build");
+
+                const actionCard = (icon, title, sub, onClick, accent) => html`
+                  <button onClick=${onClick} style=${{
+                    flex:"1 1 220px", background:"#fff", border:`1px solid ${accent}`,
+                    borderRadius:12, padding:"18px 18px", cursor:"pointer", fontFamily:"inherit",
+                    textAlign:"left", boxShadow:"0 1px 4px rgba(0,0,0,0.05)",
+                    transition:"transform .12s, box-shadow .12s",
+                  }}
+                  onMouseOver=${e => { e.currentTarget.style.transform="translateY(-2px)"; e.currentTarget.style.boxShadow="0 6px 16px rgba(0,0,0,0.10)"; }}
+                  onMouseOut=${e => { e.currentTarget.style.transform=""; e.currentTarget.style.boxShadow="0 1px 4px rgba(0,0,0,0.05)"; }}
+                  >
+                    <div style=${{ fontSize:22, marginBottom:8 }}>${icon}</div>
+                    <div style=${{ fontSize:15, fontWeight:700, color:"#2a1000", marginBottom:4 }}>${title}</div>
+                    <div style=${{ fontSize:11, color:"#7a5a3a", lineHeight:1.5 }}>${sub}</div>
+                  </button>
+                `;
+
+                const statTile = (label, value, sub, tone) => html`
+                  <div style=${{
+                    background:"#fff", border:"1px solid #e0c890",
+                    borderTop:`3px solid ${tone || "#7a2e0e"}`,
+                    borderRadius:8, padding:"12px 14px", minWidth:0,
+                  }}>
+                    <div style=${{ fontSize:10, letterSpacing:1.5, color:"#8a6a4a",
+                      textTransform:"uppercase", fontWeight:700, marginBottom:6 }}>${label}</div>
+                    <div style=${{ fontSize:20, fontWeight:700, color:"#2a1000",
+                      lineHeight:1.2, wordBreak:"break-word" }}>${value}</div>
+                    ${sub && html`<div style=${{ fontSize:11, color:"#7a5a3a", marginTop:4, lineHeight:1.4 }}>${sub}</div>`}
+                  </div>
+                `;
+
+                return html`
+                  <div>
+                    <!-- Action cards -->
+                    <div style=${{ display:"flex", gap:14, marginBottom:24, flexWrap:"wrap" }}>
+                      ${actionCard("⚒", "Forge a new deck",
+                        "Pick a commander, set archetypes, let the AI build a 99-card deck from your collection.",
+                        onForge, "#c07030")}
+                      ${actionCard("⬆", "Update collection",
+                        "Re-import your Manabox / Moxfield CSV to refresh card counts and printings.",
+                        onUpdate, "#7a8a3a")}
+                      ${actionCard("📚", "Check your decks",
+                        `Browse your ${(library.length + (groups.decks?.length || 0))} saved decks and edit, analyse, or share them.`,
+                        onCheck, "#3a6a9a")}
+                    </div>
+
+                    <!-- Stats grid -->
+                    <div style=${{ ...label, marginBottom:10 }}>Collection at a glance</div>
+                    <div style=${{
+                      display:"grid",
+                      gridTemplateColumns:"repeat(auto-fill, minmax(180px, 1fr))",
+                      gap:12, marginBottom:24,
+                    }}>
+                      ${statTile("Total cards",
+                        totalQtyAll.toLocaleString(),
+                        `${uniqueNames.size.toLocaleString()} unique`)}
+                      ${statTile("Unused cards",
+                        unusedQty.toLocaleString(),
+                        "In binders, not in any deck")}
+                      ${statTile("Binders",
+                        (groups.binders || []).length.toLocaleString(),
+                        binderQty > 0 ? `${binderQty.toLocaleString()} cards` : null,
+                        "#7a8a3a")}
+                      ${statTile("Decks",
+                        (groups.decks || []).length.toLocaleString(),
+                        deckQty > 0 ? `${deckQty.toLocaleString()} cards` : null,
+                        "#3a6a9a")}
+                    </div>
+
+                    <!-- Color breakdown -->
+                    ${coloredCount > 0 && html`
+                      <div style=${{
+                        background:"#fff", border:"1px solid #e0c890", borderRadius:8,
+                        padding:"14px 16px", marginBottom:24,
+                      }}>
+                        <div style=${{ ...label, marginBottom:10 }}>Cards by colour</div>
+                        <div style=${{ display:"flex", gap:18, flexWrap:"wrap" }}>
+                          ${["W","U","B","R","G","C"].map(c => html`
+                            <div key=${c} style=${{ display:"flex", alignItems:"center", gap:6 }}>
+                              <${Pip} c=${c} size=${22} />
+                              <span style=${{ fontSize:14, fontWeight:700, color:"#2a1000" }}>
+                                ${colorCounts[c].toLocaleString()}
+                              </span>
+                            </div>
+                          `)}
+                        </div>
+                        <div style=${{ fontSize:11, color:"#8a6a4a", marginTop:8, fontStyle:"italic" }}>
+                          Based on binders you've opened (Scryfall data cached). Open more binders to see the full picture.
+                        </div>
+                      </div>
+                    `}
+
+                    <!-- Deck highlights -->
+                    ${enrichedDecks.length > 0 && html`
+                      <div style=${{ ...label, marginBottom:10 }}>Deck highlights</div>
+                      <div style=${{
+                        display:"grid",
+                        gridTemplateColumns:"repeat(auto-fill, minmax(220px, 1fr))",
+                        gap:12, marginBottom:24,
+                      }}>
+                        ${mostExpensive && html`
+                          <div onClick=${() => openDeck(mostExpensive.d)} style=${{
+                            background:"#fff", border:"1px solid #e0c890",
+                            borderTop:"3px solid #c08030", borderRadius:8,
+                            padding:"12px 14px", cursor:"pointer",
+                          }} title="Open deck">
+                            <div style=${{ fontSize:10, letterSpacing:1.5, color:"#8a6a4a",
+                              textTransform:"uppercase", fontWeight:700, marginBottom:4 }}>💰 Most expensive</div>
+                            <div style=${{ fontSize:14, fontWeight:700, color:"#2a1000",
+                              whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                              ${mostExpensive.d.name}
+                            </div>
+                            <div style=${{ fontSize:12, color:"#7a3010", marginTop:4 }}>
+                              $${mostExpensive.price.toLocaleString(undefined, { minimumFractionDigits:2, maximumFractionDigits:2 })}
+                            </div>
+                          </div>
+                        `}
+                        ${saltiest && html`
+                          <div onClick=${() => openDeck(saltiest.d)} style=${{
+                            background:"#fff", border:"1px solid #e0c890",
+                            borderTop:"3px solid #a04040", borderRadius:8,
+                            padding:"12px 14px", cursor:"pointer",
+                          }} title="Open deck">
+                            <div style=${{ fontSize:10, letterSpacing:1.5, color:"#8a6a4a",
+                              textTransform:"uppercase", fontWeight:700, marginBottom:4 }}>🧂 Saltiest</div>
+                            <div style=${{ fontSize:14, fontWeight:700, color:"#2a1000",
+                              whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                              ${saltiest.d.name}
+                            </div>
+                            <div style=${{ fontSize:12, color:"#a04040", marginTop:4 }}>
+                              salt ${saltiest.salt.toFixed(2)}
+                            </div>
+                          </div>
+                        `}
+                        ${cheapestFull && html`
+                          <div onClick=${() => openDeck(cheapestFull.d)} style=${{
+                            background:"#fff", border:"1px solid #e0c890",
+                            borderTop:"3px solid #5a8a40", borderRadius:8,
+                            padding:"12px 14px", cursor:"pointer",
+                          }} title="Open deck">
+                            <div style=${{ fontSize:10, letterSpacing:1.5, color:"#8a6a4a",
+                              textTransform:"uppercase", fontWeight:700, marginBottom:4 }}>🪙 Best budget (complete)</div>
+                            <div style=${{ fontSize:14, fontWeight:700, color:"#2a1000",
+                              whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                              ${cheapestFull.d.name}
+                            </div>
+                            <div style=${{ fontSize:12, color:"#5a8a40", marginTop:4 }}>
+                              $${cheapestFull.price.toLocaleString(undefined, { minimumFractionDigits:2, maximumFractionDigits:2 })}
+                            </div>
+                          </div>
+                        `}
+                        ${decksWithPrice.length > 0 && html`
+                          <div style=${{
+                            background:"#fff", border:"1px solid #e0c890",
+                            borderTop:"3px solid #6a6a8a", borderRadius:8,
+                            padding:"12px 14px",
+                          }}>
+                            <div style=${{ fontSize:10, letterSpacing:1.5, color:"#8a6a4a",
+                              textTransform:"uppercase", fontWeight:700, marginBottom:4 }}>Total deck value</div>
+                            <div style=${{ fontSize:18, fontWeight:700, color:"#2a1000" }}>
+                              $${totalDeckValue.toLocaleString(undefined, { minimumFractionDigits:2, maximumFractionDigits:2 })}
+                            </div>
+                            <div style=${{ fontSize:11, color:"#7a5a3a", marginTop:4 }}>
+                              Across ${decksWithPrice.length} priced deck${decksWithPrice.length === 1 ? "" : "s"}
+                            </div>
+                          </div>
+                        `}
+                      </div>
+                      ${!saltiest && saltMap && saltMap.size > 0 && html`
+                        <div style=${{ fontSize:11, color:"#8a6a4a", marginTop:-12, marginBottom:18, fontStyle:"italic" }}>
+                          No salt scores yet — saltiest deck appears once you have decks with cards in the EDHRec top-salt list.
+                        </div>
+                      `}
+                      ${!saltMap && html`
+                        <div style=${{ fontSize:11, color:"#8a6a4a", marginTop:-12, marginBottom:18, fontStyle:"italic" }}>
+                          Loading salt scores from EDHRec…
+                        </div>
+                      `}
+                    `}
+
+                    ${enrichedDecks.length === 0 && (groups.binders || []).length === 0 && html`
+                      <div style=${{
+                        background:"#fff8ee", border:"1px dashed #d8b870", borderRadius:8,
+                        padding:"18px 20px", color:"#7a5a3a", fontSize:13,
+                      }}>
+                        Your collection is empty. Start by importing a CSV (Update collection) or by creating a binder from the Collection page.
+                      </div>
+                    `}
+                  </div>
+                `;
+              })()}
+
               <!-- Build tab -->
               ${activeTab === "build" && html`
                 <div>
