@@ -114,7 +114,9 @@ export default {
 const KV_PRECON_INDEX  = "precons:index";          // { updated, entries: [...] }
 const KV_PRECON_DECK   = (set, slug) => `precons:deck:${set}/${slug}`;
 const KV_PRECON_LOCK   = "precons:lock";           // simple in-flight marker
-const PRECON_MAX_PARALLEL = 4;                     // simultaneous /download fetches
+const PRECON_MAX_PARALLEL    = 4;     // simultaneous /download fetches
+const PRECON_STREAK_CUTOFF   = 30;    // stop scanning after this many already-cached in a row
+const PRECON_MAX_DOWNLOADS   = 60;    // hard ceiling on /download fetches per refresh run
 
 async function fetchText(url, label = "") {
   const r = await fetch(url, {
@@ -294,21 +296,38 @@ async function refreshPrecons(env, { reason = "unknown", force = false } = {}) {
     seenKey.set(`${e.set}/${e.slug}`, e);
   });
 
-  // Find entries that are new OR whose visible metadata changed.
+  // The /deck page is chronological — newest at top. Walk top-down and
+  // identify entries that are new OR whose visible metadata changed.
+  // Once we've seen PRECON_STREAK_CUTOFF already-cached entries in a row,
+  // assume the tail is unchanged and stop scanning (the cron will re-pick
+  // up anything missed, and individual cache misses lazy-fill via
+  // handlePreconDeck). Cap total /download fetches per run so the first
+  // populate (everything dirty, ~2700 entries) doesn't blow past the
+  // worker's CPU budget.
   const dirty = [];
+  let streak = 0;
+  let scanned = 0;
+  let truncated = false;
   for (const u of upstream) {
+    scanned++;
     const k = `${u.set}/${u.slug}`;
     const old = seenKey.get(k);
-    if (!old
-        || old.name !== u.name
-        || old.type !== u.type
-        || old.cardCount !== u.cardCount
-        || old.setName !== u.setName) {
-      dirty.push(u);
+    const unchanged = old
+      && old.name === u.name
+      && old.type === u.type
+      && old.cardCount === u.cardCount
+      && old.setName === u.setName;
+    if (unchanged) {
+      streak++;
+      if (streak >= PRECON_STREAK_CUTOFF) { truncated = true; break; }
+      continue;
     }
+    streak = 0;
+    dirty.push(u);
+    if (dirty.length >= PRECON_MAX_DOWNLOADS) { truncated = true; break; }
   }
 
-  // Limited parallelism so we don't DOS mtg.wtf (or hit worker subrequest caps).
+  // Limited parallelism so we don't DOS mtg.wtf or hit worker subrequest caps.
   let downloaded = 0;
   let failed = 0;
   for (let i = 0; i < dirty.length; i += PRECON_MAX_PARALLEL) {
@@ -326,13 +345,18 @@ async function refreshPrecons(env, { reason = "unknown", force = false } = {}) {
   }
 
   // Write the new index. We always store the FULL upstream listing (not a
-  // diff) so the client gets a consistent snapshot.
+  // diff) so the client gets a consistent snapshot even when /download
+  // fetches were capped.
   const indexDoc = {
     updated: Date.now(),
     upstreamCount: upstream.length,
     cachedDecks: upstream.length,
     entries: upstream,
-    lastRefresh: { reason, startedAt, finishedAt: Date.now(), downloaded, failed, dirty: dirty.length },
+    lastRefresh: {
+      reason, startedAt, finishedAt: Date.now(),
+      scanned, dirty: dirty.length, downloaded, failed, truncated,
+      streakCutoff: PRECON_STREAK_CUTOFF, downloadCap: PRECON_MAX_DOWNLOADS,
+    },
   };
   await env.STATE.put(KV_PRECON_INDEX, JSON.stringify(indexDoc));
   await env.STATE.delete(KV_PRECON_LOCK);
