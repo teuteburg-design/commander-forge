@@ -37,6 +37,7 @@ const PROXY_ROUTES = {
   // <astro-island component-export="Main"> element's props attribute — the
   // client parses it out. We just need to sidestep CORS.
   "/manabox-share/": "https://manabox.app",
+  "/mtgwtf/":        "https://mtg.wtf",
 };
 
 // EDHRec / Cloudflare-fronted endpoints reject "default fetch" UAs. Pretending

@@ -671,7 +671,8 @@
     // for unknown hosts so other proxies can pick up the request.
     { name: "local", wrap: u => u
         .replace(/^https?:\/\/json\.edhrec\.com/,             "/edhrec")
-        .replace(/^https?:\/\/backend\.commanderspellbook\.com/, "/spellbook") },
+        .replace(/^https?:\/\/backend\.commanderspellbook\.com/, "/spellbook")
+        .replace(/^https?:\/\/mtg\.wtf/,                      "/mtgwtf") },
     { name: "direct",         wrap: u => u },
     { name: "corsproxy.io",   wrap: u => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
     { name: "allorigins.win", wrap: u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
@@ -731,6 +732,225 @@
     }
 
     return { suggestions: [], status: "network", slug, http: lastHttp, error: lastErr };
+  }
+
+  // ── mtg.wtf precon source ────────────────────────────────────────────────
+  // mtg.wtf publishes every Wizards-printed preconstructed deck as HTML —
+  // no JSON API. We fetch and parse the HTML through the same proxy chain
+  // used for EDHRec to sidestep CORS. The site groups decks by product;
+  // each deck has a /deck/{set_code}/{slug} permalink.
+
+  // Shared helper: fetch HTML through the EDHREC_PROXIES chain. Returns
+  // { html, via } on success, throws on full failure.
+  async function fetchHtmlViaProxies(target) {
+    let lastErr = null;
+    for (const { name, wrap } of EDHREC_PROXIES) {
+      try {
+        const r = await fetch(wrap(target), { headers: { "Accept": "text/html" } });
+        if (!r.ok) { lastErr = `${name}: HTTP ${r.status}`; continue; }
+        const text = await r.text();
+        if (text && text.length > 200) return { html: text, via: name };
+        lastErr = `${name}: empty body`;
+      } catch (e) {
+        lastErr = `${name}: ${(e.message || "network").slice(0, 80)}`;
+      }
+    }
+    throw new Error(lastErr || "All proxies failed");
+  }
+
+  // Decode HTML entities (&amp; &#39; etc.) — used after parsing card names.
+  function decodeEntities(s) {
+    if (!s) return s;
+    const e = document.createElement("textarea");
+    e.innerHTML = s;
+    return e.value;
+  }
+
+  // Bucket a deck-type string into one of our user-facing categories.
+  // mtg.wtf's `type` field varies a lot ("Commander Deck", "Theme Deck",
+  // "Welcome Deck", "Jumpstart", "Starter Kit", etc.).
+  function preconCategory(type) {
+    const t = (type || "").toLowerCase();
+    if (t.includes("commander")) return "commander";
+    if (t.includes("welcome")) return "welcome";
+    if (t.includes("jumpstart")) return "jumpstart";
+    if (t.includes("theme") || t.includes("starter") || t.includes("challenger")
+        || t.includes("planeswalker deck") || t.includes("planeswalker pack")) return "theme";
+    return "other";
+  }
+
+  // Parse the /deck index page into [{ set, slug, name, type, cardCount,
+  // setName, collector }] entries. The page is markdown-converted by the
+  // proxy/fetch chain into a flat HTML tree; we use DOMParser to walk it.
+  function parseMtgWtfIndex(html) {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    // Each set is an <h3> (or <h2>/<h4> depending on the markup) followed
+    // by an <ul> of <li> entries. Be liberal about heading levels.
+    const out = [];
+    let currentSet = null;
+    let currentSetCode = null;
+    const root = doc.body || doc;
+    const walk = (node) => {
+      for (const child of Array.from(node.children || [])) {
+        const tag = child.tagName?.toLowerCase();
+        if (/^h[1-6]$/.test(tag || "")) {
+          // Heading: pick up the set name. If the heading contains a link
+          // to /set/<code> we can grab the code; otherwise fall back to slug.
+          const setLink = child.querySelector('a[href^="/set/"]');
+          if (setLink) {
+            const m = setLink.getAttribute("href").match(/\/set\/([^/]+)/);
+            currentSetCode = m ? m[1] : null;
+          }
+          currentSet = (child.textContent || "").trim();
+        } else if (tag === "ul" && currentSet) {
+          for (const li of Array.from(child.querySelectorAll("li"))) {
+            // Entries look like:
+            //   <li><a href="/deck/<set>/<slug>">Deck Name</a> — Commander Deck (100 cards)</li>
+            const a = li.querySelector('a[href^="/deck/"]');
+            if (!a) continue;
+            const href = a.getAttribute("href") || "";
+            const m = href.match(/^\/deck\/([^/]+)\/([^/?#]+)/);
+            if (!m) continue;
+            const setCode = m[1].toLowerCase();
+            const slug = m[2];
+            const name = decodeEntities((a.textContent || "").trim());
+            const tail = decodeEntities((li.textContent || "").replace(name, "").trim().replace(/^[—–-]\s*/, ""));
+            // tail looks like "Commander Deck (100 cards)"
+            const cardMatch = tail.match(/\((\d+)\s*cards?\)/i);
+            const cardCount = cardMatch ? parseInt(cardMatch[1], 10) : null;
+            const type = tail.replace(/\(.*?\)/g, "").trim();
+            const setName = currentSet || setCode;
+            const collector = /collector/i.test(setName) || /collector/i.test(name);
+            out.push({
+              set: setCode, slug, name, type, cardCount,
+              setName, collector,
+              category: preconCategory(type),
+            });
+          }
+        } else if (child.children?.length) {
+          walk(child);
+        }
+      }
+    };
+    walk(root);
+    return out;
+  }
+
+  // Parse a single /deck/<set>/<slug> page into { name, setName, type,
+  // releasedAt, commanders: [name], partners: bool, cards: [{name, qty,
+  // section}] }. mtg.wtf groups cards by section headers ("Commander (1)",
+  // "Creature (29)", "Land (38)", etc.). Card lines look like:
+  //   1 [Captain America, Team Leader {U}{R}{W}](/card/msc/5/Captain-America-Team-Leader)
+  // …or in raw HTML: <li>1 <a href="/card/...">Captain America, Team Leader</a> {U}{R}{W}</li>
+  function parseMtgWtfDeck(html) {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    // Title: first <h4> or <h1> usually carries the deck name.
+    const titleEl = doc.querySelector("h1, h2, h3, h4");
+    const name = titleEl ? decodeEntities(titleEl.textContent.trim()) : "Untitled deck";
+    // Metadata line (sibling after title): "<Set Name> — <Type> — <date>".
+    let setName = "", type = "", releasedAt = "";
+    const meta = titleEl?.nextElementSibling;
+    if (meta) {
+      const parts = decodeEntities(meta.textContent.trim()).split(/\s+[—–-]\s+/);
+      setName = parts[0] || "";
+      type = parts[1] || "";
+      releasedAt = parts[parts.length - 1] || "";
+    }
+
+    // Walk headings + lists. Build sections.
+    const commanders = [];
+    const cards = [];
+    let currentSection = null;
+    const root = doc.body || doc;
+    const walk = (node) => {
+      for (const child of Array.from(node.children || [])) {
+        const tag = child.tagName?.toLowerCase();
+        if (/^h[3-6]$/.test(tag || "")) {
+          currentSection = (child.textContent || "").trim();
+        } else if (tag === "ul" && currentSection) {
+          const isCommanderSection = /^commander\b/i.test(currentSection);
+          for (const li of Array.from(child.querySelectorAll(":scope > li"))) {
+            // Get the card link first, then the leading qty + the card name.
+            const a = li.querySelector('a[href^="/card/"]');
+            if (!a) continue;
+            const cardName = decodeEntities(a.textContent.trim());
+            // Quantity is the leading number in the li's text content.
+            const txt = (li.textContent || "").trim();
+            const qm = txt.match(/^(\d+)/);
+            const qty = qm ? parseInt(qm[1], 10) : 1;
+            const entry = { name: cardName, qty, section: currentSection };
+            if (isCommanderSection) commanders.push(cardName);
+            else cards.push(entry);
+          }
+        } else if (child.children?.length) {
+          walk(child);
+        }
+      }
+    };
+    walk(root);
+
+    return {
+      name, setName, type, releasedAt,
+      commanders,
+      partners: commanders.length >= 2,
+      cards,
+    };
+  }
+
+  async function fetchMtgWtfIndex() {
+    const { html, via } = await fetchHtmlViaProxies("https://mtg.wtf/deck");
+    const entries = parseMtgWtfIndex(html);
+    return { entries, via };
+  }
+
+  async function fetchMtgWtfDeck(setCode, slug) {
+    const url = `https://mtg.wtf/deck/${encodeURIComponent(setCode)}/${encodeURIComponent(slug)}`;
+    const { html, via } = await fetchHtmlViaProxies(url);
+    const deck = parseMtgWtfDeck(html);
+    return { deck, via, url };
+  }
+
+  // Resolve a list of card names → Scryfall card objects. Uses the local
+  // SF cache first; falls back to Scryfall's /cards/collection bulk endpoint
+  // (up to 75 IDs per call). Returns Map<lowercaseName, scryfallCard>.
+  async function resolveCardsByName(names) {
+    const out = new Map();
+    const cache = getSFCache();
+    const ts = Date.now();
+    const misses = [];
+    for (const n of names) {
+      const key = (n || "").toLowerCase();
+      if (!key || out.has(key)) continue;
+      const hit = cache[key];
+      if (hit?.d && (ts - hit.ts) < SF_CACHE_TTL) {
+        out.set(key, hit.d);
+      } else {
+        misses.push(n);
+      }
+    }
+    // Batch unknown names through /cards/collection.
+    for (let i = 0; i < misses.length; i += 75) {
+      const batch = misses.slice(i, i + 75);
+      try {
+        const r = await fetch("https://api.scryfall.com/cards/collection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ identifiers: batch.map(n => ({ name: n })) }),
+        });
+        if (!r.ok) continue;
+        const j = await r.json();
+        (j.data || []).forEach(c => {
+          try {
+            const slim = slimSF(c);
+            cache[(c.id   || "").toLowerCase()] = { d: slim, ts };
+            cache[(c.name || "").toLowerCase()] = { d: slim, ts };
+            out.set((c.name || "").toLowerCase(), slim);
+          } catch {}
+        });
+      } catch {}
+    }
+    try { setSFCache(cache); } catch {}
+    return out;
   }
 
   // ── Commander Spellbook ──────────────────────────────────────────────────────
@@ -2132,13 +2352,15 @@
     const [theme,           setTheme]           = useState(() => {
       try { return localStorage.getItem(LS_THEME) || "parchment"; } catch { return "parchment"; }
     });
-    const [preconSets,      setPreconSets]      = useState(null);  // null = not fetched, [] = loaded empty, [...] = data
+    const [preconIndex,     setPreconIndex]     = useState(null);  // null=not fetched, [...] = mtg.wtf deck entries
     const [preconLoading,   setPreconLoading]   = useState(false);
     const [preconError,     setPreconError]     = useState("");
     const [preconQuery,     setPreconQuery]     = useState("");
-    const [preconExpanded,  setPreconExpanded]  = useState(null);   // currently expanded set code, or null
-    const [preconCardsBySet,setPreconCardsBySet]= useState({});     // { [setCode]: scryfallCards[] }
-    const [preconImporting, setPreconImporting] = useState(null);   // setCode while importing
+    const [preconCategory,  setPreconCategory]  = useState("commander"); // "commander"|"theme"|"welcome"|"jumpstart"|"other"
+    const [preconCollector, setPreconCollector] = useState(false);
+    const [preconExpanded,  setPreconExpanded]  = useState(null);   // "<set>/<slug>" currently expanded, or null
+    const [preconDetail,    setPreconDetail]    = useState({});     // { "set/slug": parsedDeck }
+    const [preconImporting, setPreconImporting] = useState(null);   // "set/slug" while importing
     const [viewingBinder,   setViewingBinder]   = useState(null);
     const [binderEnriched,  setBinderEnriched]  = useState({});
     const [binderLoading,   setBinderLoading]   = useState(false);
@@ -5264,114 +5486,135 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       else setPhase("import");
     };
 
-    // ── Pre-con browser ──────────────────────────────────────────────────────
-    // Scryfall's /sets endpoint returns every set; we filter to set_type
-    // 'commander' (the official Wizards Commander pre-constructed products).
-    const fetchPreconSets = async () => {
-      if (preconSets !== null) return;
+    // ── Pre-con browser (mtg.wtf source) ─────────────────────────────────────
+    // mtg.wtf's /deck page lists every Wizards-published preconstructed deck.
+    // We pull the listing once, parse it, then fetch individual decks on
+    // demand. Card-name → Scryfall lookup happens at import time so the
+    // resulting deck row carries colour identity, art and pricing.
+
+    const loadPreconIndex = async () => {
+      if (preconIndex !== null) return;
       setPreconLoading(true); setPreconError("");
       try {
-        const r = await fetch("https://api.scryfall.com/sets");
-        if (!r.ok) throw new Error(`Scryfall: HTTP ${r.status}`);
-        const j = await r.json();
-        const data = (j.data || [])
-          .filter(s => s.set_type === "commander")
-          .sort((a, b) => (b.released_at || "").localeCompare(a.released_at || ""));
-        setPreconSets(data);
+        const { entries } = await fetchMtgWtfIndex();
+        setPreconIndex(entries);
       } catch (e) {
-        setPreconError(e.message || "Failed to load pre-con sets");
-        setPreconSets([]);
+        setPreconError(e.message || "Failed to load pre-con list");
+        setPreconIndex([]);
       } finally {
         setPreconLoading(false);
       }
     };
 
-    // Fetch all cards in a Scryfall set, paginated.
-    const fetchPreconCards = async (setCode) => {
-      if (preconCardsBySet[setCode]) return preconCardsBySet[setCode];
-      const out = [];
-      let url = `https://api.scryfall.com/cards/search?q=${encodeURIComponent("e:"+setCode)}&unique=cards&order=set&include_extras=true`;
-      let safety = 0;
-      while (url && safety++ < 20) {
-        const r = await fetch(url);
-        if (!r.ok) {
-          if (r.status === 404) break; // set with no cards
-          throw new Error(`Scryfall: HTTP ${r.status}`);
-        }
-        const j = await r.json();
-        (j.data || []).forEach(c => out.push(c));
-        url = j.has_more ? j.next_page : null;
-      }
-      setPreconCardsBySet(prev => ({ ...prev, [setCode]: out }));
-      return out;
-    };
-
-    const togglePreconExpand = async (setCode) => {
-      if (preconExpanded === setCode) { setPreconExpanded(null); return; }
-      setPreconExpanded(setCode);
-      if (!preconCardsBySet[setCode]) {
-        try { await fetchPreconCards(setCode); }
-        catch (e) { setPreconError(e.message); }
-      }
-    };
-
-    // A card in a precon set counts as a 'commander candidate' if it's a
-    // legendary creature, OR a planeswalker whose oracle text says it can
-    // be your commander. Mirrors Scryfall's is:commander heuristic.
-    const isPreconCommander = (c) => {
-      const t = (c.type_line || "").toLowerCase();
-      if (t.includes("legendary") && t.includes("creature")) return true;
-      if (t.includes("planeswalker") && /can be your commander/i.test(c.oracle_text || "")) return true;
-      return false;
-    };
-
-    // Create a new Deck (Commander format) seeded with the chosen commander
-    // and every card from the precon set. The deck is overstuffed when the
-    // set bundles multiple precons, so the user can prune in deck view. The
-    // commander itself is excluded from the 99 so its qty:1 stays in selCmd
-    // rather than the maindeck.
-    const importPreconAsDeck = async (set, commander) => {
-      setPreconImporting(set.code + "::" + commander.id);
-      setPreconError("");
-      try {
-        const cards = preconCardsBySet[set.code] || await fetchPreconCards(set.code);
-        const deckName = uniqueName(`${commander.name} (${set.name})`, (groups.decks || []).map(d => d.name));
-        const ts = Date.now();
-        const cache = getSFCache();
-        const rows = cards
-          .filter(p => p.id !== commander.id)
-          .map(p => {
-            try {
-              const slim = slimSF(p);
-              cache[(p.id   || "").toLowerCase()] = { d: slim, ts };
-              cache[(p.name || "").toLowerCase()] = { d: slim, ts };
-            } catch {}
-            return { name: p.name, qty: 1, id: p.id, condition:"NM", finish:"normal", lang:"en" };
-          });
-        // Cache the commander too so badges render without an extra fetch.
+    const togglePreconExpand = async (key, entry) => {
+      if (preconExpanded === key) { setPreconExpanded(null); return; }
+      setPreconExpanded(key);
+      if (!preconDetail[key]) {
         try {
-          const slim = slimSF(commander);
-          cache[(commander.id   || "").toLowerCase()] = { d: slim, ts };
-          cache[(commander.name || "").toLowerCase()] = { d: slim, ts };
-          setSFCache(cache);
-        } catch {}
+          const { deck } = await fetchMtgWtfDeck(entry.set, entry.slug);
+          setPreconDetail(prev => ({ ...prev, [key]: deck }));
+          // Resolve just the commanders so the preview shows colour identity.
+          // Full card resolution happens at import time.
+          if (deck.commanders.length) {
+            try { await resolveCardsByName(deck.commanders); } catch {}
+            // Bump state so the row re-renders with the cached Scryfall data.
+            setPreconDetail(prev => ({ ...prev }));
+          }
+        } catch (e) {
+          setPreconError(e.message);
+        }
+      }
+    };
+
+    // Build a deck (Commander format when applicable) from a parsed mtg.wtf
+    // entry. Handles Partner decks: when the source lists 2 commanders we
+    // store the second under deck.partner mirroring selCmd's shape.
+    const importPreconAsDeck = async (entry) => {
+      const key = entry.set + "/" + entry.slug;
+      setPreconImporting(key); setPreconError("");
+      try {
+        const detail = preconDetail[key] || (await fetchMtgWtfDeck(entry.set, entry.slug)).deck;
+        if (!preconDetail[key]) setPreconDetail(prev => ({ ...prev, [key]: detail }));
+
+        // Resolve every card name (commanders + main) to Scryfall objects.
+        const allNames = [...detail.commanders, ...detail.cards.map(c => c.name)];
+        const resolved = await resolveCardsByName(allNames);
+        const findSF = (name) => resolved.get((name || "").toLowerCase()) || null;
+
+        const cmdrSFs = detail.commanders.map(n => ({ name: n, sf: findSF(n) }));
+        const primary = cmdrSFs[0];
+        const partner = cmdrSFs[1];
+
+        // Title: "A + B (Set)" for partners, "A (Set)" otherwise.
+        const cmdrTitle = cmdrSFs.length >= 2
+          ? `${primary.name} + ${partner.name}`
+          : (primary?.name || detail.name);
+        const baseName = `${cmdrTitle} (${detail.setName || entry.setName || entry.set.toUpperCase()})`;
+        const deckName = uniqueName(baseName, (groups.decks || []).map(d => d.name));
+
+        // Slim + cache every resolved Scryfall card so the deck renders
+        // colour identity / image badges without an extra fetch later.
+        const cache = getSFCache();
+        const ts = Date.now();
+        for (const [, sf] of resolved) {
+          if (!sf) continue;
+          try {
+            cache[(sf.id   || "").toLowerCase()] = { d: sf, ts };
+            cache[(sf.name || "").toLowerCase()] = { d: sf, ts };
+          } catch {}
+        }
+        try { setSFCache(cache); } catch {}
+
+        // Card rows: everything in detail.cards becomes deck rows with the
+        // mtg.wtf qty. Use Scryfall id when we have it (so the deck row
+        // shows printing-specific data) and fall back to name-only otherwise.
+        const rows = detail.cards.map(c => {
+          const sf = findSF(c.name);
+          return {
+            name: c.name,
+            qty:  c.qty || 1,
+            ...(sf?.id ? { id: sf.id } : {}),
+            condition: "NM",
+            finish: "normal",
+            lang: "en",
+          };
+        });
+
+        const isCommanderFormat = preconCategory(entry.type) === "commander";
+        const fmt = isCommanderFormat ? "commander" : "casual";
+
         const newDeck = {
           name: deckName,
           type: "deck",
-          format: "commander",
-          commanderName: commander.name,
+          format: fmt,
+          commanderName: isCommanderFormat ? primary?.name : null,
           source: "precon",
-          precon: { set: set.code, released_at: set.released_at },
-          tags: ["precon"],
-          selCmd: {
-            name: commander.name,
-            card: { name: commander.name, scryfall: commander },
-            commanderCandidates: [],
+          precon: {
+            set: entry.set,
+            slug: entry.slug,
+            released_at: detail.releasedAt || null,
+            mtgwtf_type: detail.type || entry.type,
           },
+          tags: ["precon"],
           cards: rows,
         };
+        if (isCommanderFormat && primary?.sf) {
+          newDeck.selCmd = {
+            name: primary.name,
+            card: { name: primary.name, scryfall: primary.sf },
+            commanderCandidates: [],
+          };
+        }
+        if (isCommanderFormat && partner?.sf) {
+          newDeck.partnerName = partner.name;
+          newDeck.partner = {
+            name: partner.name,
+            card: { name: partner.name, scryfall: partner.sf },
+          };
+        }
+
         const nextGroups = { ...groups, decks: [...(groups.decks || []), newDeck] };
-        const nextDeckInc = { ...deckInc, [deckName]: false }; // locked by default like other decks
+        const nextDeckInc = { ...deckInc, [deckName]: false };
         setDeckInc(nextDeckInc);
         persistGroups(nextGroups, nextDeckInc, binInc);
         setPreconImporting(null);
@@ -5382,12 +5625,12 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       }
     };
 
-    // Auto-fetch the set list when the user enters the precons phase.
+    // Auto-fetch the index when the user enters the precons phase.
     useEffect(() => {
-      if (phase === "precons" && preconSets === null && !preconLoading) {
-        fetchPreconSets();
+      if (phase === "precons" && preconIndex === null && !preconLoading) {
+        loadPreconIndex();
       }
-    }, [phase, preconSets, preconLoading]);
+    }, [phase, preconIndex, preconLoading]);
 
     // ── Shared loading screen ────────────────────────────────────────────────
     const isLoading = ["loading_cmdr","analyzing","building","enriching"].includes(phase);
@@ -6560,24 +6803,44 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           `;
           })()}
 
-          <!-- ── PRE-CON BROWSER ───────────────────────────────────────── -->
+          <!-- ── PRE-CON BROWSER (mtg.wtf) ─────────────────────────────── -->
           ${phase === "precons" && (() => {
+            const CATEGORIES = [
+              { id:"commander", label:"Commander (~100)" },
+              { id:"theme",     label:"Theme / Starter (~60)" },
+              { id:"welcome",   label:"Welcome (~30)" },
+              { id:"jumpstart", label:"Jumpstart (~20)" },
+              { id:"other",     label:"Other" },
+            ];
             const q = (preconQuery || "").trim().toLowerCase();
-            const sets = (preconSets || []).filter(s => {
+            const filtered = (preconIndex || []).filter(e => {
+              if (e.category !== preconCategory) return false;
+              if (!preconCollector && e.collector) return false;
+              if (preconCollector && !e.collector) return false;
               if (!q) return true;
-              return s.name.toLowerCase().includes(q)
-                  || (s.code || "").toLowerCase().includes(q)
-                  || (s.released_at || "").includes(q);
+              return e.name.toLowerCase().includes(q)
+                  || (e.setName || "").toLowerCase().includes(q)
+                  || (e.set || "").toLowerCase().includes(q)
+                  || (e.type || "").toLowerCase().includes(q);
             });
-            const fmtDate = s => (s || "").slice(0, 10);
+            // Group filtered entries by set for nicer browsing.
+            const bySet = new Map();
+            filtered.forEach(e => {
+              const k = e.setName || e.set;
+              if (!bySet.has(k)) bySet.set(k, []);
+              bySet.get(k).push(e);
+            });
+            const groupedSets = [...bySet.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+
             return html`
               <div style=${{ maxWidth:1080, margin:"0 auto" }}>
                 <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:12, marginBottom:16 }}>
                   <div>
                     <h2 style=${{ fontSize:18, color:"var(--fg-text-heading)", marginBottom:6 }}>Pre-constructed decks</h2>
-                    <p style=${{ fontSize:13, color:"var(--fg-text-soft)", maxWidth:640, lineHeight:1.55 }}>
-                      Wizards-published Commander pre-cons sourced from Scryfall. Each set typically ships several decks bundled together.
-                      Importing adds every card in the set to a new binder so you can split, edit, and forge from it.
+                    <p style=${{ fontSize:13, color:"var(--fg-text-soft)", maxWidth:680, lineHeight:1.55 }}>
+                      Every Wizards-published preconstructed deck, sourced from <strong>mtg.wtf/deck</strong>.
+                      Pick a category, expand any deck to preview the decklist, then import as a Commander deck.
+                      Partner decks bring both commanders in automatically.
                     </p>
                   </div>
                 </div>
@@ -6589,185 +6852,196 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   }}>${preconError}</div>
                 `}
 
-                ${preconLoading && preconSets === null && html`
+                ${preconLoading && preconIndex === null && html`
                   <div style=${{
                     padding:"40px 20px", textAlign:"center", color:"var(--fg-text-soft)", fontSize:13,
-                  }}>Loading pre-con sets from Scryfall…</div>
+                  }}>Loading deck list from mtg.wtf…</div>
                 `}
 
-                ${preconSets !== null && html`
+                ${preconIndex !== null && html`
+                  <!-- Category + collector + search row -->
                   <div style=${{
-                    marginBottom:14, display:"flex", alignItems:"center", gap:10,
-                    background:"var(--bg-surface)", border:"1px solid var(--border-neutral)", borderRadius:8,
-                    padding:"8px 12px",
+                    marginBottom:14, display:"flex", flexWrap:"wrap", alignItems:"center", gap:10,
                   }}>
-                    <span style=${{ fontSize:14, color:"var(--fg-text-muted)" }}>🔍</span>
-                    <input type="search" value=${preconQuery}
-                      onInput=${e => setPreconQuery(e.target.value)}
-                      placeholder="Search by set name, code, or release year…"
-                      style=${{
-                        flex:1, border:"none", outline:"none", background:"transparent",
-                        fontFamily:"inherit", fontSize:13, color:"var(--fg-text)", padding:0,
-                      }} />
-                    <span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}>
-                      ${sets.length} of ${preconSets.length} sets
-                    </span>
-                  </div>
-
-                  <div style=${{ display:"flex", flexDirection:"column", gap:8 }}>
-                    ${sets.map(s => {
-                      const expanded = preconExpanded === s.code;
-                      const cards = preconCardsBySet[s.code] || null;
-                      const commanders = cards ? cards.filter(isPreconCommander) : null;
-                      const importedDeckCount = (groups.decks || []).filter(d => d.precon?.set === s.code).length;
-                      return html`
-                        <div key=${s.code} style=${{
-                          background:"var(--bg-surface)", border:"1px solid var(--border-neutral)", borderRadius:8,
-                          overflow:"hidden",
-                        }}>
-                          <div onClick=${() => togglePreconExpand(s.code)}
+                    <div style=${{ display:"flex", gap:4, flexWrap:"wrap" }}>
+                      ${CATEGORIES.map(c => {
+                        const active = preconCategory === c.id;
+                        const count = (preconIndex || []).filter(e => e.category === c.id
+                          && (preconCollector ? e.collector : !e.collector)).length;
+                        return html`
+                          <button key=${c.id} onClick=${() => setPreconCategory(c.id)}
                             style=${{
-                              display:"flex", alignItems:"center", gap:14,
-                              padding:"12px 16px", cursor:"pointer",
-                              background: expanded ? "var(--bg-surface-soft)" : "var(--bg-surface)",
+                              padding:"6px 12px", borderRadius:8, fontSize:12, fontFamily:"inherit", cursor:"pointer",
+                              border: active ? "1px solid var(--accent)" : "1px solid var(--border)",
+                              background: active ? "var(--accent)" : "var(--bg-surface)",
+                              color: active ? "var(--on-accent)" : "var(--fg-text-body)",
+                              fontWeight: active ? 700 : 500,
                             }}>
-                            ${s.icon_svg_uri && html`
-                              <img src=${s.icon_svg_uri} alt="" style=${{ width:28, height:28, objectFit:"contain", flexShrink:0 }} />
-                            `}
-                            <div style=${{ flex:1, minWidth:0 }}>
-                              <div style=${{ fontSize:14, fontWeight:700, color:"var(--fg-text-strong)",
-                                whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
-                                ${s.name}
-                              </div>
-                              <div style=${{ fontSize:11, color:"var(--fg-text-soft)", marginTop:2 }}>
-                                ${(s.code || "").toUpperCase()} · ${fmtDate(s.released_at)} · ${s.card_count || "?"} cards
-                                ${importedDeckCount > 0 && html`<span style=${{
-                                  marginLeft:8, padding:"1px 7px", borderRadius:10, fontSize:10,
-                                  background:"var(--success-bg)", color:"var(--success-text)", fontWeight:600,
-                                }}>${importedDeckCount} deck${importedDeckCount===1?"":"s"} imported</span>`}
-                              </div>
-                            </div>
-                            <span style=${{ fontSize:12, color:"var(--fg-text-soft)", flexShrink:0 }}>${expanded ? "▲" : "▼"}</span>
-                          </div>
-                          ${expanded && html`
-                            <div style=${{
-                              padding:"10px 16px 14px", borderTop:"1px solid var(--border-pale)",
-                              background:"var(--bg-surface-soft)",
-                            }}>
-                              ${!cards && html`
-                                <div style=${{ fontSize:12, color:"var(--fg-text-soft)", padding:"10px 0" }}>
-                                  Loading cards…
-                                </div>
-                              `}
-                              ${cards && cards.length === 0 && html`
-                                <div style=${{ fontSize:12, color:"var(--fg-text-soft)" }}>No cards found for this set.</div>
-                              `}
-
-                              ${commanders && commanders.length > 0 && html`
-                                <div style=${{ ...label, marginTop:0, marginBottom:8 }}>
-                                  Pick a commander to import as a deck
-                                </div>
-                                <div style=${{
-                                  display:"grid",
-                                  gridTemplateColumns:"repeat(auto-fill, minmax(220px, 1fr))",
-                                  gap:8, marginBottom:14,
-                                }}>
-                                  ${commanders.map(cmd => {
-                                    const importing = preconImporting === (s.code + "::" + cmd.id);
-                                    const art = cmd.image_uris?.art_crop
-                                             || cmd.card_faces?.[0]?.image_uris?.art_crop
-                                             || cmd.image_uris?.small
-                                             || cmd.card_faces?.[0]?.image_uris?.small || null;
-                                    const ci = cmd.color_identity || [];
-                                    const alreadyHere = (groups.decks || []).some(d => d.precon?.set === s.code && d.commanderName === cmd.name);
-                                    return html`
-                                      <div key=${cmd.id} style=${{
-                                        background:"var(--bg-surface)", border:"1px solid var(--border-neutral)",
-                                        borderRadius:8, overflow:"hidden",
-                                        display:"flex", flexDirection:"column",
-                                      }}>
-                                        ${art && html`
-                                          <img src=${art} alt="" style=${{
-                                            width:"100%", height:80, objectFit:"cover",
-                                            display:"block",
-                                          }} />
-                                        `}
-                                        <div style=${{ padding:"8px 10px", flex:1, display:"flex", flexDirection:"column", gap:6 }}>
-                                          <div style=${{ fontSize:12, fontWeight:700, color:"var(--fg-text-strong)",
-                                            whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }} title=${cmd.name}>
-                                            ${cmd.name}
-                                          </div>
-                                          <div style=${{ display:"flex", alignItems:"center", gap:4, minHeight:18 }}>
-                                            ${ci.map(c => html`<${Pip} key=${c} c=${c} size=${14} />`)}
-                                            ${ci.length === 0 && html`<${Pip} c=${"C"} size=${14} />`}
-                                          </div>
-                                          <button onClick=${() => importPreconAsDeck(s, cmd)}
-                                            disabled=${importing || alreadyHere}
-                                            style=${{
-                                              ...btn, fontSize:11, padding:"5px 10px", whiteSpace:"nowrap",
-                                              opacity: (importing || alreadyHere) ? 0.55 : 1,
-                                              cursor: importing ? "wait" : alreadyHere ? "default" : "pointer",
-                                            }}>
-                                            ${importing ? "Importing…" : alreadyHere ? "✓ Deck created" : "+ Import as deck"}
-                                          </button>
-                                        </div>
-                                      </div>
-                                    `;
-                                  })}
-                                </div>
-                              `}
-
-                              ${commanders && commanders.length === 0 && cards && cards.length > 0 && html`
-                                <div style=${{ fontSize:12, color:"var(--fg-text-soft)", marginBottom:12, fontStyle:"italic" }}>
-                                  No legendary commander candidates found in this set.
-                                </div>
-                              `}
-
-                              ${cards && cards.length > 0 && html`
-                                <div style=${{ ...label, marginTop:6, marginBottom:6 }}>
-                                  All cards in this set (${cards.length})
-                                </div>
-                                <div style=${{
-                                  display:"grid",
-                                  gridTemplateColumns:"repeat(auto-fill, minmax(220px, 1fr))",
-                                  gap:6,
-                                  maxHeight:300, overflow:"auto",
-                                  paddingRight:6,
-                                }}>
-                                  ${cards.slice(0, 200).map(c => html`
-                                    <div key=${c.id} style=${{
-                                      display:"flex", alignItems:"center", gap:6,
-                                      fontSize:11, color:"var(--fg-text-heading)", padding:"3px 6px",
-                                      background:"var(--bg-surface)", border:"1px solid var(--border-pale)",
-                                      borderRadius:6, minWidth:0,
-                                    }}>
-                                      <span style=${{ flex:1, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
-                                        ${c.name}
-                                      </span>
-                                      ${typeof c.cmc === "number" && html`
-                                        <span style=${{ fontSize:10, color:"var(--fg-text-muted)", flexShrink:0 }}>${c.cmc}</span>
-                                      `}
-                                    </div>
-                                  `)}
-                                </div>
-                                ${cards.length > 200 && html`
-                                  <div style=${{ fontSize:11, color:"var(--fg-text-muted)", marginTop:6, fontStyle:"italic" }}>
-                                    Showing first 200 of ${cards.length}.
-                                  </div>
-                                `}
-                              `}
-                            </div>
-                          `}
-                        </div>
-                      `;
-                    })}
+                            ${c.label}${count > 0 ? ` · ${count}` : ""}
+                          </button>
+                        `;
+                      })}
+                    </div>
+                    <label style=${{ display:"inline-flex", alignItems:"center", gap:6, cursor:"pointer", fontSize:12, color:"var(--fg-text-body)" }}>
+                      <input type="checkbox" checked=${preconCollector}
+                        onChange=${e => setPreconCollector(e.target.checked)}
+                        style=${{ accentColor:"var(--accent)", cursor:"pointer" }} />
+                      Collector editions
+                    </label>
+                    <div style=${{
+                      flex:1, minWidth:200, display:"flex", alignItems:"center", gap:8,
+                      background:"var(--bg-surface)", border:"1px solid var(--border-neutral)", borderRadius:8,
+                      padding:"6px 10px",
+                    }}>
+                      <span style=${{ fontSize:13, color:"var(--fg-text-muted)" }}>🔍</span>
+                      <input type="search" value=${preconQuery}
+                        onInput=${e => setPreconQuery(e.target.value)}
+                        placeholder="Search deck or product…"
+                        style=${{
+                          flex:1, border:"none", outline:"none", background:"transparent",
+                          fontFamily:"inherit", fontSize:13, color:"var(--fg-text)", padding:0,
+                        }} />
+                      <span style=${{ fontSize:11, color:"var(--fg-text-muted)", whiteSpace:"nowrap" }}>
+                        ${filtered.length} deck${filtered.length===1?"":"s"}
+                      </span>
+                    </div>
                   </div>
 
-                  ${sets.length === 0 && preconSets.length > 0 && html`
+                  ${groupedSets.length === 0 && html`
                     <div style=${{ padding:"30px 20px", textAlign:"center", color:"var(--fg-text-muted)", fontSize:13 }}>
-                      No sets match "${preconQuery}".
+                      No decks match the current filters.
                     </div>
                   `}
+
+                  <div style=${{ display:"flex", flexDirection:"column", gap:14 }}>
+                    ${groupedSets.map(([setName, entries]) => html`
+                      <div key=${setName} style=${{
+                        background:"var(--bg-surface-soft)", border:"1px solid var(--border-neutral)",
+                        borderRadius:8, padding:"10px 12px",
+                      }}>
+                        <div style=${{ fontSize:13, fontWeight:700, color:"var(--fg-text-strong)", marginBottom:8 }}>
+                          ${setName} <span style=${{ color:"var(--fg-text-muted)", fontWeight:400, fontSize:11 }}>· ${entries.length} deck${entries.length===1?"":"s"}</span>
+                        </div>
+                        <div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
+                          ${entries.map(entry => {
+                            const key = entry.set + "/" + entry.slug;
+                            const expanded = preconExpanded === key;
+                            const detail = preconDetail[key] || null;
+                            const importing = preconImporting === key;
+                            const alreadyHere = (groups.decks || []).some(d => d.precon?.set === entry.set && d.precon?.slug === entry.slug);
+                            const resolved = detail ? (() => {
+                              const cache = getSFCache();
+                              return detail.commanders.map(n => ({
+                                name: n,
+                                sf: cache[n.toLowerCase()]?.d || null,
+                              }));
+                            })() : null;
+                            return html`
+                              <div key=${key} style=${{
+                                background:"var(--bg-surface)", border:"1px solid var(--border-pale)",
+                                borderRadius:6, overflow:"hidden",
+                              }}>
+                                <div onClick=${() => togglePreconExpand(key, entry)}
+                                  style=${{
+                                    display:"flex", alignItems:"center", gap:10,
+                                    padding:"8px 12px", cursor:"pointer",
+                                    background: expanded ? "var(--bg-surface-soft)" : "var(--bg-surface)",
+                                  }}>
+                                  <div style=${{ flex:1, minWidth:0 }}>
+                                    <div style=${{ fontSize:13, fontWeight:600, color:"var(--fg-text-strong)",
+                                      whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                                      ${entry.name}
+                                    </div>
+                                    <div style=${{ fontSize:11, color:"var(--fg-text-soft)", marginTop:1 }}>
+                                      ${entry.type}${entry.cardCount ? ` · ${entry.cardCount} cards` : ""}
+                                      ${alreadyHere && html`<span style=${{
+                                        marginLeft:8, padding:"1px 7px", borderRadius:10, fontSize:10,
+                                        background:"var(--success-bg)", color:"var(--success-text)", fontWeight:600,
+                                      }}>imported</span>`}
+                                    </div>
+                                  </div>
+                                  <button onClick=${(e) => { e.stopPropagation(); importPreconAsDeck(entry); }}
+                                    disabled=${importing || alreadyHere}
+                                    style=${{
+                                      ...btn, fontSize:11, padding:"5px 10px", whiteSpace:"nowrap",
+                                      opacity: (importing || alreadyHere) ? 0.55 : 1,
+                                      cursor: importing ? "wait" : alreadyHere ? "default" : "pointer",
+                                    }}>
+                                    ${importing ? "Importing…" : alreadyHere ? "✓ Imported" : "+ Import as deck"}
+                                  </button>
+                                  <span style=${{ fontSize:12, color:"var(--fg-text-soft)", flexShrink:0 }}>${expanded ? "▲" : "▼"}</span>
+                                </div>
+
+                                ${expanded && html`
+                                  <div style=${{
+                                    padding:"10px 14px 12px", borderTop:"1px solid var(--border-pale)",
+                                    background:"var(--bg-surface-soft)",
+                                  }}>
+                                    ${!detail && html`
+                                      <div style=${{ fontSize:12, color:"var(--fg-text-soft)", padding:"6px 0" }}>
+                                        Loading decklist…
+                                      </div>
+                                    `}
+                                    ${detail && html`
+                                      ${detail.commanders.length > 0 && html`
+                                        <div style=${{ ...label, marginTop:0, marginBottom:6 }}>
+                                          Commander${detail.commanders.length > 1 ? "s" : ""}${detail.partners ? " (Partner)" : ""}
+                                        </div>
+                                        <div style=${{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:10 }}>
+                                          ${resolved.map(r => html`
+                                            <div key=${r.name} style=${{
+                                              display:"flex", alignItems:"center", gap:6,
+                                              padding:"4px 8px", borderRadius:6,
+                                              background:"var(--bg-surface)", border:"1px solid var(--border-pale)",
+                                            }}>
+                                              <span style=${{ fontSize:12, fontWeight:600, color:"var(--fg-text-strong)" }}>${r.name}</span>
+                                              ${r.sf?.color_identity && html`
+                                                <span style=${{ display:"inline-flex", gap:2 }}>
+                                                  ${(r.sf.color_identity || []).map(c => html`<${Pip} key=${c} c=${c} size=${13} />`)}
+                                                </span>
+                                              `}
+                                            </div>
+                                          `)}
+                                        </div>
+                                      `}
+
+                                      <div style=${{ ...label, marginTop:6, marginBottom:6 }}>
+                                        Decklist (${detail.cards.reduce((s, c) => s + (c.qty || 1), 0)} cards)
+                                      </div>
+                                      <div style=${{
+                                        display:"grid",
+                                        gridTemplateColumns:"repeat(auto-fill, minmax(220px, 1fr))",
+                                        gap:4, maxHeight:280, overflow:"auto", paddingRight:6,
+                                      }}>
+                                        ${detail.cards.slice(0, 200).map((c, i) => html`
+                                          <div key=${c.name+i} style=${{
+                                            display:"flex", alignItems:"center", gap:6,
+                                            fontSize:11, color:"var(--fg-text-heading)", padding:"2px 6px",
+                                            background:"var(--bg-surface)", border:"1px solid var(--border-pale)",
+                                            borderRadius:4, minWidth:0,
+                                          }}>
+                                            <span style=${{ flexShrink:0, color:"var(--fg-text-muted)" }}>${c.qty}×</span>
+                                            <span style=${{ flex:1, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                                              ${c.name}
+                                            </span>
+                                          </div>
+                                        `)}
+                                      </div>
+                                      ${detail.cards.length > 200 && html`
+                                        <div style=${{ fontSize:11, color:"var(--fg-text-muted)", marginTop:6, fontStyle:"italic" }}>
+                                          Showing first 200 of ${detail.cards.length}.
+                                        </div>
+                                      `}
+                                    `}
+                                  </div>
+                                `}
+                              </div>
+                            `;
+                          })}
+                        </div>
+                      </div>
+                    `)}
+                  </div>
                 `}
               </div>
             `;
