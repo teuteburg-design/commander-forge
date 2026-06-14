@@ -2400,7 +2400,7 @@
     const [preconExpanded,  setPreconExpanded]  = useState(null);   // "<set>/<slug>" currently expanded, or null
     const [preconDetail,    setPreconDetail]    = useState({});     // { "set/slug": parsedDeck }
     const [preconImporting, setPreconImporting] = useState(null);   // "set/slug" while importing
-    const [viewingPrecon,   setViewingPrecon]   = useState(null);   // { entry } when on the precon detail page
+    const [previewingPrecon,setPreviewingPrecon]= useState(null);   // { entry } while the deck view is showing a precon preview
     const [preconUpdated,   setPreconUpdated]   = useState(0);
     const [preconRefreshing,setPreconRefreshing]= useState(false);
     const [preconCmdrArt,   setPreconCmdrArt]   = useState({});   // { lcName: art_crop_url }
@@ -5521,10 +5521,13 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setPhase("ready"); setDeck(null); setSelCmd(null);
       setCands([]); setLog([]); setEnriched([]); setDeckSvd(false);
       setLibSaved(false); setFromSaved(false); setFromCollection(false); setUnsavedDeck(null);
+      setPreviewingPrecon(null);
       setError(""); setTab("home");
     };
 
     const navToCollection = () => {
+      setPreviewingPrecon(null);
+      if (previewingPrecon) { setDeck(null); setSelCmd(null); }
       if (groups.decks.length || groups.binders.length) setPhase("select");
       else setPhase("import");
     };
@@ -5618,41 +5621,146 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       }
     };
 
-    // Navigate to the full precon-detail page. Fetches the decklist if we
-    // haven't already, and resolves every card in it against Scryfall so the
-    // detail view can render mana costs / type lines / art alongside the
-    // names. Falls through silently if the network hops fail — the page
-    // still works with just names.
+    // Build a synthetic { selCmd, deck } pair that matches the shape
+    // enrichImportedDeck produces, so we can route a precon preview
+    // through the existing deck view. No EDHRec / Spellbook calls — keep
+    // the preview cheap; those only fire on a real import.
+    const buildPreconDeckData = (entry, detail, sfCache) => {
+      const lookup = (n) => sfCache[(n || "").toLowerCase()]?.d || null;
+      const primary = detail.commanders[0] || null;
+      const partner = detail.commanders[1] || null;
+      const cmdrSF  = primary ? lookup(primary) : null;
+      const selCmd = primary ? {
+        name:     primary,
+        theme:    "Pre-con preview",
+        reason:   `From ${entry.setName || entry.set.toUpperCase()}`,
+        strategy: "",
+        card:     cmdrSF ? { name: primary, scryfall: cmdrSF } : { name: primary, scryfall: {} },
+        commanderCandidates: [],
+      } : null;
+
+      const BASICS = new Set(["Plains","Island","Swamp","Mountain","Forest","Wastes"]);
+      const BASIC_CI = { Plains:["W"], Island:["U"], Swamp:["B"], Mountain:["R"], Forest:["G"], Wastes:[] };
+      const CAT_ORDER = ["Creatures","Instants","Sorceries","Enchantments","Artifacts","Planeswalkers","Battles","Other","Lands"];
+      const byCat = Object.fromEntries(CAT_ORDER.map(c => [c, []]));
+      const categorise = (tl) => {
+        const t = (tl || "").toLowerCase();
+        if (/\bland\b/.test(t))     return "Lands";
+        if (/creature/.test(t))     return "Creatures";
+        if (/instant/.test(t))      return "Instants";
+        if (/sorcery/.test(t))      return "Sorceries";
+        if (/enchantment/.test(t))  return "Enchantments";
+        if (/artifact/.test(t))     return "Artifacts";
+        if (/planeswalker/.test(t)) return "Planeswalkers";
+        if (/battle/.test(t))       return "Battles";
+        return "Other";
+      };
+
+      for (const raw of (detail.cards || [])) {
+        // Skip commanders — they live in the command zone, not the maindeck.
+        if (raw.name === primary || raw.name === partner) continue;
+        const sf = lookup(raw.name) || {};
+        const isBasic = BASICS.has(raw.name);
+        const tl = sf.type_line || (isBasic ? `Basic Land — ${raw.name}` : "");
+        const card = {
+          name:             raw.name,
+          reason:           "",
+          img:              sf.image_uris?.small || sf.card_faces?.[0]?.image_uris?.small || null,
+          mana_cost:        sf.mana_cost || sf.card_faces?.[0]?.mana_cost || "",
+          cmc:              typeof sf.cmc === "number" ? sf.cmc : 0,
+          type_line:        tl,
+          color_identity:   sf.color_identity || (isBasic ? BASIC_CI[raw.name] : []) || [],
+          isLand:           /\bland\b/i.test(tl) || isBasic,
+          id:               sf.id || null,
+          set:              sf.set || null,
+          collector_number: sf.collector_number || null,
+        };
+        const cat = categorise(tl);
+        for (let i = 0; i < (raw.qty || 1); i++) byCat[cat].push({ ...card });
+      }
+      const categories = CAT_ORDER
+        .map(name => ({ name, cards: byCat[name] }))
+        .filter(c => c.cards.length > 0);
+
+      const totalRendered = categories.reduce((s, c) => s + c.cards.length, 0);
+      const deck = {
+        theme:       entry.name,
+        description: `Pre-con preview — ${totalRendered} cards categorised by type.`
+                   + ` ${entry.setName || entry.set.toUpperCase()}`
+                   + (entry.set ? ` (${entry.set.toUpperCase()})` : "")
+                   + ".",
+        warnings:    [],
+        categories,
+        edhrecSuggestions: [],
+        combosHave:  [],
+        combosAlmost: [],
+        precon: { setCode: entry.set, setName: entry.setName },
+      };
+      // Partner support — stash second commander where the existing
+      // deck-view import path also looks for it.
+      if (partner) {
+        const partnerSF = lookup(partner);
+        deck.partner = {
+          name: partner,
+          card: partnerSF ? { name: partner, scryfall: partnerSF } : { name: partner, scryfall: {} },
+        };
+      }
+      return { selCmd, deck };
+    };
+
+    // Open a precon as a preview in the full deck view. Fetches the
+    // decklist + resolves every card on Scryfall once, then routes
+    // through phase="deck" so the user gets the same layout the library
+    // uses (sticky commander on the left, card grid grouped by type,
+    // etc.). The previewingPrecon flag tells the deck view to swap save
+    // / edit buttons for an Import button.
     const openPreconView = async (entry) => {
-      setViewingPrecon({ entry });
-      setPhase("precon_view");
-      window.scrollTo({ top: 0 });
       const key = entry.set + "/" + entry.slug;
-      if (!preconDetail[key]) {
-        try {
-          const { deck } = await fetchMtgWtfDeck(entry.set, entry.slug);
-          setPreconDetail(prev => ({ ...prev, [key]: deck }));
-          // Eager-resolve every card so the detail view shows colour identity,
-          // type lines, art_crop on the commander, etc.
-          const allNames = [...deck.commanders, ...deck.cards.map(c => c.name)];
-          try { await resolveCardsByName(allNames); } catch {}
-          // Bump precon art map for any commanders we just resolved.
-          if (deck.commanders.length) {
-            const cache = getSFCache();
-            const update = {};
-            deck.commanders.forEach(n => {
-              const sf = cache[n.toLowerCase()]?.d;
-              const art = sf?.image_uris?.art_crop
-                       || sf?.card_faces?.[0]?.image_uris?.art_crop;
-              if (art) update[n.toLowerCase()] = art;
-            });
-            if (Object.keys(update).length) setPreconCmdrArt(prev => ({ ...prev, ...update }));
-          }
-          // Force a re-render via the detail map.
-          setPreconDetail(prev => ({ ...prev }));
-        } catch (e) {
-          setPreconError(e.message);
+      // Preserve the freshly-built unsaved deck (if any) so it's not lost.
+      if (!fromSaved && !fromCollection && deck && selCmd && !previewingPrecon) {
+        setUnsavedDeck({ deck, selCmd });
+      }
+      setPreviewingPrecon({ entry });
+      setFromSaved(false); setFromCollection(false);
+      setLibSaved(false); setDeckSvd(false);
+      setError("");
+      setPhase("enriching");
+      setLog([]); setProg(0);
+      addLog(`📦 Loading pre-con preview "${entry.name}"…`);
+      try {
+        let detail = preconDetail[key];
+        if (!detail) {
+          const r = await fetchMtgWtfDeck(entry.set, entry.slug);
+          detail = r.deck;
+          setPreconDetail(prev => ({ ...prev, [key]: detail }));
         }
+        setProg(30);
+        addLog(`🔍 Resolving ${detail.cards.length + detail.commanders.length} cards on Scryfall…`);
+        const allNames = [...detail.commanders, ...detail.cards.map(c => c.name)];
+        try { await resolveCardsByName(allNames); } catch {}
+        setProg(80);
+        const cache = getSFCache();
+        // Cache commander art for downstream uses (precon list bg, etc.).
+        if (detail.commanders.length) {
+          const update = {};
+          detail.commanders.forEach(n => {
+            const sf = cache[n.toLowerCase()]?.d;
+            const art = sf?.image_uris?.art_crop
+                     || sf?.card_faces?.[0]?.image_uris?.art_crop;
+            if (art) update[n.toLowerCase()] = art;
+          });
+          if (Object.keys(update).length) setPreconCmdrArt(prev => ({ ...prev, ...update }));
+        }
+        const { selCmd: sel, deck: deckObj } = buildPreconDeckData(entry, detail, cache);
+        setSelCmd(sel);
+        setDeck(deckObj);
+        setProg(100);
+        setPhase("deck");
+        window.scrollTo({ top: 0 });
+      } catch (e) {
+        setPreviewingPrecon(null);
+        setError(`Couldn't load pre-con preview: ${e?.message || e}`);
+        setPhase("error");
       }
     };
 
@@ -5748,6 +5856,12 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         setDeckInc(nextDeckInc);
         persistGroups(nextGroups, nextDeckInc, binInc);
         setPreconImporting(null);
+        // If we got here from the preview deck-view, clear that state so
+        // the freshly-imported deck is what the user sees next.
+        if (previewingPrecon) {
+          setPreviewingPrecon(null);
+          setDeck(null); setSelCmd(null);
+        }
         setPhase("select");
       } catch (e) {
         setPreconError(e.message || "Failed to import pre-con");
@@ -5869,7 +5983,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       || (phase === "deck" && !fromCollection && !fromSaved),
                     onClick: () => { setPhase("ready"); setTab(activeTab === "home" ? "build" : activeTab); } },
                   { label:"📋 Collection",
-                    active: phase==="select" || phase==="import" || phase==="binder_view" || phase==="precons" || phase==="precon_view",
+                    active: phase==="select" || phase==="import" || phase==="binder_view" || phase==="precons" || (phase==="deck" && !!previewingPrecon),
                     onClick: navToCollection },
                   { label:`📚 Library${(library.length + (groups.decks?.length || 0)) > 0 ? " ("+(library.length + (groups.decks?.length || 0))+")" : ""}`,
                     active: phase==="saved_list"
@@ -5932,7 +6046,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               `}
 
               <!-- Contextual sub-nav for Collection: Overview + Pre-cons. -->
-              ${["select","import","binder_view","precons","precon_view"].includes(phase) && html`
+              ${(["select","import","binder_view","precons"].includes(phase) || (phase==="deck" && !!previewingPrecon)) && html`
                 <div style=${{
                   display:"flex", gap:0, marginTop:6, paddingLeft:6, flexWrap:"wrap",
                   borderTop:"1px solid var(--header-overlay)",
@@ -5945,8 +6059,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       active: phase==="import",
                       onClick: () => { setCsv(""); setError(""); setPhase("import"); } },
                     { label:"🛒 Pre-cons",
-                      active: phase==="precons" || phase==="precon_view",
-                      onClick: () => { setViewingPrecon(null); setPhase("precons"); } },
+                      active: phase==="precons" || (phase==="deck" && !!previewingPrecon),
+                      onClick: () => { setPreviewingPrecon(null); setDeck(null); setSelCmd(null); setPhase("precons"); } },
                   ].map(item => html`
                     <button key=${item.label} onClick=${item.onClick}
                       style=${{
@@ -7138,171 +7252,6 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             `;
           })()}
 
-          <!-- ── PRE-CON DETAIL ('deck list view') ──────────────────────── -->
-          ${phase === "precon_view" && viewingPrecon && (() => {
-            const entry = viewingPrecon.entry;
-            const key = entry.set + "/" + entry.slug;
-            const detail = preconDetail[key] || null;
-            const cache = getSFCache();
-            const importing = preconImporting === key;
-            const alreadyHere = (groups.decks || []).some(d => d.precon?.set === entry.set && d.precon?.slug === entry.slug);
-            const cmdrs = (detail?.commanders || entry.commanders || []).map(n => ({
-              name: n,
-              sf: cache[n.toLowerCase()]?.d || null,
-            }));
-            const heroArt = cmdrs[0]?.sf?.image_uris?.art_crop
-                         || cmdrs[0]?.sf?.card_faces?.[0]?.image_uris?.art_crop
-                         || (cmdrs[0] ? preconCmdrArt[cmdrs[0].name.toLowerCase()] : null);
-            // Group cards by section header (Creature / Instant / Land / …) so
-            // the view mirrors the library's deck layout.
-            const grouped = new Map();
-            (detail?.cards || []).forEach(c => {
-              const sec = c.section || "Other";
-              if (!grouped.has(sec)) grouped.set(sec, []);
-              grouped.get(sec).push(c);
-            });
-            // Stable, readable section order: lands last, creatures first.
-            const sectionRank = (s) => {
-              const t = s.toLowerCase();
-              if (t.startsWith("creature")) return 1;
-              if (t.startsWith("planeswalker")) return 2;
-              if (t.startsWith("instant")) return 3;
-              if (t.startsWith("sorcery")) return 4;
-              if (t.startsWith("artifact")) return 5;
-              if (t.startsWith("enchantment")) return 6;
-              if (t.startsWith("battle")) return 7;
-              if (t.startsWith("land")) return 9;
-              return 8;
-            };
-            const orderedSections = [...grouped.entries()]
-              .sort(([a], [b]) => sectionRank(a) - sectionRank(b) || a.localeCompare(b));
-            return html`
-              <div style=${{ maxWidth:1080, margin:"0 auto" }}>
-                <!-- Top bar: back + import + meta -->
-                <div style=${{ display:"flex", alignItems:"center", gap:10, marginBottom:14, flexWrap:"wrap" }}>
-                  <button onClick=${() => { setPhase("precons"); setViewingPrecon(null); }}
-                    style=${{ ...btnSec, fontSize:12, padding:"6px 12px" }}>← Back to pre-cons</button>
-                  <div style=${{ flex:1, minWidth:0 }}>
-                    <h2 style=${{ fontSize:20, color:"var(--fg-text-heading)", margin:0 }}>${entry.name}</h2>
-                    <div style=${{ fontSize:12, color:"var(--fg-text-soft)", marginTop:2 }}>
-                      ${entry.setName}
-                      <span style=${{
-                        marginLeft:6, padding:"1px 7px", borderRadius:4, fontSize:10, fontWeight:700,
-                        background:"var(--bg-tag)", color:"var(--fg-text-soft)", letterSpacing:0.5,
-                      }}>${(entry.set || "").toUpperCase()}</span>
-                      ${entry.cardCount && html`<span> · ${entry.cardCount} cards</span>`}
-                      ${detail?.releasedAt && html`<span> · released ${detail.releasedAt}</span>`}
-                    </div>
-                  </div>
-                  <button onClick=${() => importPreconAsDeck(entry)}
-                    disabled=${importing || alreadyHere}
-                    style=${{
-                      ...btn, fontSize:13, padding:"7px 14px", whiteSpace:"nowrap",
-                      opacity: (importing || alreadyHere) ? 0.55 : 1,
-                      cursor: importing ? "wait" : alreadyHere ? "default" : "pointer",
-                    }}>
-                    ${importing ? "Importing…" : alreadyHere ? "✓ Imported" : "+ Import as deck"}
-                  </button>
-                </div>
-
-                <!-- Commander hero -->
-                ${cmdrs.length > 0 && html`
-                  <div style=${{
-                    position:"relative", overflow:"hidden",
-                    background:"var(--bg-surface)", border:"1px solid var(--border-neutral)",
-                    borderRadius:10, marginBottom:18, minHeight: heroArt ? 160 : 80,
-                    backgroundImage: heroArt ? `linear-gradient(90deg, var(--bg-surface) 0%, var(--bg-surface) 25%, rgba(0,0,0,0) 80%), url("${heroArt}")` : "none",
-                    backgroundSize: heroArt ? "cover" : "auto",
-                    backgroundPosition: heroArt ? "right center" : "initial",
-                  }}>
-                    <div style=${{ padding:"18px 22px", position:"relative", zIndex:1, maxWidth:"60%" }}>
-                      <div style=${{ fontSize:10, letterSpacing:2, color:"var(--fg-text-muted)", textTransform:"uppercase", fontWeight:700, marginBottom:6 }}>
-                        Commander${cmdrs.length > 1 ? "s" : ""}${detail?.partners ? " · Partner" : ""}
-                      </div>
-                      ${cmdrs.map(r => html`
-                        <div key=${r.name} style=${{ marginBottom:6 }}>
-                          <span style=${{ fontSize:16, fontWeight:700, color:"var(--fg-text-strong)",
-                            textShadow: heroArt ? "0 1px 3px var(--bg-surface), 0 0 6px var(--bg-surface)" : "none" }}>
-                            ${r.name}
-                          </span>
-                          ${r.sf?.color_identity && html`
-                            <span style=${{ display:"inline-flex", gap:3, marginLeft:8, verticalAlign:"middle" }}>
-                              ${(r.sf.color_identity || []).map(c => html`<${Pip} key=${c} c=${c} size=${15} />`)}
-                            </span>
-                          `}
-                          ${r.sf?.type_line && html`
-                            <div style=${{ fontSize:11, color:"var(--fg-text-soft)", marginTop:2,
-                              textShadow: heroArt ? "0 1px 3px var(--bg-surface)" : "none" }}>
-                              ${r.sf.type_line}
-                            </div>
-                          `}
-                        </div>
-                      `)}
-                    </div>
-                  </div>
-                `}
-
-                ${!detail && html`
-                  <div style=${{ padding:"40px 20px", textAlign:"center", color:"var(--fg-text-soft)", fontSize:13 }}>
-                    Loading decklist…
-                  </div>
-                `}
-
-                ${detail && html`
-                  <div style=${{
-                    display:"grid",
-                    gridTemplateColumns:"repeat(auto-fill, minmax(320px, 1fr))",
-                    gap:16,
-                  }}>
-                    ${orderedSections.map(([section, cards]) => {
-                      const total = cards.reduce((s, c) => s + (c.qty || 1), 0);
-                      return html`
-                        <div key=${section} style=${{
-                          background:"var(--bg-surface)", border:"1px solid var(--border-neutral)",
-                          borderRadius:8, padding:"10px 12px",
-                        }}>
-                          <div style=${{ fontSize:11, letterSpacing:1.5, textTransform:"uppercase",
-                            color:"var(--accent)", fontWeight:700, marginBottom:8 }}>
-                            ${section.replace(/\s*\(\d+\)\s*$/, "")} · ${total}
-                          </div>
-                          <div style=${{ display:"flex", flexDirection:"column", gap:3 }}>
-                            ${cards.map((c, i) => {
-                              const sf = cache[(c.name || "").toLowerCase()]?.d;
-                              const ci = sf?.color_identity || [];
-                              return html`
-                                <div key=${c.name+i} style=${{
-                                  display:"flex", alignItems:"center", gap:6,
-                                  fontSize:12, color:"var(--fg-text-heading)", padding:"3px 4px",
-                                  borderRadius:4, minWidth:0,
-                                }}>
-                                  <span style=${{ flexShrink:0, color:"var(--fg-text-muted)", minWidth:18 }}>
-                                    ${c.qty}×
-                                  </span>
-                                  <span style=${{ flex:1, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
-                                    ${c.name}
-                                  </span>
-                                  ${ci.length > 0 && html`
-                                    <span style=${{ display:"inline-flex", gap:1, flexShrink:0 }}>
-                                      ${ci.map(col => html`<${Pip} key=${col} c=${col} size=${11} />`)}
-                                    </span>
-                                  `}
-                                  ${typeof sf?.cmc === "number" && html`
-                                    <span style=${{ fontSize:10, color:"var(--fg-text-muted)", flexShrink:0, minWidth:14, textAlign:"right" }}>
-                                      ${sf.cmc}
-                                    </span>
-                                  `}
-                                </div>
-                              `;
-                            })}
-                          </div>
-                        </div>
-                      `;
-                    })}
-                  </div>
-                `}
-              </div>
-            `;
-          })()}
 
           <!-- ── BINDER VIEW (Phase A) ─────────────────────────────────── -->
           ${phase === "binder_view" && viewingBinder && (() => {
@@ -8954,35 +8903,59 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       </button>
                     `;
                   })()}
-                  <button onClick=${() => { setAddToDeckQuery(""); setAddToDeckOpen(true); }}
-                    title="Pull a card from one of your binders into this deck"
-                    style=${{ ...btn, padding:"6px 14px", fontSize:11,
-                      background:"linear-gradient(135deg,#5a3a10,#a06030)" }}>
-                    ➕ Add from collection
-                  </button>
-                  <button onClick=${exportDeck} style=${{ ...btnSec, padding:"6px 14px", fontSize:11 }}>
-                    ⬇ Export .txt
-                  </button>
-                  ${!libSaved && html`<button onClick=${saveDeckToLibrary}
-                    style=${{ ...btn, padding:"6px 14px", fontSize:11,
-                      background:"linear-gradient(135deg,var(--success),#2e8a44)" }}>
-                    💾 Save to Library
-                  </button>`}
-                  ${!deckSaved && html`<button onClick=${saveDeckToCollection}
-                    title="Saves the deck under Collection → Decks and reserves its non-basic cards from the eligible pool."
-                    style=${{ ...btnSec, padding:"6px 14px", fontSize:11,
-                      borderColor:"var(--accent-dark)", color:"var(--accent-dark)" }}>
-                    📦 Save to Collection
-                  </button>`}
+                  ${!previewingPrecon && html`
+                    <button onClick=${() => { setAddToDeckQuery(""); setAddToDeckOpen(true); }}
+                      title="Pull a card from one of your binders into this deck"
+                      style=${{ ...btn, padding:"6px 14px", fontSize:11,
+                        background:"linear-gradient(135deg,#5a3a10,#a06030)" }}>
+                      ➕ Add from collection
+                    </button>
+                    <button onClick=${exportDeck} style=${{ ...btnSec, padding:"6px 14px", fontSize:11 }}>
+                      ⬇ Export .txt
+                    </button>
+                    ${!libSaved && html`<button onClick=${saveDeckToLibrary}
+                      style=${{ ...btn, padding:"6px 14px", fontSize:11,
+                        background:"linear-gradient(135deg,var(--success),#2e8a44)" }}>
+                      💾 Save to Library
+                    </button>`}
+                    ${!deckSaved && html`<button onClick=${saveDeckToCollection}
+                      title="Saves the deck under Collection → Decks and reserves its non-basic cards from the eligible pool."
+                      style=${{ ...btnSec, padding:"6px 14px", fontSize:11,
+                        borderColor:"var(--accent-dark)", color:"var(--accent-dark)" }}>
+                      📦 Save to Collection
+                    </button>`}
+                  `}
+                  ${previewingPrecon && (() => {
+                    const entry = previewingPrecon.entry;
+                    const alreadyHere = (groups.decks || []).some(d =>
+                      d.precon?.set === entry.set && d.precon?.slug === entry.slug);
+                    return html`
+                      <button onClick=${() => importPreconAsDeck(entry)}
+                        disabled=${alreadyHere}
+                        style=${{
+                          ...btn, padding:"7px 16px", fontSize:12,
+                          opacity: alreadyHere ? 0.55 : 1,
+                          cursor: alreadyHere ? "default" : "pointer",
+                          background: alreadyHere ? undefined : "linear-gradient(135deg,var(--success),#2e8a44)",
+                        }}>
+                        ${alreadyHere ? "✓ Already imported" : "+ Import as deck"}
+                      </button>
+                    `;
+                  })()}
                   <button onClick=${() => {
                       setDeckSvd(false); setLibSaved(false);
-                      if (fromCollection) { setFromCollection(false); setPhase("select"); }
+                      if (previewingPrecon) {
+                        setPreviewingPrecon(null);
+                        setDeck(null); setSelCmd(null);
+                        setPhase("precons");
+                      } else if (fromCollection) { setFromCollection(false); setPhase("select"); }
                       else if (fromSaved) { setFromSaved(false); setPhase("saved_list"); }
                       else if (cands.length > 0) setPhase("pick");
                       else { setPhase("ready"); setTab("commanders"); }
                     }}
                     style=${{ ...btnSec, padding:"6px 14px", fontSize:11 }}>
-                    ${fromCollection ? "← Collection"
+                    ${previewingPrecon ? "← Back to pre-cons"
+                      : fromCollection ? "← Collection"
                       : fromSaved   ? "← Library"
                       :              "↩ Re-pick"}
                   </button>
