@@ -337,8 +337,12 @@ async function refreshPrecons(env, { reason = "unknown", force = false } = {}) {
   }
 
   // Limited parallelism so we don't DOS mtg.wtf or hit worker subrequest caps.
+  // We also collect each dirty deck's commanders[] so we can attach them to
+  // the upstream index entry (cheap commander preview without a per-row KV
+  // read at /api/precons time).
   let downloaded = 0;
   let failed = 0;
+  const freshCommanders = new Map();   // key → ["Cmdr A", "Cmdr B"]
   for (let i = 0; i < dirty.length; i += PRECON_MAX_PARALLEL) {
     const batch = dirty.slice(i, i + PRECON_MAX_PARALLEL);
     const results = await Promise.allSettled(batch.map(async (e) => {
@@ -349,9 +353,19 @@ async function refreshPrecons(env, { reason = "unknown", force = false } = {}) {
         type: e.type,
         cardCount: e.cardCount,
       }));
+      freshCommanders.set(`${e.set}/${e.slug}`, deck.commanders || []);
     }));
     for (const r of results) (r.status === "fulfilled" ? downloaded++ : failed++);
   }
+
+  // Attach commanders to each upstream entry: from this run's freshly
+  // parsed /download for dirty entries, or carried over from the previous
+  // cached index for unchanged ones.
+  const enrichedEntries = upstream.map(u => {
+    const k = `${u.set}/${u.slug}`;
+    const cmdrs = freshCommanders.get(k) || seenKey.get(k)?.commanders;
+    return cmdrs ? { ...u, commanders: cmdrs } : u;
+  });
 
   // Write the new index. We always store the FULL upstream listing (not a
   // diff) so the client gets a consistent snapshot even when /download
@@ -360,7 +374,7 @@ async function refreshPrecons(env, { reason = "unknown", force = false } = {}) {
     updated: Date.now(),
     upstreamCount: upstream.length,
     cachedDecks: upstream.length,
-    entries: upstream,
+    entries: enrichedEntries,
     lastRefresh: {
       reason, startedAt, finishedAt: Date.now(),
       scanned, dirty: dirty.length, downloaded, failed, truncated,

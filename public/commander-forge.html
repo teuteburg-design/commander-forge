@@ -2398,6 +2398,7 @@
     const [preconImporting, setPreconImporting] = useState(null);   // "set/slug" while importing
     const [preconUpdated,   setPreconUpdated]   = useState(0);
     const [preconRefreshing,setPreconRefreshing]= useState(false);
+    const [preconCmdrArt,   setPreconCmdrArt]   = useState({});   // { lcName: art_crop_url }
     const [viewingBinder,   setViewingBinder]   = useState(null);
     const [binderEnriched,  setBinderEnriched]  = useState({});
     const [binderLoading,   setBinderLoading]   = useState(false);
@@ -5529,6 +5530,27 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // demand. Card-name → Scryfall lookup happens at import time so the
     // resulting deck row carries colour identity, art and pricing.
 
+    // After the index lands, batch-resolve every primary commander against
+    // Scryfall once. The art_crop URLs feed each row's background image.
+    const resolvePreconCommanderArt = async (entries) => {
+      const names = new Set();
+      (entries || []).forEach(e => {
+        const first = (e.commanders || [])[0];
+        if (first) names.add(first);
+      });
+      if (!names.size) return;
+      const map = await resolveCardsByName([...names]);
+      const next = {};
+      for (const [lc, sf] of map.entries()) {
+        const art = sf?.image_uris?.art_crop
+                 || sf?.card_faces?.[0]?.image_uris?.art_crop
+                 || sf?.image_uris?.normal
+                 || null;
+        if (art) next[lc] = art;
+      }
+      setPreconCmdrArt(prev => ({ ...prev, ...next }));
+    };
+
     const loadPreconIndex = async () => {
       if (preconIndex !== null) return;
       setPreconLoading(true); setPreconError("");
@@ -5536,6 +5558,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         const { entries, updated, status } = await fetchMtgWtfIndex();
         setPreconIndex(entries);
         setPreconUpdated(updated || 0);
+        resolvePreconCommanderArt(entries);
         if (status === "refreshing") {
           // Worker reported a cold-start refresh in flight — poll once after
           // a short delay so the user sees data without manual reload.
@@ -5547,6 +5570,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 if (Array.isArray(d.entries) && d.entries.length) {
                   setPreconIndex(d.entries);
                   setPreconUpdated(d.updated || 0);
+                  resolvePreconCommanderArt(d.entries);
                 }
               }
             } catch {}
@@ -5581,6 +5605,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           if (Array.isArray(d.entries)) {
             setPreconIndex(d.entries);
             setPreconUpdated(d.updated || 0);
+            resolvePreconCommanderArt(d.entries);
           }
         }
       } finally {
@@ -6995,15 +7020,27 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   `}
 
                   <div style=${{ display:"flex", flexDirection:"column", gap:14 }}>
-                    ${groupedSets.map(([setName, entries]) => html`
+                    ${groupedSets.map(([setName, entries]) => {
+                      // Set code: pull from any entry in the group (they all share one).
+                      const setCode = entries[0]?.set ? entries[0].set.toUpperCase() : "";
+                      return html`
                       <div key=${setName} style=${{
                         background:"var(--bg-surface-soft)", border:"1px solid var(--border-neutral)",
                         borderRadius:8, padding:"10px 12px",
                       }}>
                         <div style=${{ fontSize:13, fontWeight:700, color:"var(--fg-text-strong)", marginBottom:8 }}>
-                          ${setName} <span style=${{ color:"var(--fg-text-muted)", fontWeight:400, fontSize:11 }}>· ${entries.length} deck${entries.length===1?"":"s"}</span>
+                          ${setName}
+                          ${setCode && html`<span style=${{
+                            marginLeft:8, padding:"1px 7px", borderRadius:4, fontSize:10, fontWeight:700,
+                            background:"var(--bg-tag)", color:"var(--fg-text-soft)", letterSpacing:0.5,
+                          }}>${setCode}</span>`}
+                          <span style=${{ color:"var(--fg-text-muted)", fontWeight:400, fontSize:11, marginLeft:6 }}>· ${entries.length} deck${entries.length===1?"":"s"}</span>
                         </div>
-                        <div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
+                        <div style=${{
+                          display:"grid",
+                          gridTemplateColumns:"repeat(auto-fill, minmax(280px, 1fr))",
+                          gap:8,
+                        }}>
                           ${entries.map(entry => {
                             const key = entry.set + "/" + entry.slug;
                             const expanded = preconExpanded === key;
@@ -7017,26 +7054,45 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 sf: cache[n.toLowerCase()]?.d || null,
                               }));
                             })() : null;
+                            // Commander art: from the prefetched bg map (worker-provided
+                            // commanders list) OR fall back to the expanded-deck Scryfall
+                            // resolve. Both populate the same SF cache.
+                            const firstCmdr = (entry.commanders || [])[0] || (detail?.commanders || [])[0];
+                            const cmdrArt = firstCmdr ? preconCmdrArt[firstCmdr.toLowerCase()] : null;
                             return html`
                               <div key=${key} style=${{
                                 background:"var(--bg-surface)", border:"1px solid var(--border-pale)",
-                                borderRadius:6, overflow:"hidden",
+                                borderRadius:6, overflow:"hidden", position:"relative",
                               }}>
                                 <div onClick=${() => togglePreconExpand(key, entry)}
                                   style=${{
                                     display:"flex", alignItems:"center", gap:10,
-                                    padding:"8px 12px", cursor:"pointer",
-                                    background: expanded ? "var(--bg-surface-soft)" : "var(--bg-surface)",
+                                    padding:"10px 12px", cursor:"pointer",
+                                    position:"relative", minHeight: cmdrArt ? 64 : "auto",
+                                    background: cmdrArt
+                                      ? `linear-gradient(90deg, var(--bg-surface) 0%, rgba(0,0,0,0) 60%), url("${cmdrArt}")`
+                                      : (expanded ? "var(--bg-surface-soft)" : "var(--bg-surface)"),
+                                    backgroundSize: cmdrArt ? "cover" : "auto",
+                                    backgroundPosition: cmdrArt ? "right center" : "initial",
                                   }}>
-                                  <div style=${{ flex:1, minWidth:0 }}>
+                                  <div style=${{ flex:1, minWidth:0, position:"relative", zIndex:1 }}>
                                     <div style=${{ fontSize:13, fontWeight:600, color:"var(--fg-text-strong)",
-                                      whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                                      whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+                                      textShadow: cmdrArt ? "0 1px 2px var(--bg-surface)" : "none" }}>
                                       ${entry.name}
                                     </div>
-                                    <div style=${{ fontSize:11, color:"var(--fg-text-soft)", marginTop:1 }}>
-                                      ${entry.type}${entry.cardCount ? ` · ${entry.cardCount} cards` : ""}
+                                    ${firstCmdr && html`
+                                      <div style=${{ fontSize:10, color:"var(--fg-text-soft)", marginTop:1,
+                                        whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+                                        textShadow: cmdrArt ? "0 1px 2px var(--bg-surface)" : "none" }}>
+                                        👑 ${firstCmdr}${(entry.commanders || []).length > 1 ? ` + ${entry.commanders[1]}` : ""}
+                                      </div>
+                                    `}
+                                    <div style=${{ fontSize:10, color:"var(--fg-text-muted)", marginTop:1,
+                                      textShadow: cmdrArt ? "0 1px 2px var(--bg-surface)" : "none" }}>
+                                      ${entry.cardCount ? `${entry.cardCount} cards` : entry.type}
                                       ${alreadyHere && html`<span style=${{
-                                        marginLeft:8, padding:"1px 7px", borderRadius:10, fontSize:10,
+                                        marginLeft:6, padding:"1px 6px", borderRadius:10, fontSize:9,
                                         background:"var(--success-bg)", color:"var(--success-text)", fontWeight:600,
                                       }}>imported</span>`}
                                     </div>
@@ -7047,10 +7103,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                       ...btn, fontSize:11, padding:"5px 10px", whiteSpace:"nowrap",
                                       opacity: (importing || alreadyHere) ? 0.55 : 1,
                                       cursor: importing ? "wait" : alreadyHere ? "default" : "pointer",
+                                      position:"relative", zIndex:1,
                                     }}>
-                                    ${importing ? "Importing…" : alreadyHere ? "✓ Imported" : "+ Import as deck"}
+                                    ${importing ? "Importing…" : alreadyHere ? "✓ Imported" : "+ Import"}
                                   </button>
-                                  <span style=${{ fontSize:12, color:"var(--fg-text-soft)", flexShrink:0 }}>${expanded ? "▲" : "▼"}</span>
+                                  <span style=${{ fontSize:12, color:"var(--fg-text-soft)", flexShrink:0, position:"relative", zIndex:1 }}>${expanded ? "▲" : "▼"}</span>
                                 </div>
 
                                 ${expanded && html`
@@ -7121,7 +7178,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           })}
                         </div>
                       </div>
-                    `)}
+                    `;
+                    })}
                   </div>
                 `}
               </div>
