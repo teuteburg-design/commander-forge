@@ -1649,60 +1649,103 @@
         </div>
 
         <!-- Mechanics toggle -->
-        <button onClick=${() => setShowMech(v => !v)}
-          style=${{
-            background:"transparent", border:"none", color:"#7a3010",
-            fontFamily:"inherit", fontSize:12, cursor:"pointer", padding:"6px 0",
-            display:"flex", alignItems:"center", gap:4,
-          }}>
-          ${showMech ? "▲" : "▼"} Construction targets ${showMech ? "" : "(advanced)"}
-        </button>
+        ${(() => {
+          const D = { lands:37, ramp:10, draw:10, removal:8, wipes:3, interaction:"medium", recursion:"light" };
+          const allDefault = Object.keys(D).every(k => mech[k] === D[k]);
+          return html`
+            <div style=${{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:8, padding:"6px 0" }}>
+              <button onClick=${() => setShowMech(v => !v)}
+                style=${{
+                  background:"transparent", border:"none", color:"#7a3010",
+                  fontFamily:"inherit", fontSize:12, cursor:"pointer",
+                  display:"flex", alignItems:"center", gap:4,
+                }}>
+                ${showMech ? "▲" : "▼"} Construction targets
+              </button>
+              <div style=${{ display:"flex", alignItems:"center", gap:8 }}>
+                <span style=${{
+                  fontSize:10, letterSpacing:1.5, fontWeight:700, textTransform:"uppercase",
+                  padding:"2px 8px", borderRadius:10,
+                  background: allDefault ? "#eaf5ea" : "#fff0e0",
+                  color: allDefault ? "#2a6a2a" : "#7a3010",
+                  border: "1px solid " + (allDefault ? "#bcd8b8" : "#e0b890"),
+                }}>${allDefault ? "✓ Using defaults" : "Customised"}</span>
+                ${!allDefault && html`
+                  <button onClick=${() => setMech({ ...D })}
+                    style=${{ background:"transparent", border:"none", color:"#7a3010",
+                      fontFamily:"inherit", fontSize:11, cursor:"pointer", textDecoration:"underline" }}>
+                    Reset all
+                  </button>
+                `}
+              </div>
+            </div>
 
-        ${showMech && html`
-          <div style=${{
-            marginTop:6, padding:"12px 14px", background:"#fff8ee",
-            border:"1px solid #e8d8b8", borderRadius:8,
-            display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(170px, 1fr))",
-            gap:"10px 14px", fontSize:12, color:"#5a3a1a",
-          }}>
-            ${[
-              ["Lands",       "lands",   Array.from({length:21}, (_,i) => i+30)],  // 30-50
-              ["Ramp",        "ramp",    Array.from({length:11}, (_,i) => i+5)],   // 5-15
-              ["Card draw",   "draw",    Array.from({length:11}, (_,i) => i+5)],   // 5-15
-              ["Removal",     "removal", Array.from({length:11}, (_,i) => i+3)],   // 3-13
-              ["Board wipes", "wipes",   Array.from({length: 8}, (_,i) => i+1)],   // 1-8
-            ].map(([lbl, key, opts]) => html`
-              <label key=${key} style=${{ display:"flex", flexDirection:"column", gap:4 }}>
-                <span>${lbl}</span>
-                <select value=${mech[key]} onChange=${e => setMech(m => ({ ...m, [key]: parseInt(e.target.value) }))}
-                  style=${{ background:"#fff", border:"1px solid #d0b880", borderRadius:6,
-                    padding:"5px 8px", fontFamily:"inherit", fontSize:12, cursor:"pointer" }}>
-                  ${opts.map(n => html`<option key=${n} value=${n}>${n}</option>`)}
-                </select>
-              </label>
-            `)}
-            <label style=${{ display:"flex", flexDirection:"column", gap:4 }}>
-              <span>Interaction</span>
-              <select value=${mech.interaction} onChange=${e => setMech(m => ({ ...m, interaction: e.target.value }))}
-                style=${{ background:"#fff", border:"1px solid #d0b880", borderRadius:6,
-                  padding:"5px 8px", fontFamily:"inherit", fontSize:12, cursor:"pointer" }}>
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High (counterspells, instants)</option>
-              </select>
-            </label>
-            <label style=${{ display:"flex", flexDirection:"column", gap:4 }}>
-              <span>Recursion</span>
-              <select value=${mech.recursion} onChange=${e => setMech(m => ({ ...m, recursion: e.target.value }))}
-                style=${{ background:"#fff", border:"1px solid #d0b880", borderRadius:6,
-                  padding:"5px 8px", fontFamily:"inherit", fontSize:12, cursor:"pointer" }}>
-                <option value="none">None</option>
-                <option value="light">Light</option>
-                <option value="heavy">Heavy (graveyard package)</option>
-              </select>
-            </label>
-          </div>
-        `}
+            ${showMech && html`
+              <div style=${{
+                marginTop:6, padding:"12px 14px", background:"#fff8ee",
+                border:"1px solid #e8d8b8", borderRadius:8,
+                display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(180px, 1fr))",
+                gap:"10px 14px", fontSize:12, color:"#5a3a1a",
+              }}>
+                ${[
+                  ["Lands",       "lands",   Array.from({length:21}, (_,i) => i+30)],
+                  ["Ramp",        "ramp",    Array.from({length:11}, (_,i) => i+5)],
+                  ["Card draw",   "draw",    Array.from({length:11}, (_,i) => i+5)],
+                  ["Removal",     "removal", Array.from({length:11}, (_,i) => i+3)],
+                  ["Board wipes", "wipes",   Array.from({length: 8}, (_,i) => i+1)],
+                ].map(([lbl, key, opts]) => {
+                  const isDef = mech[key] === D[key];
+                  return html`
+                    <label key=${key} style=${{ display:"flex", flexDirection:"column", gap:3 }}>
+                      <span style=${{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:6 }}>
+                        <span>${lbl}</span>
+                        <span style=${{ fontSize:10, color: isDef ? "#8a6a4a" : "#7a3010", fontWeight: isDef ? 400 : 600 }}>
+                          ${isDef ? `default ${D[key]}` : `default ${D[key]} ·`}
+                          ${!isDef && html`<button onClick=${() => setMech(m => ({ ...m, [key]: D[key] }))}
+                            style=${{ background:"transparent", border:"none", color:"#7a3010",
+                              fontFamily:"inherit", fontSize:10, cursor:"pointer", padding:0, marginLeft:3, textDecoration:"underline" }}>reset</button>`}
+                        </span>
+                      </span>
+                      <select value=${mech[key]} onChange=${e => setMech(m => ({ ...m, [key]: parseInt(e.target.value) }))}
+                        style=${{ background:"#fff",
+                          border:"1px solid " + (isDef ? "#d0b880" : "#c07030"),
+                          borderRadius:6, padding:"5px 8px", fontFamily:"inherit", fontSize:12, cursor:"pointer",
+                          fontWeight: isDef ? 400 : 600 }}>
+                        ${opts.map(n => html`<option key=${n} value=${n}>${n}${n === D[key] ? " ★" : ""}</option>`)}
+                      </select>
+                    </label>
+                  `;
+                })}
+                ${[
+                  ["Interaction", "interaction", [["low","Low"],["medium","Medium"],["high","High (counterspells, instants)"]]],
+                  ["Recursion",   "recursion",   [["none","None"],["light","Light"],["heavy","Heavy (graveyard package)"]]],
+                ].map(([lbl, key, opts]) => {
+                  const isDef = mech[key] === D[key];
+                  return html`
+                    <label key=${key} style=${{ display:"flex", flexDirection:"column", gap:3 }}>
+                      <span style=${{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:6 }}>
+                        <span>${lbl}</span>
+                        <span style=${{ fontSize:10, color: isDef ? "#8a6a4a" : "#7a3010", fontWeight: isDef ? 400 : 600 }}>
+                          ${isDef ? `default ${D[key]}` : `default ${D[key]} ·`}
+                          ${!isDef && html`<button onClick=${() => setMech(m => ({ ...m, [key]: D[key] }))}
+                            style=${{ background:"transparent", border:"none", color:"#7a3010",
+                              fontFamily:"inherit", fontSize:10, cursor:"pointer", padding:0, marginLeft:3, textDecoration:"underline" }}>reset</button>`}
+                        </span>
+                      </span>
+                      <select value=${mech[key]} onChange=${e => setMech(m => ({ ...m, [key]: e.target.value }))}
+                        style=${{ background:"#fff",
+                          border:"1px solid " + (isDef ? "#d0b880" : "#c07030"),
+                          borderRadius:6, padding:"5px 8px", fontFamily:"inherit", fontSize:12, cursor:"pointer",
+                          fontWeight: isDef ? 400 : 600 }}>
+                        ${opts.map(([v, lab]) => html`<option key=${v} value=${v}>${lab}${v === D[key] ? " ★" : ""}</option>`)}
+                      </select>
+                    </label>
+                  `;
+                })}
+              </div>
+            `}
+          `;
+        })()}
 
         <!-- ── Active preferences summary ─────────────────────────── -->
         ${(() => {
@@ -1778,6 +1821,7 @@
     // binderEnriched is a per-binder cache: { [binderName]: [card-with-scryfall, …] }.
     // We enrich on-demand the first time a binder is opened, then keep results
     // in memory for instant return visits.
+    const [collQuery,       setCollQuery]       = useState("");
     const [viewingBinder,   setViewingBinder]   = useState(null);
     const [binderEnriched,  setBinderEnriched]  = useState({});
     const [binderLoading,   setBinderLoading]   = useState(false);
@@ -2154,7 +2198,7 @@
       interaction: "medium",   // low | medium | high
       recursion:   "light",    // none | light | heavy
     });
-    const [showMech, setShowMech]     = useState(false);
+    const [showMech, setShowMech]     = useState(true);
 
     const [expandedDeckCard, setExpandedCard] = useState(null);
     const [cardTooltip,  setCardTooltip]  = useState(null); // { img, name, x, y }
@@ -4903,7 +4947,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       : `Building deck for ${selCmd?.name || "…"}`;
 
     // ── Render ───────────────────────────────────────────────────────────────
-    const showNav = !["init","setup"].includes(phase);
+    const showNav = !["init"].includes(phase);
 
     return html`
       <div style=${{ minHeight:"100vh", background:"#f2ebe0", paddingBottom:60 }}>
@@ -4997,7 +5041,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   // has been opened FROM a stored source (Collection / Library)
                   // we treat the deck view as belonging to that section
                   // rather than to Home.
-                  { label:"🏠 Home",
+                  { label:"⚒ Forge",
                     active: (["ready", "pick", "building", "analyzing", "loading_cmdr"].includes(phase))
                       || (phase === "deck" && !fromCollection && !fromSaved),
                     onClick: resetHome },
@@ -5038,18 +5082,17 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   borderTop:"1px solid rgba(255,255,255,0.08)",
                 }}>
                   ${[
-                    { label:"👑 Commanders",
+                    { label:"🎯 Build a new deck",
+                      active: phase==="ready" && activeTab==="build",
+                      onClick: () => { setPhase("ready"); setTab("build"); } },
+                    { label:`👑 Commanders${cmdrs.length ? ` (${cmdrs.length})` : ""}`,
                       active: phase==="ready" && activeTab==="commanders",
                       onClick: () => { setPhase("ready"); setTab("commanders"); },
                       disabled: cmdrs.length === 0 },
-                    { label:"⚔️ AI Suggest",
+                    { label:"⚔️ Suggestion",
                       active: phase==="pick",
                       onClick: () => cands.length && setPhase("pick"),
                       disabled: cands.length === 0 },
-                    { label:"🃏 Deck",
-                      active: phase==="deck",
-                      onClick: () => deck && setPhase("deck"),
-                      disabled: !deck },
                   ].map(item => html`
                     <button key=${item.label} disabled=${!!item.disabled} onClick=${item.onClick}
                       style=${{
@@ -5698,11 +5741,25 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             const totalUnique = totalMap.size;
             const selDecks    = groups.decks.filter(d => deckInc[d.name]).length;
             const selBinders  = groups.binders.filter(b => binInc[b.name]).length;
-            const sortedDecks = [...groups.decks].sort((a, b) => {
+            const q = (collQuery || "").trim().toLowerCase();
+            const matchDeck = d => {
+              if (!q) return true;
+              if (d.name.toLowerCase().includes(q)) return true;
+              if ((d.commanderName || "").toLowerCase().includes(q)) return true;
+              if ((d.format || "").toLowerCase().includes(q)) return true;
+              return (d.cards || []).some(c => (c.name || "").toLowerCase().includes(q));
+            };
+            const matchBinder = b => {
+              if (!q) return true;
+              if (b.name.toLowerCase().includes(q)) return true;
+              if ((b.tags || []).some(t => t.toLowerCase().includes(q))) return true;
+              return (b.cards || []).some(c => (c.name || "").toLowerCase().includes(q));
+            };
+            const sortedDecks = [...groups.decks].filter(matchDeck).sort((a, b) => {
               const ai = deckInc[a.name] ? 0 : 1, bi = deckInc[b.name] ? 0 : 1;
               return ai !== bi ? ai - bi : a.name.localeCompare(b.name);
             });
-            const sortedBinders = [...groups.binders].sort((a, b) => {
+            const sortedBinders = [...groups.binders].filter(matchBinder).sort((a, b) => {
               const ai = binInc[a.name] ? 0 : 1, bi = binInc[b.name] ? 0 : 1;
               return ai !== bi ? ai - bi : a.name.localeCompare(b.name);
             });
@@ -5773,6 +5830,33 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 `}
               </div>
 
+              <!-- Search -->
+              <div style=${{
+                marginBottom:14, display:"flex", alignItems:"center", gap:10,
+                background:"#fff", border:"1px solid #ddd0b8", borderRadius:8,
+                padding:"8px 12px",
+              }}>
+                <span style=${{ fontSize:14, color:"#8a6a4a" }}>🔍</span>
+                <input type="search" value=${collQuery}
+                  onInput=${e => setCollQuery(e.target.value)}
+                  placeholder="Search binders, decks, commanders, tags, or card names…"
+                  style=${{
+                    flex:1, border:"none", outline:"none", background:"transparent",
+                    fontFamily:"inherit", fontSize:13, color:"#1e0f00", padding:0,
+                  }} />
+                ${collQuery && html`
+                  <button onClick=${() => setCollQuery("")}
+                    style=${{ background:"transparent", border:"none", color:"#7a3010",
+                      cursor:"pointer", fontFamily:"inherit", fontSize:12 }}>
+                    Clear
+                  </button>
+                  <span style=${{ fontSize:11, color:"#8a6a4a", whiteSpace:"nowrap" }}>
+                    ${sortedBinders.length} binder${sortedBinders.length===1?"":"s"} ·
+                    ${sortedDecks.length} deck${sortedDecks.length===1?"":"s"}
+                  </span>
+                `}
+              </div>
+
               <div style=${{
                 display:"grid",
                 gridTemplateColumns:"minmax(0, 1fr) minmax(0, 1fr)",
@@ -5802,8 +5886,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                      they share a grid row with the matching deck row.
                      CSS grid sizes the row to fit the taller of the two
                      cells, keeping the columns aligned horizontally. -->
-                ${groups.binders.length === 0
-                  ? html`<div style=${{ gridRow:2, gridColumn:1, fontSize:12, color:"#a08868", fontStyle:"italic" }}>No binders yet — create one or import a CSV.</div>`
+                ${sortedBinders.length === 0
+                  ? html`<div style=${{ gridRow:2, gridColumn:1, fontSize:12, color:"#a08868", fontStyle:"italic" }}>
+                      ${groups.binders.length === 0 ? "No binders yet — create one or import a CSV." : `No binders match "${collQuery}".`}
+                    </div>`
                   : sortedBinders.map((b, i) => {
                       const total = cardTotal(b.cards);
                       const included = !!binInc[b.name];
@@ -5853,8 +5939,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     })}
 
                 <!-- Deck rows in column 2 -->
-                ${groups.decks.length === 0
-                  ? html`<div style=${{ gridRow:2, gridColumn:2, fontSize:12, color:"#a08868", fontStyle:"italic" }}>No decks yet. Create an empty one, build & save, or import a CSV with deck data.</div>`
+                ${sortedDecks.length === 0
+                  ? html`<div style=${{ gridRow:2, gridColumn:2, fontSize:12, color:"#a08868", fontStyle:"italic" }}>
+                      ${groups.decks.length === 0 ? "No decks yet. Create an empty one, build & save, or import a CSV with deck data." : `No decks match "${collQuery}".`}
+                    </div>`
                   : sortedDecks.map((d, i) => {
                       const total = cardTotal(d.cards);
                       const fmt = (d.format || "commander");
@@ -6631,22 +6719,6 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           <!-- ── READY (home hub) ──────────────────────────────────────── -->
           ${phase === "ready" && html`
             <div>
-              <div style=${{ display:"flex", borderBottom:"2px solid #d8c8a8", marginBottom:22 }}>
-                ${[
-                  { id:"build",      label:"🎯 Build a Deck" },
-                  { id:"commanders", label:`👑 Commanders (${cmdrs.length})` },
-                ].map(t => html`
-                  <button key=${t.id} onClick=${() => setTab(t.id)} style=${{
-                    padding:"10px 22px", fontSize:13, fontFamily:"inherit", cursor:"pointer",
-                    border:"none", borderBottom: activeTab===t.id ? "3px solid #7a2e0e" : "3px solid transparent",
-                    background:"transparent", color: activeTab===t.id ? "#7a2e0e" : "#7a5a3a",
-                    fontWeight: activeTab===t.id ? 700 : 400, marginBottom:"-2px",
-                  }}>
-                    ${t.label}
-                  </button>
-                `)}
-              </div>
-
               <!-- Build tab -->
               ${activeTab === "build" && html`
                 <div>
@@ -6672,21 +6744,13 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             onClick=${() => setCF(cf => cf.includes(c) ? cf.filter(x=>x!==c) : [...cf,c])}
                             style=${{
                               display:"flex", alignItems:"center", gap:8, cursor:"pointer",
-                              padding:"4px 12px 4px 4px", borderRadius:24,
+                              padding:"4px 12px 4px 6px", borderRadius:24,
                               background: on ? "#fff0e0" : "#fff",
                               border: on ? "1px solid #c07030" : "1px solid #e0c890",
                               boxShadow: on ? "0 1px 6px rgba(192,112,48,0.18)" : "none",
                               transition:"all .15s",
                             }}>
-                            <span style=${{
-                              width:30, height:30, borderRadius:"50%",
-                              background: C_BG[c],
-                              border: on ? "2px solid #3a1000" : "2px solid transparent",
-                              display:"flex", alignItems:"center", justifyContent:"center",
-                              fontSize:12, fontWeight:700,
-                              color: c==="W" ? "#333" : "#fff",
-                              boxShadow:"0 1px 3px rgba(0,0,0,0.18)",
-                            }}>${c}</span>
+                            <${Pip} c=${c} size=${26} />
                             <span style=${{ fontSize:13, fontWeight: on ? 700 : 400,
                               color: on ? "#5a1a00" : "#5a3a1a" }}>${C_LABEL[c]}</span>
                           </div>
@@ -6695,19 +6759,13 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       <div onClick=${() => setCL(v=>!v)}
                         style=${{
                           display:"flex", alignItems:"center", gap:8, cursor:"pointer",
-                          padding:"4px 12px 4px 4px", borderRadius:24,
+                          padding:"4px 12px 4px 6px", borderRadius:24,
                           background: colorless ? "#fff0e0" : "#fff",
                           border: colorless ? "1px solid #c07030" : "1px solid #e0c890",
                           boxShadow: colorless ? "0 1px 6px rgba(192,112,48,0.18)" : "none",
                           transition:"all .15s",
                         }}>
-                        <span style=${{
-                          width:30, height:30, borderRadius:"50%", background:"#777",
-                          border: colorless ? "2px solid #3a1000" : "2px solid transparent",
-                          display:"flex", alignItems:"center", justifyContent:"center",
-                          fontSize:13, color:"#fff", fontWeight:700,
-                          boxShadow:"0 1px 3px rgba(0,0,0,0.18)",
-                        }}>∅</span>
+                        <${Pip} c=${"C"} size=${26} />
                         <span style=${{ fontSize:13, fontWeight: colorless ? 700 : 400,
                           color: colorless ? "#5a1a00" : "#5a3a1a" }}>Colorless</span>
                       </div>
