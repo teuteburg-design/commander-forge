@@ -953,24 +953,79 @@
   // Resolve a list of card names → Scryfall card objects. Uses the local
   // SF cache first; falls back to Scryfall's /cards/collection bulk endpoint
   // (up to 75 IDs per call). Returns Map<lowercaseName, scryfallCard>.
-  async function resolveCardsByName(names) {
+  //
+  // setHint: optional Scryfall set code (e.g. "msc"). When provided we ask
+  // Scryfall for THAT printing first by passing { name, set } identifiers —
+  // this keeps precon imports from picking up random reprints. Cards Scryfall
+  // can't find in the requested set are retried with a bare { name } lookup
+  // so we don't lose entries WotC didn't actually include in that printing.
+  // The setHint also keys the in-memory cache as "<name>::<set>" alongside
+  // the plain name key, so precons don't poison earlier name-only caches and
+  // a later non-precon resolution still finds the right printing.
+  async function resolveCardsByName(names, setHint = null) {
     const out = new Map();
     const cache = getSFCache();
     const ts = Date.now();
+    const setKey = setHint ? `::${setHint.toLowerCase()}` : "";
+
     const misses = [];
     for (const n of names) {
       const key = (n || "").toLowerCase();
       if (!key || out.has(key)) continue;
-      const hit = cache[key];
+      // Prefer a printing-specific hit when a setHint is in play.
+      const hitInSet = setHint ? cache[key + setKey] : null;
+      const hit = hitInSet || cache[key];
       if (hit?.d && (ts - hit.ts) < SF_CACHE_TTL) {
         out.set(key, hit.d);
       } else {
         misses.push(n);
       }
     }
-    // Batch unknown names through /cards/collection.
-    for (let i = 0; i < misses.length; i += 75) {
-      const batch = misses.slice(i, i + 75);
+
+    // Stash a card into the cache + output map. Skip the printing-keyed
+    // slot when the result's set doesn't match the hint (Scryfall fell
+    // back to a different printing for us).
+    const storeCard = (sf) => {
+      try {
+        const slim = slimSF(sf);
+        const nameKey = (sf.name || "").toLowerCase();
+        cache[(sf.id || "").toLowerCase()] = { d: slim, ts };
+        cache[nameKey] = { d: slim, ts };
+        if (setHint && (sf.set || "").toLowerCase() === setHint.toLowerCase()) {
+          cache[nameKey + setKey] = { d: slim, ts };
+        }
+        out.set(nameKey, slim);
+      } catch {}
+    };
+
+    // Pass 1: set-specific bulk lookup (when setHint is set).
+    let stillMissing = misses;
+    if (setHint && misses.length) {
+      stillMissing = [];
+      for (let i = 0; i < misses.length; i += 75) {
+        const batch = misses.slice(i, i + 75);
+        try {
+          const r = await fetch("https://api.scryfall.com/cards/collection", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              identifiers: batch.map(n => ({ name: n, set: setHint })),
+            }),
+          });
+          if (!r.ok) { stillMissing.push(...batch); continue; }
+          const j = await r.json();
+          (j.data || []).forEach(storeCard);
+          // Anything Scryfall flagged not_found goes to fallback below.
+          (j.not_found || []).forEach(nf => {
+            if (nf.name) stillMissing.push(nf.name);
+          });
+        } catch { stillMissing.push(...batch); }
+      }
+    }
+
+    // Pass 2: bare-name fallback (or the only pass when no setHint).
+    for (let i = 0; i < stillMissing.length; i += 75) {
+      const batch = stillMissing.slice(i, i + 75);
       try {
         const r = await fetch("https://api.scryfall.com/cards/collection", {
           method: "POST",
@@ -979,14 +1034,7 @@
         });
         if (!r.ok) continue;
         const j = await r.json();
-        (j.data || []).forEach(c => {
-          try {
-            const slim = slimSF(c);
-            cache[(c.id   || "").toLowerCase()] = { d: slim, ts };
-            cache[(c.name || "").toLowerCase()] = { d: slim, ts };
-            out.set((c.name || "").toLowerCase(), slim);
-          } catch {}
-        });
+        (j.data || []).forEach(storeCard);
       } catch {}
     }
     try { setSFCache(cache); } catch {}
@@ -5963,7 +6011,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         setProg(30);
         addLog(`🔍 Resolving ${detail.cards.length + detail.commanders.length} cards on Scryfall…`);
         const allNames = [...detail.commanders, ...detail.cards.map(c => c.name)];
-        try { await resolveCardsByName(allNames); } catch {}
+        try { await resolveCardsByName(allNames, entry.set); } catch {}
         setProg(80);
         const cache = getSFCache();
         // Cache commander art for downstream uses (precon list bg, etc.).
@@ -6002,7 +6050,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
         // Resolve every card name (commanders + main) to Scryfall objects.
         const allNames = [...detail.commanders, ...detail.cards.map(c => c.name)];
-        const resolved = await resolveCardsByName(allNames);
+        const resolved = await resolveCardsByName(allNames, entry.set);
         const findSF = (name) => resolved.get((name || "").toLowerCase()) || null;
 
         const cmdrSFs = detail.commanders.map(n => ({ name: n, sf: findSF(n) }));
