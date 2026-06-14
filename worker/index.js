@@ -211,19 +211,43 @@ function parseMtgWtfIndexHtml(html) {
   return out;
 }
 
-// Parse the /deck/<set>/<slug>/download plain-text format:
+// Parse the /deck/<set>/<slug>/download_with_printings plain-text format:
 //   // NAME: ...
 //   // URL: ...
 //   // DATE: 2026-06-26
-//   COMMANDER: 1 Card Name
-//   PARTNER: 1 Card Name
-//   1 Other Card
+//   COMMANDER: 1 Card Name [SETCODE:NUMBER] [foil]
+//   PARTNER:   1 Card Name [SETCODE:NUMBER]
+//   1 Other Card [SETCODE:NUMBER]
 //   ...
+// The [SETCODE:NUMBER] suffix is what makes this endpoint better than plain
+// /download — it tells us the exact printing WotC shipped in the precon, so
+// downstream Scryfall lookups can pull the right art / collector number
+// instead of guessing the latest reprint. The [foil] tag is optional.
+//
+// Commanders go into commanders[] (so downstream code can treat partners
+// uniformly). Each card/commander record carries name, qty, set, number,
+// foil. Lines without a [SET:NUM] suffix still parse (we leave set/number
+// null) so the bare /download format keeps working as a fallback.
 function parseMtgWtfDownload(text) {
   const lines = text.split(/\r?\n/);
   const meta = {};
   const commanders = [];
   const cards = [];
+
+  // qty, name, optional [SET:NUMBER], optional [foil]
+  const lineRe = /^(\d+)\s+(.+?)(?:\s*\[([A-Za-z0-9_]+):([^\]]+)\])?(?:\s*\[(foil|etched)\])?\s*$/i;
+  const parseCard = (body) => {
+    const m = body.match(lineRe);
+    if (!m) return null;
+    return {
+      qty:    parseInt(m[1], 10),
+      name:   m[2].trim(),
+      set:    m[3] ? m[3].toLowerCase() : null,
+      number: m[4] ? m[4].trim() : null,
+      foil:   !!m[5],
+    };
+  };
+
   for (const raw of lines) {
     const line = raw.trim();
     if (!line) continue;
@@ -232,32 +256,41 @@ function parseMtgWtfDownload(text) {
       if (m) meta[m[1].toLowerCase()] = m[2].trim();
       continue;
     }
-    const cmdMatch = line.match(/^(COMMANDER|PARTNER|COMPANION)\s*:\s*(\d+)\s+(.+)$/i);
+    const cmdMatch = line.match(/^(COMMANDER|PARTNER|COMPANION)\s*:\s*(.+)$/i);
     if (cmdMatch) {
       const role = cmdMatch[1].toUpperCase();
-      const cardName = cmdMatch[3].trim();
-      if (role === "COMMANDER" || role === "PARTNER") commanders.push(cardName);
+      const c = parseCard(cmdMatch[2]);
+      if (!c) continue;
+      if (role === "COMMANDER" || role === "PARTNER") commanders.push(c);
       // companion: ignored for the deck-builder model (no slot)
       continue;
     }
-    const cardMatch = line.match(/^(\d+)\s+(.+)$/);
-    if (cardMatch) {
-      cards.push({ name: cardMatch[2].trim(), qty: parseInt(cardMatch[1], 10) });
-    }
+    const c = parseCard(line);
+    if (c) cards.push(c);
   }
   return {
     name:        meta.name        || "",
     url:         meta.url         || "",
     releasedAt:  meta.date        || "",
     commanders,
+    // Backward compat: existing client code expects commanders to be a list
+    // of strings on the top level. Provide both.
+    commanderNames: commanders.map(c => c.name),
     partners:    commanders.length >= 2,
     cards,
   };
 }
 
+// Prefer download_with_printings (set + collector number per card). Falls
+// back to the plain /download for any deck the new endpoint doesn't have.
 async function fetchAndParseDeck(setCode, slug) {
-  const url = `https://mtg.wtf/deck/${encodeURIComponent(setCode)}/${encodeURIComponent(slug)}/download`;
-  const text = await fetchText(url, `download ${setCode}/${slug}`);
+  const base = `https://mtg.wtf/deck/${encodeURIComponent(setCode)}/${encodeURIComponent(slug)}`;
+  let text;
+  try {
+    text = await fetchText(base + "/download_with_printings", `download_wp ${setCode}/${slug}`);
+  } catch {
+    text = await fetchText(base + "/download", `download ${setCode}/${slug}`);
+  }
   const parsed = parseMtgWtfDownload(text);
   // /download omits the set name and deck type; copy them from the index.
   return { ...parsed, set: setCode, slug };

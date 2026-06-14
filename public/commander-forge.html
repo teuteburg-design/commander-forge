@@ -951,6 +951,134 @@
   }
 
   // Resolve a list of card names → Scryfall card objects. Uses the local
+  // Printing-aware resolver. Takes an array of { name, set, number } entries
+  // (set/number optional) and asks Scryfall for the EXACT printing first
+  // via the { set, collector_number } identifier — most surgical option,
+  // returns the precise card art / collector_number WotC shipped. Falls
+  // back to { name, set } then bare { name } for entries Scryfall can't
+  // pin to that printing. Returns Map<lowercaseName, scryfallCard>.
+  // The SF cache also gets a "<name>::<setHint>" alias so future bare-name
+  // lookups in a non-precon context aren't poisoned by the precon printing.
+  async function resolveCardsByPrinting(entries, setHint = null) {
+    const out = new Map();
+    const cache = getSFCache();
+    const ts = Date.now();
+    const setKey = setHint ? `::${setHint.toLowerCase()}` : "";
+
+    const storeCard = (sf) => {
+      try {
+        const slim = slimSF(sf);
+        const nameKey = (sf.name || "").toLowerCase();
+        cache[(sf.id || "").toLowerCase()] = { d: slim, ts };
+        cache[nameKey] = { d: slim, ts };
+        if (setHint && (sf.set || "").toLowerCase() === setHint.toLowerCase()) {
+          cache[nameKey + setKey] = { d: slim, ts };
+        }
+        out.set(nameKey, slim);
+      } catch {}
+    };
+
+    // De-dup by name — same card listed twice gets one Scryfall lookup.
+    const byName = new Map();
+    for (const e of entries) {
+      const key = (e?.name || "").toLowerCase();
+      if (!key) continue;
+      if (!byName.has(key)) byName.set(key, e);
+    }
+
+    // Pass 0: serve from cache when possible.
+    const todo = [];
+    for (const [key, e] of byName.entries()) {
+      const hitInSet = setHint ? cache[key + setKey] : null;
+      const hit = hitInSet || cache[key];
+      if (hit?.d && (ts - hit.ts) < SF_CACHE_TTL) {
+        out.set(key, hit.d);
+      } else {
+        todo.push(e);
+      }
+    }
+
+    // Pass 1: surgical {set, collector_number}.
+    const needSetName = [];
+    const surgical = todo.filter(e => e.set && e.number);
+    for (let i = 0; i < surgical.length; i += 75) {
+      const batch = surgical.slice(i, i + 75);
+      try {
+        const r = await fetch("https://api.scryfall.com/cards/collection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            identifiers: batch.map(e => ({
+              set: (e.set || "").toLowerCase(),
+              collector_number: String(e.number),
+            })),
+          }),
+        });
+        if (!r.ok) { needSetName.push(...batch); continue; }
+        const j = await r.json();
+        (j.data || []).forEach(storeCard);
+        // For not_founds we don't have the original name back from Scryfall
+        // — fall through to the next pass with the same batch entry.
+        (j.not_found || []).forEach((_, idx) => { /* opaque */ });
+        // Anything still missing from this batch: retry by set+name.
+        for (const e of batch) {
+          if (!out.has((e.name || "").toLowerCase())) needSetName.push(e);
+        }
+      } catch { needSetName.push(...batch); }
+    }
+
+    // Pass 2: {name, set} (catches entries without a collector number, or
+    // ones the surgical pass failed on).
+    const needBare = [];
+    const nameSet = [
+      ...todo.filter(e => !e.set || !e.number),
+      ...needSetName,
+    ];
+    for (let i = 0; i < nameSet.length; i += 75) {
+      const batch = nameSet.slice(i, i + 75);
+      const withSet = batch.filter(e => e.set || setHint);
+      if (!withSet.length) { needBare.push(...batch); continue; }
+      try {
+        const r = await fetch("https://api.scryfall.com/cards/collection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            identifiers: withSet.map(e => ({
+              name: e.name,
+              set: (e.set || setHint).toLowerCase(),
+            })),
+          }),
+        });
+        if (!r.ok) { needBare.push(...batch); continue; }
+        const j = await r.json();
+        (j.data || []).forEach(storeCard);
+        for (const e of batch) {
+          if (!out.has((e.name || "").toLowerCase())) needBare.push(e);
+        }
+      } catch { needBare.push(...batch); }
+    }
+
+    // Pass 3: bare {name}. Last resort — accept whatever printing Scryfall
+    // picks. Nothing is silently dropped this way.
+    for (let i = 0; i < needBare.length; i += 75) {
+      const batch = needBare.slice(i, i + 75);
+      try {
+        const r = await fetch("https://api.scryfall.com/cards/collection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ identifiers: batch.map(e => ({ name: e.name })) }),
+        });
+        if (!r.ok) continue;
+        const j = await r.json();
+        (j.data || []).forEach(storeCard);
+      } catch {}
+    }
+    try { setSFCache(cache); } catch {}
+    return out;
+  }
+
+  // Backward-compat helper: existing callers pass name strings.
+  // Re-exposed as resolveCardsByName so older code keeps working.
   // SF cache first; falls back to Scryfall's /cards/collection bulk endpoint
   // (up to 75 IDs per call). Returns Map<lowercaseName, scryfallCard>.
   //
@@ -5818,7 +5946,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       const names = new Set();
       (entries || []).forEach(e => {
         const first = (e.commanders || [])[0];
-        if (first) names.add(first);
+        const n = typeof first === "string" ? first : (first?.name || "");
+        if (n) names.add(n);
       });
       if (!names.size) return;
       const map = await resolveCardsByName([...names]);
@@ -5899,10 +6028,17 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // enrichImportedDeck produces, so we can route a precon preview
     // through the existing deck view. No EDHRec / Spellbook calls — keep
     // the preview cheap; those only fire on a real import.
+    // Accepts both shapes of commanders/cards entries:
+    //   • new (download_with_printings): { name, set, number, foil? }
+    //   • old (plain /download or stale cache): bare string
+    const preconEntryName = (x) => (typeof x === "string" ? x : (x?.name || ""));
+
     const buildPreconDeckData = (entry, detail, sfCache) => {
       const lookup = (n) => sfCache[(n || "").toLowerCase()]?.d || null;
-      const primary = detail.commanders[0] || null;
-      const partner = detail.commanders[1] || null;
+      const primaryName = preconEntryName(detail.commanders[0]);
+      const partnerName = preconEntryName(detail.commanders[1]);
+      const primary = primaryName || null;
+      const partner = partnerName || null;
       const cmdrSF  = primary ? lookup(primary) : null;
       const selCmd = primary ? {
         name:     primary,
@@ -5930,7 +6066,13 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         return "Other";
       };
 
-      for (const raw of (detail.cards || [])) {
+      for (const rawEntry of (detail.cards || [])) {
+        // Old cached precons stored card names as strings; new ones use
+        // { name, qty, set, number }. Normalise so the rest of the loop
+        // can be uniform.
+        const raw = typeof rawEntry === "string"
+          ? { name: rawEntry, qty: 1 }
+          : rawEntry;
         // Skip commanders — they live in the command zone, not the maindeck.
         if (raw.name === primary || raw.name === partner) continue;
         const sf = lookup(raw.name) || {};
@@ -5945,9 +6087,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           type_line:        tl,
           color_identity:   sf.color_identity || (isBasic ? BASIC_CI[raw.name] : []) || [],
           isLand:           /\bland\b/i.test(tl) || isBasic,
+          // Prefer the printing the precon shipped (raw.set / raw.number)
+          // over Scryfall's "primary" answer when both are present.
           id:               sf.id || null,
-          set:              sf.set || null,
-          collector_number: sf.collector_number || null,
+          set:              (raw.set || sf.set || null),
+          collector_number: (raw.number || sf.collector_number || null),
         };
         const cat = categorise(tl);
         for (let i = 0; i < (raw.qty || 1); i++) byCat[cat].push({ ...card });
@@ -6010,14 +6154,21 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         }
         setProg(30);
         addLog(`🔍 Resolving ${detail.cards.length + detail.commanders.length} cards on Scryfall…`);
-        const allNames = [...detail.commanders, ...detail.cards.map(c => c.name)];
-        try { await resolveCardsByName(allNames, entry.set); } catch {}
+        // Build printing entries — { name, set, number } — using the precon's
+        // own set as the fallback when individual rows lack a printing tag.
+        const toPrinting = (x) => typeof x === "string"
+          ? { name: x, set: entry.set, number: null }
+          : { name: x.name, set: x.set || entry.set, number: x.number || null };
+        const printings = [...detail.commanders, ...detail.cards].map(toPrinting);
+        try { await resolveCardsByPrinting(printings, entry.set); } catch {}
         setProg(80);
         const cache = getSFCache();
         // Cache commander art for downstream uses (precon list bg, etc.).
         if (detail.commanders.length) {
           const update = {};
-          detail.commanders.forEach(n => {
+          detail.commanders.forEach(c => {
+            const n = preconEntryName(c);
+            if (!n) return;
             const sf = cache[n.toLowerCase()]?.d;
             const art = sf?.image_uris?.art_crop
                      || sf?.card_faces?.[0]?.image_uris?.art_crop;
@@ -6048,12 +6199,19 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         const detail = preconDetail[key] || (await fetchMtgWtfDeck(entry.set, entry.slug)).deck;
         if (!preconDetail[key]) setPreconDetail(prev => ({ ...prev, [key]: detail }));
 
-        // Resolve every card name (commanders + main) to Scryfall objects.
-        const allNames = [...detail.commanders, ...detail.cards.map(c => c.name)];
-        const resolved = await resolveCardsByName(allNames, entry.set);
+        // Resolve every card to its EXACT printing on Scryfall using the
+        // {set, collector_number} hints from /download_with_printings.
+        const toPrinting = (x) => typeof x === "string"
+          ? { name: x, set: entry.set, number: null }
+          : { name: x.name, set: x.set || entry.set, number: x.number || null };
+        const printings = [...detail.commanders, ...detail.cards].map(toPrinting);
+        const resolved = await resolveCardsByPrinting(printings, entry.set);
         const findSF = (name) => resolved.get((name || "").toLowerCase()) || null;
 
-        const cmdrSFs = detail.commanders.map(n => ({ name: n, sf: findSF(n) }));
+        const cmdrSFs = detail.commanders.map(c => {
+          const n = preconEntryName(c);
+          return { name: n, sf: findSF(n) };
+        });
         const primary = cmdrSFs[0];
         const partner = cmdrSFs[1];
 
@@ -6080,14 +6238,16 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         // Card rows: everything in detail.cards becomes deck rows with the
         // mtg.wtf qty. Use Scryfall id when we have it (so the deck row
         // shows printing-specific data) and fall back to name-only otherwise.
-        const rows = detail.cards.map(c => {
+        // Honour the foil flag from /download_with_printings when present.
+        const rows = detail.cards.map(rawEntry => {
+          const c = typeof rawEntry === "string" ? { name: rawEntry, qty: 1 } : rawEntry;
           const sf = findSF(c.name);
           return {
             name: c.name,
             qty:  c.qty || 1,
             ...(sf?.id ? { id: sf.id } : {}),
             condition: "NM",
-            finish: "normal",
+            finish: c.foil ? "foil" : "normal",
             lang: "en",
           };
         });
@@ -7477,7 +7637,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             const key = entry.set + "/" + entry.slug;
                             const importing = preconImporting === key;
                             const alreadyHere = (groups.decks || []).some(d => d.precon?.set === entry.set && d.precon?.slug === entry.slug);
-                            const firstCmdr = (entry.commanders || [])[0];
+                            const cmdrNames = (entry.commanders || []).map(preconEntryName).filter(Boolean);
+                            const firstCmdr = cmdrNames[0] || null;
                             const cmdrArt = firstCmdr ? preconCmdrArt[firstCmdr.toLowerCase()] : null;
                             return html`
                               <div key=${key}
@@ -7511,7 +7672,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                       <div style=${{ fontSize:11, color:"var(--fg-text-soft)", marginTop:2,
                                         whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
                                         textShadow: cmdrArt ? "0 1px 3px var(--bg-surface), 0 0 6px var(--bg-surface)" : "none" }}>
-                                        👑 ${firstCmdr}${(entry.commanders || []).length > 1 ? ` + ${entry.commanders[1]}` : ""}
+                                        👑 ${firstCmdr}${cmdrNames.length > 1 ? ` + ${cmdrNames[1]}` : ""}
                                       </div>
                                     `}
                                     <div style=${{ fontSize:10, color:"var(--fg-text-muted)", marginTop:2,
