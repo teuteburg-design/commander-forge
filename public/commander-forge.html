@@ -897,17 +897,52 @@
     };
   }
 
+  // Primary path: hit the worker's cached precon catalog (/api/precons).
+  // Fallback: scrape mtg.wtf live through the CORS-proxy chain — used in
+  // local dev (proxy.py doesn't host the cache) or while the worker is
+  // doing a cold-start refresh.
   async function fetchMtgWtfIndex() {
+    try {
+      const r = await fetch("/api/precons", { headers: { Accept: "application/json" } });
+      if (r.ok || r.status === 202) {
+        const data = await r.json();
+        const entries = Array.isArray(data.entries) ? data.entries : [];
+        if (entries.length || r.status === 202) {
+          return { entries, via: "worker", updated: data.updated || 0, status: data.status };
+        }
+      }
+      // Anything else (404 from local dev, 5xx, malformed): fall back.
+    } catch {}
     const { html, via } = await fetchHtmlViaProxies("https://mtg.wtf/deck");
     const entries = parseMtgWtfIndex(html);
-    return { entries, via };
+    return { entries, via: `mtg.wtf:${via}` };
   }
 
   async function fetchMtgWtfDeck(setCode, slug) {
+    try {
+      const r = await fetch(`/api/precons/${encodeURIComponent(setCode)}/${encodeURIComponent(slug)}`,
+        { headers: { Accept: "application/json" } });
+      if (r.ok) {
+        const deck = await r.json();
+        return { deck, via: "worker", url: deck.url };
+      }
+    } catch {}
     const url = `https://mtg.wtf/deck/${encodeURIComponent(setCode)}/${encodeURIComponent(slug)}`;
     const { html, via } = await fetchHtmlViaProxies(url);
     const deck = parseMtgWtfDeck(html);
-    return { deck, via, url };
+    return { deck, via: `mtg.wtf:${via}`, url };
+  }
+
+  // Manual trigger — POSTs to the worker. 401 (no auth) and 503 (no KV) are
+  // both quiet no-ops on the client side; the user just sees no fresh data.
+  async function triggerPreconRefresh() {
+    try {
+      const r = await fetch("/api/precons/refresh", { method: "POST" });
+      if (!r.ok) return { ok:false, status: r.status };
+      return { ok:true, report: await r.json() };
+    } catch (e) {
+      return { ok:false, error: e?.message };
+    }
   }
 
   // Resolve a list of card names → Scryfall card objects. Uses the local
@@ -2361,6 +2396,8 @@
     const [preconExpanded,  setPreconExpanded]  = useState(null);   // "<set>/<slug>" currently expanded, or null
     const [preconDetail,    setPreconDetail]    = useState({});     // { "set/slug": parsedDeck }
     const [preconImporting, setPreconImporting] = useState(null);   // "set/slug" while importing
+    const [preconUpdated,   setPreconUpdated]   = useState(0);
+    const [preconRefreshing,setPreconRefreshing]= useState(false);
     const [viewingBinder,   setViewingBinder]   = useState(null);
     const [binderEnriched,  setBinderEnriched]  = useState({});
     const [binderLoading,   setBinderLoading]   = useState(false);
@@ -5496,13 +5533,58 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       if (preconIndex !== null) return;
       setPreconLoading(true); setPreconError("");
       try {
-        const { entries } = await fetchMtgWtfIndex();
+        const { entries, updated, status } = await fetchMtgWtfIndex();
         setPreconIndex(entries);
+        setPreconUpdated(updated || 0);
+        if (status === "refreshing") {
+          // Worker reported a cold-start refresh in flight — poll once after
+          // a short delay so the user sees data without manual reload.
+          setTimeout(async () => {
+            try {
+              const r = await fetch("/api/precons");
+              if (r.ok) {
+                const d = await r.json();
+                if (Array.isArray(d.entries) && d.entries.length) {
+                  setPreconIndex(d.entries);
+                  setPreconUpdated(d.updated || 0);
+                }
+              }
+            } catch {}
+          }, 4000);
+        }
       } catch (e) {
         setPreconError(e.message || "Failed to load pre-con list");
         setPreconIndex([]);
       } finally {
         setPreconLoading(false);
+      }
+    };
+
+    const refreshPreconCache = async () => {
+      setPreconRefreshing(true); setPreconError("");
+      try {
+        const res = await triggerPreconRefresh();
+        if (!res.ok) {
+          if (res.status === 401) {
+            setPreconError("Sign in to trigger a refresh — the daily cron still runs server-side.");
+          } else if (res.status === 503) {
+            setPreconError("Worker cache isn't configured (KV missing). Falling back to live scrape.");
+          } else {
+            setPreconError(res.error || `Refresh failed (${res.status || "network"})`);
+          }
+          return;
+        }
+        // Re-pull the index after the refresh succeeds.
+        const r = await fetch("/api/precons");
+        if (r.ok) {
+          const d = await r.json();
+          if (Array.isArray(d.entries)) {
+            setPreconIndex(d.entries);
+            setPreconUpdated(d.updated || 0);
+          }
+        }
+      } finally {
+        setPreconRefreshing(false);
       }
     };
 
@@ -6838,10 +6920,31 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   <div>
                     <h2 style=${{ fontSize:18, color:"var(--fg-text-heading)", marginBottom:6 }}>Pre-constructed decks</h2>
                     <p style=${{ fontSize:13, color:"var(--fg-text-soft)", maxWidth:680, lineHeight:1.55 }}>
-                      Every Wizards-published preconstructed deck, sourced from <strong>mtg.wtf/deck</strong>.
-                      Pick a category, expand any deck to preview the decklist, then import as a Commander deck.
-                      Partner decks bring both commanders in automatically.
+                      Every Wizards-published preconstructed deck, sourced from <strong>mtg.wtf/deck</strong> and cached here.
+                      A daily refresh checks for new decks; you can also force one below. Partner decks bring both commanders in automatically.
                     </p>
+                  </div>
+                  <div style=${{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:6, flexShrink:0 }}>
+                    <button onClick=${refreshPreconCache}
+                      disabled=${preconRefreshing}
+                      style=${{
+                        ...btnSec, fontSize:11, padding:"6px 12px", whiteSpace:"nowrap",
+                        opacity: preconRefreshing ? 0.6 : 1,
+                        cursor: preconRefreshing ? "wait" : "pointer",
+                      }}>
+                      ${preconRefreshing ? "Refreshing…" : "↻ Check for updates"}
+                    </button>
+                    ${preconUpdated > 0 && html`
+                      <span style=${{ fontSize:10, color:"var(--fg-text-muted)", whiteSpace:"nowrap" }}>
+                        Updated ${(() => {
+                          const secs = Math.max(0, Math.floor((Date.now() - preconUpdated) / 1000));
+                          if (secs < 60) return `${secs}s ago`;
+                          if (secs < 3600) return `${Math.floor(secs/60)}m ago`;
+                          if (secs < 86400) return `${Math.floor(secs/3600)}h ago`;
+                          return `${Math.floor(secs/86400)}d ago`;
+                        })()}
+                      </span>
+                    `}
                   </div>
                 </div>
 

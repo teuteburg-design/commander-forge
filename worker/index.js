@@ -74,6 +74,18 @@ export default {
       return handleSharedGemini(request, env);
     }
 
+    // ── Pre-con catalog (cached from mtg.wtf) ───────────────────────────
+    if (url.pathname === "/api/precons" && request.method === "GET") {
+      return handlePreconIndex(request, env, ctx);
+    }
+    if (url.pathname === "/api/precons/refresh" && request.method === "POST") {
+      return handlePreconRefresh(request, env, ctx);
+    }
+    const preconMatch = url.pathname.match(/^\/api\/precons\/([^/]+)\/([^/]+)$/);
+    if (preconMatch && request.method === "GET") {
+      return handlePreconDeck(request, env, preconMatch[1], preconMatch[2]);
+    }
+
     // Match against proxy routes. First-prefix-wins.
     for (const [prefix, target] of Object.entries(PROXY_ROUTES)) {
       if (url.pathname.startsWith(prefix)) {
@@ -84,7 +96,275 @@ export default {
     // Everything else: static asset.
     return env.ASSETS.fetch(request);
   },
+
+  // Cron-triggered refresh. wrangler.toml controls the schedule
+  // (default: daily @ 06:00 UTC).
+  async scheduled(_controller, env, ctx) {
+    ctx.waitUntil(refreshPrecons(env, { reason: "cron" }).catch(err => {
+      console.error("Cron refresh failed:", err);
+    }));
+  },
 };
+
+// ── Pre-con cache ───────────────────────────────────────────────────────
+// We mirror mtg.wtf/deck server-side so the client gets a fast same-origin
+// JSON API (no third-party scraping, no per-user CORS proxy hops). The
+// scheduled handler diffs the upstream index nightly and pulls any new or
+// changed decks via their /download plain-text endpoint.
+const KV_PRECON_INDEX  = "precons:index";          // { updated, entries: [...] }
+const KV_PRECON_DECK   = (set, slug) => `precons:deck:${set}/${slug}`;
+const KV_PRECON_LOCK   = "precons:lock";           // simple in-flight marker
+const PRECON_MAX_PARALLEL = 4;                     // simultaneous /download fetches
+
+async function fetchText(url, label = "") {
+  const r = await fetch(url, {
+    headers: { "User-Agent": BROWSER_UA, "Accept": "text/html,text/plain,*/*" },
+  });
+  if (!r.ok) throw new Error(`${label || url}: HTTP ${r.status}`);
+  return await r.text();
+}
+
+// Decode HTML entities — workers don't have a DOM textarea trick, so this
+// covers the handful that mtg.wtf actually emits.
+function decodeHtmlEntities(s) {
+  if (!s) return s;
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)));
+}
+
+function preconCategory(type) {
+  const t = (type || "").toLowerCase();
+  if (t.includes("commander")) return "commander";
+  if (t.includes("welcome")) return "welcome";
+  if (t.includes("jumpstart")) return "jumpstart";
+  if (t.includes("theme") || t.includes("starter") || t.includes("challenger")
+      || t.includes("planeswalker deck") || t.includes("planeswalker pack")) return "theme";
+  return "other";
+}
+
+// Walk the mtg.wtf /deck HTML with regex (no DOMParser in workers). We
+// alternate between heading captures (set name) and list-item captures
+// (individual deck entries). Pulls every /deck/<set>/<slug> link with its
+// type + card count + parent set name.
+function parseMtgWtfIndexHtml(html) {
+  const out = [];
+  let currentSet = null;
+  // One regex that matches either an opening heading OR a <li>...</li> entry
+  // in source order. We use the running `g` flag's lastIndex to advance.
+  const re = /<(h[1-6])\b[^>]*>([\s\S]*?)<\/\1>|<li\b[^>]*>([\s\S]*?)<\/li>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    if (m[1]) {
+      // Heading — extract text only.
+      const txt = decodeHtmlEntities(m[2].replace(/<[^>]+>/g, "").trim());
+      if (txt) currentSet = txt;
+    } else if (m[3] && currentSet) {
+      const liInner = m[3];
+      const deckLink = liInner.match(/<a\b[^>]+href="\/deck\/([^"\/]+)\/([^"\/]+)"[^>]*>([\s\S]*?)<\/a>/i);
+      if (!deckLink) continue;
+      const setCode = deckLink[1].toLowerCase();
+      const slug = deckLink[2];
+      const name = decodeHtmlEntities(deckLink[3].replace(/<[^>]+>/g, "").trim());
+      // The tail after the anchor carries "— Commander Deck (100 cards)".
+      const afterAnchor = liInner.slice(liInner.indexOf("</a>") + 4);
+      const tail = decodeHtmlEntities(afterAnchor.replace(/<[^>]+>/g, "").trim().replace(/^[—–-]\s*/, ""));
+      const cardMatch = tail.match(/\((\d+)\s*cards?\)/i);
+      const cardCount = cardMatch ? parseInt(cardMatch[1], 10) : null;
+      const type = tail.replace(/\(.*?\)/g, "").trim();
+      const collector = /collector/i.test(currentSet) || /collector/i.test(name);
+      out.push({
+        set: setCode, slug, name, type, cardCount,
+        setName: currentSet,
+        collector,
+        category: preconCategory(type),
+      });
+    }
+  }
+  return out;
+}
+
+// Parse the /deck/<set>/<slug>/download plain-text format:
+//   // NAME: ...
+//   // URL: ...
+//   // DATE: 2026-06-26
+//   COMMANDER: 1 Card Name
+//   PARTNER: 1 Card Name
+//   1 Other Card
+//   ...
+function parseMtgWtfDownload(text) {
+  const lines = text.split(/\r?\n/);
+  const meta = {};
+  const commanders = [];
+  const cards = [];
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("//")) {
+      const m = line.match(/^\/\/\s*([A-Z]+):\s*(.+)$/);
+      if (m) meta[m[1].toLowerCase()] = m[2].trim();
+      continue;
+    }
+    const cmdMatch = line.match(/^(COMMANDER|PARTNER|COMPANION)\s*:\s*(\d+)\s+(.+)$/i);
+    if (cmdMatch) {
+      const role = cmdMatch[1].toUpperCase();
+      const cardName = cmdMatch[3].trim();
+      if (role === "COMMANDER" || role === "PARTNER") commanders.push(cardName);
+      // companion: ignored for the deck-builder model (no slot)
+      continue;
+    }
+    const cardMatch = line.match(/^(\d+)\s+(.+)$/);
+    if (cardMatch) {
+      cards.push({ name: cardMatch[2].trim(), qty: parseInt(cardMatch[1], 10) });
+    }
+  }
+  return {
+    name:        meta.name        || "",
+    url:         meta.url         || "",
+    releasedAt:  meta.date        || "",
+    commanders,
+    partners:    commanders.length >= 2,
+    cards,
+  };
+}
+
+async function fetchAndParseDeck(setCode, slug) {
+  const url = `https://mtg.wtf/deck/${encodeURIComponent(setCode)}/${encodeURIComponent(slug)}/download`;
+  const text = await fetchText(url, `download ${setCode}/${slug}`);
+  const parsed = parseMtgWtfDownload(text);
+  // /download omits the set name and deck type; copy them from the index.
+  return { ...parsed, set: setCode, slug };
+}
+
+async function readPreconIndex(env) {
+  if (!env.STATE) return null;
+  const raw = await env.STATE.get(KV_PRECON_INDEX);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+// Diff and refresh. Compares upstream entries to the cached index. For every
+// new or changed entry (changes detected via shallow key equality on name/
+// type/cardCount/setName) we re-fetch the /download text and store it.
+async function refreshPrecons(env, { reason = "unknown", force = false } = {}) {
+  if (!env.STATE) throw new Error("STATE KV not configured");
+
+  // Lightweight lock to keep two refreshes from racing. KV writes are
+  // strongly consistent within a region but eventual across, so this is
+  // best-effort — it just avoids most accidental double-runs.
+  const lockRaw = await env.STATE.get(KV_PRECON_LOCK);
+  if (lockRaw && !force) {
+    const since = Date.now() - parseInt(lockRaw, 10);
+    if (since < 10 * 60 * 1000) return { skipped: true, reason: "lock held" };
+  }
+  await env.STATE.put(KV_PRECON_LOCK, String(Date.now()), { expirationTtl: 600 });
+
+  const startedAt = Date.now();
+  const indexHtml = await fetchText("https://mtg.wtf/deck", "index");
+  const upstream  = parseMtgWtfIndexHtml(indexHtml);
+
+  const current = await readPreconIndex(env);
+  const seenKey = new Map();
+  (current?.entries || []).forEach(e => {
+    seenKey.set(`${e.set}/${e.slug}`, e);
+  });
+
+  // Find entries that are new OR whose visible metadata changed.
+  const dirty = [];
+  for (const u of upstream) {
+    const k = `${u.set}/${u.slug}`;
+    const old = seenKey.get(k);
+    if (!old
+        || old.name !== u.name
+        || old.type !== u.type
+        || old.cardCount !== u.cardCount
+        || old.setName !== u.setName) {
+      dirty.push(u);
+    }
+  }
+
+  // Limited parallelism so we don't DOS mtg.wtf (or hit worker subrequest caps).
+  let downloaded = 0;
+  let failed = 0;
+  for (let i = 0; i < dirty.length; i += PRECON_MAX_PARALLEL) {
+    const batch = dirty.slice(i, i + PRECON_MAX_PARALLEL);
+    const results = await Promise.allSettled(batch.map(async (e) => {
+      const deck = await fetchAndParseDeck(e.set, e.slug);
+      await env.STATE.put(KV_PRECON_DECK(e.set, e.slug), JSON.stringify({
+        ...deck,
+        setName: e.setName,
+        type: e.type,
+        cardCount: e.cardCount,
+      }));
+    }));
+    for (const r of results) (r.status === "fulfilled" ? downloaded++ : failed++);
+  }
+
+  // Write the new index. We always store the FULL upstream listing (not a
+  // diff) so the client gets a consistent snapshot.
+  const indexDoc = {
+    updated: Date.now(),
+    upstreamCount: upstream.length,
+    cachedDecks: upstream.length,
+    entries: upstream,
+    lastRefresh: { reason, startedAt, finishedAt: Date.now(), downloaded, failed, dirty: dirty.length },
+  };
+  await env.STATE.put(KV_PRECON_INDEX, JSON.stringify(indexDoc));
+  await env.STATE.delete(KV_PRECON_LOCK);
+  return indexDoc.lastRefresh;
+}
+
+async function handlePreconIndex(request, env, ctx) {
+  if (!env.STATE) return jsonResponse({ error: "precon cache not configured" }, 503);
+  let doc = await readPreconIndex(env);
+  // Cold start: kick off a refresh in the background and return a 202 with
+  // any cached data we have (which will be null on the very first call).
+  if (!doc) {
+    ctx.waitUntil(refreshPrecons(env, { reason: "cold-start" }).catch(() => {}));
+    return jsonResponse({
+      entries: [],
+      updated: 0,
+      status: "refreshing",
+    }, 202);
+  }
+  return jsonResponse(doc);
+}
+
+async function handlePreconDeck(_request, env, setCode, slug) {
+  if (!env.STATE) return jsonResponse({ error: "precon cache not configured" }, 503);
+  const raw = await env.STATE.get(KV_PRECON_DECK(setCode, slug));
+  if (raw) {
+    try { return jsonResponse(JSON.parse(raw)); } catch {}
+  }
+  // Cache miss — fetch on demand (don't wait for the next cron).
+  try {
+    const deck = await fetchAndParseDeck(setCode, slug);
+    await env.STATE.put(KV_PRECON_DECK(setCode, slug), JSON.stringify(deck));
+    return jsonResponse(deck);
+  } catch (e) {
+    return jsonResponse({ error: e?.message || "fetch failed" }, 502);
+  }
+}
+
+async function handlePreconRefresh(request, env, ctx) {
+  if (!env.STATE) return jsonResponse({ error: "precon cache not configured" }, 503);
+  // Anyone signed in can trigger a refresh. Anonymous callers get a 401 so we
+  // don't expose an open trigger for an upstream-traffic-generator.
+  const email = authenticatedEmail(request);
+  if (!email) return jsonResponse({ error: "not authenticated" }, 401);
+  try {
+    const report = await refreshPrecons(env, { reason: `manual:${email}`, force: true });
+    return jsonResponse({ ok: true, ...report });
+  } catch (e) {
+    return jsonResponse({ error: e?.message || "refresh failed" }, 500);
+  }
+}
 
 // ── Auth / identity ─────────────────────────────────────────────────────
 // We trust the email header iff there's ALSO a JWT assertion present —
