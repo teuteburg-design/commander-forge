@@ -1955,6 +1955,88 @@
     return (tl.includes("legendary") && (tl.includes("creature") || tl.includes("planeswalker")))
       || ol.includes("can be your commander");
   }
+
+  // ── Partner / second-commander mechanic detection ────────────────────────
+  // Returns null when a card has no second-commander ability, otherwise an
+  // object describing the mechanic:
+  //   { type: "partner" }                        — open-ended Partner
+  //   { type: "partnerWith", target: "Name" }    — bonded pair (Frodo + Sam)
+  //   { type: "friendsForever" }                 — Strixhaven, open-ended
+  //   { type: "doctor" }                         — Doctor Who, needs a Companion
+  //   { type: "companion" }                      — Doctor Who, the partner half
+  //   { type: "chooseABackground" }              — D&D, pairs with a Background
+  //   { type: "background" }                     — D&D, the partner half
+  // We only look at oracle text (cheap, no fetch). Two-faced cards are joined.
+  function partnerMechanic(sf) {
+    if (!sf) return null;
+    const faces = sf.card_faces || [];
+    const tl = [sf.type_line, ...faces.map(f => f.type_line)].filter(Boolean).join(" // ").toLowerCase();
+    const ol = [sf.oracle_text, ...faces.map(f => f.oracle_text)].filter(Boolean).join("\n").toLowerCase();
+    // "Background" type-line: this card is the partner half for Choose-a-Background.
+    if (/\bbackground\b/.test(tl) && /enchantment/.test(tl)) return { type: "background" };
+    // "Choose a Background" oracle text: this card chooses one.
+    if (/choose a background/.test(ol)) return { type: "chooseABackground" };
+    // "Doctor's companion": this card partners with a Doctor.
+    if (/doctor's companion/.test(ol)) return { type: "companion" };
+    // Doctor (the partner half for a Companion). Detected via Time Lord
+    // Doctor type line or "[card] partners with [a] doctor" — Scryfall puts
+    // 'Time Lord Doctor' in the type line of Doctors.
+    if (/time lord doctor/.test(tl)) return { type: "doctor" };
+    // "Friends forever": Strixhaven mechanic.
+    if (/friends forever/.test(ol)) return { type: "friendsForever" };
+    // "Partner with <Name>" — bonded pair. Match the text up to a sentence
+    // boundary or "(". Be tolerant of card-face artefacts.
+    const pw = ol.match(/partner with ([^(\n.]+)/);
+    if (pw) {
+      const target = pw[1].trim().replace(/[.,;]+$/, "");
+      // Title-case the target to match Scryfall card names. We compare
+      // case-insensitively elsewhere so this is just for display.
+      const display = target.replace(/\b\w/g, c => c.toUpperCase());
+      return { type: "partnerWith", target: display };
+    }
+    // Plain "Partner" (open-ended). Anchored as a sentence-ish marker so
+    // we don't false-positive on "partner with X" (handled above) or
+    // "Doctor's companion" (handled above).
+    if (/(^|\n|\.\s+)partner(\.|\n|$| \()/i.test(ol)) return { type: "partner" };
+    return null;
+  }
+
+  // Can two cards legally be each other's second commander?
+  function arePartnersLegal(aSf, bSf) {
+    if (!aSf || !bSf) return false;
+    const a = partnerMechanic(aSf);
+    const b = partnerMechanic(bSf);
+    if (!a || !b) return false;
+    if (aSf.name && bSf.name && aSf.name.toLowerCase() === bSf.name.toLowerCase()) return false;
+    // Bonded pair: both must say "Partner with" and reference each other.
+    if (a.type === "partnerWith" || b.type === "partnerWith") {
+      return a.type === "partnerWith" && b.type === "partnerWith"
+        && a.target?.toLowerCase() === bSf.name?.toLowerCase()
+        && b.target?.toLowerCase() === aSf.name?.toLowerCase();
+    }
+    if (a.type === "partner" && b.type === "partner") return true;
+    if (a.type === "friendsForever" && b.type === "friendsForever") return true;
+    if ((a.type === "doctor" && b.type === "companion")
+      || (a.type === "companion" && b.type === "doctor")) return true;
+    if ((a.type === "chooseABackground" && b.type === "background")
+      || (a.type === "background" && b.type === "chooseABackground")) return true;
+    return false;
+  }
+
+  // Short user-facing label for a partner mechanic.
+  function partnerMechanicLabel(m) {
+    if (!m) return "";
+    switch (m.type) {
+      case "partner":           return "Partner";
+      case "partnerWith":       return `Partner with ${m.target}`;
+      case "friendsForever":    return "Friends forever";
+      case "doctor":            return "Doctor (needs a Companion)";
+      case "companion":         return "Doctor's companion";
+      case "chooseABackground": return "Choose a Background";
+      case "background":        return "Background";
+      default:                  return "";
+    }
+  }
   function computeUsable(groups, deckInc, binInc) {
     const seen = new Map();
     const add = cards => cards.forEach(c => {
@@ -2436,6 +2518,10 @@
     // by query so the user can pick a card to move into the open deck.
     const [addToDeckOpen,  setAddToDeckOpen]  = useState(false);
     const [addToDeckQuery, setAddToDeckQuery] = useState("");
+    // "Pick a partner commander" modal: open when the user clicks
+    // "+ Add partner" on the deck-view sidebar. Lists legal partners
+    // found inside the open deck's categories.
+    const [partnerPickerOpen, setPartnerPickerOpen] = useState(false);
     // "Remove card from deck" modal — { name, deckName } when open, plus
     // the chosen destination ("__uncategorised__" sentinel or a binder name).
     const [cardRemove,       setCardRemove]       = useState(null);
@@ -5515,6 +5601,98 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setLibSaved(false);
       setUnsavedDeck(null);
       setPhase("deck");
+    };
+
+    // Assign a partner from a card already in the deck. Pulls the card OUT
+    // of deck.categories (it now lives in the command zone) and stashes it
+    // as deck.partner. Persists when the deck is saved (lives in groups.decks
+    // under deck.theme); otherwise updates in-memory state only.
+    const assignPartnerFromDeck = (partnerCard) => {
+      if (!deck || !selCmd || !partnerCard?.scryfall) return;
+      // Mutate categories: drop the card from whatever bucket it sits in.
+      const nextCategories = (deck.categories || []).map(cat => ({
+        ...cat,
+        cards: (cat.cards || []).filter(c =>
+          (c.name || "").toLowerCase() !== (partnerCard.name || "").toLowerCase()),
+      })).filter(cat => cat.cards.length > 0);
+      const partnerEntry = {
+        name: partnerCard.name,
+        card: { name: partnerCard.name, scryfall: partnerCard.scryfall },
+      };
+      const nextDeck = { ...deck, categories: nextCategories, partner: partnerEntry };
+      setDeck(nextDeck);
+      // Persist on saved decks.
+      if (!previewingPrecon && deck.theme) {
+        const matchName = deck.theme;
+        const updated = (groups.decks || []).map(d => {
+          if (d.name !== matchName) return d;
+          return {
+            ...d,
+            partnerName: partnerEntry.name,
+            partner:     partnerEntry,
+            deckData:    nextDeck,
+            // Drop the chosen card from the persisted maindeck rows too.
+            cards: (d.cards || []).filter(c =>
+              (c.name || "").toLowerCase() !== (partnerCard.name || "").toLowerCase()),
+          };
+        });
+        if (updated !== groups.decks) persistGroups({ ...groups, decks: updated });
+      }
+      setPartnerPickerOpen(false);
+    };
+
+    // Drop the current partner. The card returns to the deck via the
+    // categories bucket — re-categorise on the fly to match enrichImportedDeck.
+    const removePartner = () => {
+      if (!deck?.partner?.card?.scryfall) return;
+      const partner = deck.partner;
+      const sf = partner.card.scryfall;
+      const tl = (sf.type_line || "").toLowerCase();
+      const cat = /\bland\b/.test(tl) ? "Lands"
+        : /creature/.test(tl)       ? "Creatures"
+        : /instant/.test(tl)        ? "Instants"
+        : /sorcery/.test(tl)        ? "Sorceries"
+        : /enchantment/.test(tl)    ? "Enchantments"
+        : /artifact/.test(tl)       ? "Artifacts"
+        : /planeswalker/.test(tl)   ? "Planeswalkers"
+        : /battle/.test(tl)         ? "Battles"
+        :                             "Other";
+      const newCard = {
+        name: partner.name, reason: "",
+        img: sf.image_uris?.small || sf.card_faces?.[0]?.image_uris?.small || null,
+        mana_cost: sf.mana_cost || sf.card_faces?.[0]?.mana_cost || "",
+        cmc: typeof sf.cmc === "number" ? sf.cmc : 0,
+        type_line: sf.type_line || "",
+        color_identity: sf.color_identity || [],
+        isLand: /\bland\b/.test(tl),
+        id: sf.id || null,
+        set: sf.set || null,
+        collector_number: sf.collector_number || null,
+      };
+      const cats = [...(deck.categories || [])];
+      let bucket = cats.find(c => c.name === cat);
+      if (!bucket) { bucket = { name: cat, cards: [] }; cats.push(bucket); }
+      bucket.cards = [...bucket.cards, newCard];
+      const { partner: _p, ...rest } = deck;
+      const nextDeck = { ...rest, categories: cats };
+      setDeck(nextDeck);
+      if (!previewingPrecon && deck.theme) {
+        const matchName = deck.theme;
+        const updated = (groups.decks || []).map(d => {
+          if (d.name !== matchName) return d;
+          const { partner: _q, partnerName: _r, ...drest } = d;
+          return {
+            ...drest,
+            deckData: nextDeck,
+            cards: [...(d.cards || []), {
+              name: partner.name, qty: 1,
+              ...(sf.id ? { id: sf.id } : {}),
+              condition: "NM", finish: "normal", lang: "en",
+            }],
+          };
+        });
+        persistGroups({ ...groups, decks: updated });
+      }
     };
 
     // Swap the displayed primary commander with the partner. Works for any
@@ -8737,22 +8915,50 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   padding:"14px 14px 20px",
                   boxShadow:"0 4px 20px rgba(0,0,0,0.12)",
                 }}>
-                  <div style=${{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
-                    <div style=${{ fontSize:9, letterSpacing:3, color:"var(--accent-text)",
-                      textTransform:"uppercase", fontWeight:700 }}>👑 Commander${deck.partner ? " · Partner" : ""}</div>
-                    ${deck.partner && deck.partner.card?.scryfall && html`
-                      <button onClick=${swapPartnerCommander}
-                        title=${`Switch primary commander to ${deck.partner.name}`}
-                        style=${{
-                          background:"var(--bg-surface-soft)", border:"1px solid var(--border)",
-                          borderRadius:14, padding:"3px 9px", fontFamily:"inherit", cursor:"pointer",
-                          fontSize:10, color:"var(--accent-dark)", fontWeight:700,
-                          display:"inline-flex", alignItems:"center", gap:4,
-                        }}>
-                        ⇄ ${deck.partner.name.split(",")[0]}
-                      </button>
-                    `}
-                  </div>
+                  ${(() => {
+                    const mech = partnerMechanic(sf);
+                    const hasPartner = !!(deck.partner && deck.partner.card?.scryfall);
+                    return html`
+                      <div style=${{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:6, marginBottom:6, flexWrap:"wrap" }}>
+                        <div style=${{ fontSize:9, letterSpacing:3, color:"var(--accent-text)",
+                          textTransform:"uppercase", fontWeight:700 }}>👑 Commander${hasPartner ? " · Partner" : ""}</div>
+                        ${hasPartner && html`
+                          <button onClick=${swapPartnerCommander}
+                            title=${`Switch primary commander to ${deck.partner.name}`}
+                            style=${{
+                              background:"var(--bg-surface-soft)", border:"1px solid var(--border)",
+                              borderRadius:14, padding:"3px 9px", fontFamily:"inherit", cursor:"pointer",
+                              fontSize:10, color:"var(--accent-dark)", fontWeight:700,
+                              display:"inline-flex", alignItems:"center", gap:4,
+                            }}>
+                            ⇄ ${deck.partner.name.split(",")[0]}
+                          </button>
+                        `}
+                        ${!hasPartner && mech && html`
+                          <button onClick=${() => setPartnerPickerOpen(true)}
+                            title=${`This commander has ${partnerMechanicLabel(mech)} — pick a partner from the deck`}
+                            style=${{
+                              background:"var(--bg-surface-soft)", border:"1px dashed var(--border-strong)",
+                              borderRadius:14, padding:"3px 9px", fontFamily:"inherit", cursor:"pointer",
+                              fontSize:10, color:"var(--accent-dark)", fontWeight:700,
+                            }}>
+                            + Add partner
+                          </button>
+                        `}
+                      </div>
+                      ${mech && html`
+                        <div style=${{ fontSize:10, color:"var(--fg-text-muted)", fontStyle:"italic", marginBottom:8 }}>
+                          ${partnerMechanicLabel(mech)}
+                          ${hasPartner && html`
+                            · <button onClick=${removePartner}
+                              style=${{ background:"transparent", border:"none", padding:0,
+                                color:"var(--danger)", cursor:"pointer", fontFamily:"inherit",
+                                fontSize:10, textDecoration:"underline" }}>remove partner</button>
+                          `}
+                        </div>
+                      `}
+                    `;
+                  })()}
 
                   ${img && html`
                     <img src=${img} alt=${selCmd.card.name}
@@ -10232,6 +10438,100 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           </div>
         </div>
       `}
+
+      <!-- ── Partner picker: pick a legal second commander from the deck ────── -->
+      ${partnerPickerOpen && deck && selCmd && (() => {
+        const cmdrSF = selCmd.card?.scryfall || {};
+        const mech = partnerMechanic(cmdrSF);
+        const close = () => setPartnerPickerOpen(false);
+        // Scan every card in the deck's categories. Keep those whose
+        // scryfall data exists AND form a legal partner pair with the
+        // current commander. Cards reach us via category buckets; their
+        // Scryfall data was attached at enrichment time as `img` etc.,
+        // and the SF cache has the full slim record by name.
+        const sfCache = getSFCache();
+        const seen = new Set();
+        const candidates = [];
+        for (const cat of (deck.categories || [])) {
+          for (const c of (cat.cards || [])) {
+            const key = (c.name || "").toLowerCase();
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            const sf = sfCache[key]?.d;
+            if (!sf) continue;
+            if (arePartnersLegal(cmdrSF, sf)) {
+              candidates.push({ name: c.name, scryfall: sf });
+            }
+          }
+        }
+        // For "Partner with X" we want the named partner even if not in
+        // the deck — let the user know they'd need to add it.
+        let hint = null;
+        if (mech?.type === "partnerWith") {
+          const found = candidates.some(c =>
+            (c.name || "").toLowerCase() === mech.target.toLowerCase());
+          if (!found) hint = `Looking for ${mech.target} — add it to the deck first to make it your partner.`;
+        }
+        return html`
+          <div onClick=${close} style=${{
+            position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", zIndex:9000,
+            display:"flex", alignItems:"center", justifyContent:"center", padding:20,
+          }}>
+            <div onClick=${e => e.stopPropagation()} style=${{
+              background:"var(--bg-surface)", borderRadius:12, maxWidth:560, width:"100%",
+              maxHeight:"80vh", overflow:"auto", padding:"18px 22px",
+              boxShadow:"0 20px 60px rgba(0,0,0,0.35)",
+            }}>
+              <div style=${{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
+                <h3 style=${{ fontSize:16, color:"var(--fg-text-heading)", margin:0 }}>Pick a partner</h3>
+                <button onClick=${close} style=${{ background:"transparent", border:"none", fontSize:18, cursor:"pointer", color:"var(--fg-text-muted)" }}>×</button>
+              </div>
+              <div style=${{ fontSize:12, color:"var(--fg-text-soft)", marginBottom:14 }}>
+                ${selCmd.card?.name} has <strong>${partnerMechanicLabel(mech)}</strong>.
+                ${candidates.length > 0
+                  ? html` Pick one of these legal partners from the deck:`
+                  : html` No legal partners are currently in the deck.`}
+              </div>
+              ${hint && html`
+                <div style=${{
+                  fontSize:11, color:"var(--accent-text)", background:"var(--bg-surface-soft)",
+                  border:"1px solid var(--border-soft)", borderRadius:8, padding:"8px 10px",
+                  marginBottom:12,
+                }}>${hint}</div>
+              `}
+              ${candidates.length === 0 && html`
+                <div style=${{ fontSize:12, color:"var(--fg-text-muted)", fontStyle:"italic" }}>
+                  Add a legal partner via the "+ Add from collection" button on the deck view, then re-open this picker.
+                </div>
+              `}
+              <div style=${{ display:"flex", flexDirection:"column", gap:6, marginTop:4 }}>
+                ${candidates.map(c => {
+                  const csf = c.scryfall;
+                  const ci  = csf.color_identity || [];
+                  const img = csf.image_uris?.small || csf.card_faces?.[0]?.image_uris?.small;
+                  return html`
+                    <button key=${c.name} onClick=${() => assignPartnerFromDeck(c)}
+                      style=${{
+                        display:"flex", alignItems:"center", gap:10, padding:"8px 10px",
+                        background:"var(--bg-surface-soft)", border:"1px solid var(--border)",
+                        borderRadius:8, cursor:"pointer", fontFamily:"inherit", textAlign:"left",
+                      }}>
+                      ${img && html`<img src=${img} alt="" style=${{ width:36, height:50, objectFit:"cover", borderRadius:4, flexShrink:0 }} />`}
+                      <div style=${{ flex:1, minWidth:0 }}>
+                        <div style=${{ fontSize:13, fontWeight:700, color:"var(--fg-text-strong)" }}>${c.name}</div>
+                        <div style=${{ fontSize:11, color:"var(--fg-text-soft)", marginTop:2, display:"flex", alignItems:"center", gap:6 }}>
+                          ${ci.length > 0 && html`<span style=${{ display:"inline-flex", gap:2 }}>${ci.map(col => html`<${Pip} key=${col} c=${col} size=${12} />`)}</span>`}
+                          <span>${partnerMechanicLabel(partnerMechanic(csf))}</span>
+                        </div>
+                      </div>
+                    </button>
+                  `;
+                })}
+              </div>
+            </div>
+          </div>
+        `;
+      })()}
 
       <!-- ── Add card from collection to the open deck ────────────────────── -->
       ${addToDeckOpen && deck && (groups.decks || []).some(d => d.name === deck.theme) && (() => {
