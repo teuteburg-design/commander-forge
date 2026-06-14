@@ -782,57 +782,58 @@
   // Parse the /deck index page into [{ set, slug, name, type, cardCount,
   // setName, collector }] entries. The page is markdown-converted by the
   // proxy/fetch chain into a flat HTML tree; we use DOMParser to walk it.
+  // Real mtg.wtf /deck structure (verified 2026-06):
+  //   <div>Marvel Super Heroes Commander (MSC)</div>
+  //   <ul>
+  //     <li><a href="/deck/msc/avengers-assemble">Avengers Assemble</a>(Commander Deck, 100 cards)</li>
+  //     …
+  //   </ul>
+  // Set names live in unclassed <div> blocks (no heading tag). Build a
+  // code→setName map first, then walk every /deck/<set>/<slug> anchor.
   function parseMtgWtfIndex(html) {
     const doc = new DOMParser().parseFromString(html, "text/html");
-    // Each set is an <h3> (or <h2>/<h4> depending on the markup) followed
-    // by an <ul> of <li> entries. Be liberal about heading levels.
+    const codeToSet = new Map();
+    for (const div of doc.querySelectorAll("div")) {
+      // Skip Bootstrap / layout divs; we only care about plain text+CODE divs.
+      if (div.children.length || !div.textContent) continue;
+      const txt = decodeEntities(div.textContent.trim());
+      const m = txt.match(/^(.+?)\s*\(([A-Za-z0-9_]+)\)\s*$/);
+      if (m) codeToSet.set(m[2].toLowerCase(), m[1].trim());
+    }
     const out = [];
-    let currentSet = null;
-    let currentSetCode = null;
-    const root = doc.body || doc;
-    const walk = (node) => {
-      for (const child of Array.from(node.children || [])) {
-        const tag = child.tagName?.toLowerCase();
-        if (/^h[1-6]$/.test(tag || "")) {
-          // Heading: pick up the set name. If the heading contains a link
-          // to /set/<code> we can grab the code; otherwise fall back to slug.
-          const setLink = child.querySelector('a[href^="/set/"]');
-          if (setLink) {
-            const m = setLink.getAttribute("href").match(/\/set\/([^/]+)/);
-            currentSetCode = m ? m[1] : null;
-          }
-          currentSet = (child.textContent || "").trim();
-        } else if (tag === "ul" && currentSet) {
-          for (const li of Array.from(child.querySelectorAll("li"))) {
-            // Entries look like:
-            //   <li><a href="/deck/<set>/<slug>">Deck Name</a> — Commander Deck (100 cards)</li>
-            const a = li.querySelector('a[href^="/deck/"]');
-            if (!a) continue;
-            const href = a.getAttribute("href") || "";
-            const m = href.match(/^\/deck\/([^/]+)\/([^/?#]+)/);
-            if (!m) continue;
-            const setCode = m[1].toLowerCase();
-            const slug = m[2];
-            const name = decodeEntities((a.textContent || "").trim());
-            const tail = decodeEntities((li.textContent || "").replace(name, "").trim().replace(/^[—–-]\s*/, ""));
-            // tail looks like "Commander Deck (100 cards)"
-            const cardMatch = tail.match(/\((\d+)\s*cards?\)/i);
-            const cardCount = cardMatch ? parseInt(cardMatch[1], 10) : null;
-            const type = tail.replace(/\(.*?\)/g, "").trim();
-            const setName = currentSet || setCode;
-            const collector = /collector/i.test(setName) || /collector/i.test(name);
-            out.push({
-              set: setCode, slug, name, type, cardCount,
-              setName, collector,
-              category: preconCategory(type),
-            });
-          }
-        } else if (child.children?.length) {
-          walk(child);
+    for (const a of doc.querySelectorAll('a[href^="/deck/"]')) {
+      const href = a.getAttribute("href") || "";
+      const m = href.match(/^\/deck\/([^/]+)\/([^/?#]+)/);
+      if (!m) continue;
+      const setCode = m[1].toLowerCase();
+      const slug = m[2];
+      const name = decodeEntities((a.textContent || "").trim());
+      // The trailing "(Commander Deck, 100 cards)" sits as a text sibling
+      // immediately after the </a>.
+      let tail = "";
+      let n = a.nextSibling;
+      while (n && n.nodeType === 3 /* TEXT */) { tail += n.nodeValue; n = n.nextSibling; }
+      tail = decodeEntities(tail.trim());
+      let type = "", cardCount = null;
+      const tailMatch = tail.match(/^\(\s*(.+?)\s*\)\s*$/);
+      if (tailMatch) {
+        const inner = tailMatch[1];
+        const cm = inner.match(/(\d+)\s*cards?$/i);
+        if (cm) {
+          cardCount = parseInt(cm[1], 10);
+          type = inner.slice(0, cm.index).replace(/[,;]\s*$/, "").trim();
+        } else {
+          type = inner.trim();
         }
       }
-    };
-    walk(root);
+      const setName = codeToSet.get(setCode) || setCode.toUpperCase();
+      const collector = /collector/i.test(setName) || /collector/i.test(name);
+      out.push({
+        set: setCode, slug, name, type, cardCount,
+        setName, collector,
+        category: preconCategory(type),
+      });
+    }
     return out;
   }
 

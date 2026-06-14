@@ -149,43 +149,62 @@ function preconCategory(type) {
   return "other";
 }
 
-// Walk the mtg.wtf /deck HTML with regex (no DOMParser in workers). We
-// alternate between heading captures (set name) and list-item captures
-// (individual deck entries). Pulls every /deck/<set>/<slug> link with its
-// type + card count + parent set name.
+// Walk the mtg.wtf /deck HTML with regex (no DOMParser in workers).
+// Actual structure (as of 2026-06):
+//   <div>Marvel Super Heroes Commander (MSC)</div>
+//   <ul>
+//     <li><a href="/deck/msc/avengers-assemble">Avengers Assemble</a>(Commander Deck, 100 cards)</li>
+//     …
+//   </ul>
+// So set names live in plain <div>…(CODE)</div> blocks (no class), and the
+// type + card count are a single parenthesized group after the </a>. We
+// build a code→setName map first, then extract entries.
 function parseMtgWtfIndexHtml(html) {
-  const out = [];
-  let currentSet = null;
-  // One regex that matches either an opening heading OR a <li>...</li> entry
-  // in source order. We use the running `g` flag's lastIndex to advance.
-  const re = /<(h[1-6])\b[^>]*>([\s\S]*?)<\/\1>|<li\b[^>]*>([\s\S]*?)<\/li>/gi;
+  // 1) code → setName map.
+  const codeToSet = new Map();
+  const divRe = /<div\b[^>]*>([^<]*\(([A-Za-z0-9_]+)\))<\/div>/g;
   let m;
-  while ((m = re.exec(html)) !== null) {
-    if (m[1]) {
-      // Heading — extract text only.
-      const txt = decodeHtmlEntities(m[2].replace(/<[^>]+>/g, "").trim());
-      if (txt) currentSet = txt;
-    } else if (m[3] && currentSet) {
-      const liInner = m[3];
-      const deckLink = liInner.match(/<a\b[^>]+href="\/deck\/([^"\/]+)\/([^"\/]+)"[^>]*>([\s\S]*?)<\/a>/i);
-      if (!deckLink) continue;
-      const setCode = deckLink[1].toLowerCase();
-      const slug = deckLink[2];
-      const name = decodeHtmlEntities(deckLink[3].replace(/<[^>]+>/g, "").trim());
-      // The tail after the anchor carries "— Commander Deck (100 cards)".
-      const afterAnchor = liInner.slice(liInner.indexOf("</a>") + 4);
-      const tail = decodeHtmlEntities(afterAnchor.replace(/<[^>]+>/g, "").trim().replace(/^[—–-]\s*/, ""));
-      const cardMatch = tail.match(/\((\d+)\s*cards?\)/i);
-      const cardCount = cardMatch ? parseInt(cardMatch[1], 10) : null;
-      const type = tail.replace(/\(.*?\)/g, "").trim();
-      const collector = /collector/i.test(currentSet) || /collector/i.test(name);
-      out.push({
-        set: setCode, slug, name, type, cardCount,
-        setName: currentSet,
-        collector,
-        category: preconCategory(type),
-      });
+  while ((m = divRe.exec(html)) !== null) {
+    const inner = decodeHtmlEntities(m[1]).trim();
+    const code = m[2].toLowerCase();
+    // Set name = inner with the trailing "(CODE)" stripped.
+    const setName = inner.replace(/\s*\([^)]*\)\s*$/, "").trim();
+    if (setName && code) codeToSet.set(code, setName);
+  }
+
+  // 2) deck entries from every /deck/<set>/<slug> anchor.
+  const out = [];
+  const liRe = /<li\b[^>]*>([\s\S]*?)<\/li>/gi;
+  while ((m = liRe.exec(html)) !== null) {
+    const liInner = m[1];
+    const deckLink = liInner.match(/<a\b[^>]+href="\/deck\/([^"\/]+)\/([^"\/]+)"[^>]*>([\s\S]*?)<\/a>/i);
+    if (!deckLink) continue;
+    const setCode = deckLink[1].toLowerCase();
+    const slug    = deckLink[2];
+    const name    = decodeHtmlEntities(deckLink[3].replace(/<[^>]+>/g, "").trim());
+    const afterAnchor = liInner.slice(liInner.indexOf("</a>") + 4);
+    const tail = decodeHtmlEntities(afterAnchor.replace(/<[^>]+>/g, "").trim());
+    // Tail looks like "(Commander Deck, 100 cards)" — split on comma inside parens.
+    let type = "", cardCount = null;
+    const tailMatch = tail.match(/^\(\s*(.+?)\s*\)\s*$/);
+    if (tailMatch) {
+      const inner = tailMatch[1];
+      const countMatch = inner.match(/(\d+)\s*cards?$/i);
+      if (countMatch) {
+        cardCount = parseInt(countMatch[1], 10);
+        type = inner.slice(0, countMatch.index).replace(/[,;]\s*$/, "").trim();
+      } else {
+        type = inner.trim();
+      }
     }
+    const setName = codeToSet.get(setCode) || setCode.toUpperCase();
+    const collector = /collector/i.test(setName) || /collector/i.test(name);
+    out.push({
+      set: setCode, slug, name, type, cardCount,
+      setName,
+      collector,
+      category: preconCategory(type),
+    });
   }
   return out;
 }
