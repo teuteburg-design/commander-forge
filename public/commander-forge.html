@@ -1860,6 +1860,13 @@
     // in memory for instant return visits.
     const [collQuery,       setCollQuery]       = useState("");
     const [saltMap,         setSaltMap]         = useState(null); // Map<lcName, salt> | null while loading
+    const [preconSets,      setPreconSets]      = useState(null);  // null = not fetched, [] = loaded empty, [...] = data
+    const [preconLoading,   setPreconLoading]   = useState(false);
+    const [preconError,     setPreconError]     = useState("");
+    const [preconQuery,     setPreconQuery]     = useState("");
+    const [preconExpanded,  setPreconExpanded]  = useState(null);   // currently expanded set code, or null
+    const [preconCardsBySet,setPreconCardsBySet]= useState({});     // { [setCode]: scryfallCards[] }
+    const [preconImporting, setPreconImporting] = useState(null);   // setCode while importing
     const [viewingBinder,   setViewingBinder]   = useState(null);
     const [binderEnriched,  setBinderEnriched]  = useState({});
     const [binderLoading,   setBinderLoading]   = useState(false);
@@ -4990,6 +4997,106 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       else setPhase("import");
     };
 
+    // ── Pre-con browser ──────────────────────────────────────────────────────
+    // Scryfall's /sets endpoint returns every set; we filter to set_type
+    // 'commander' (the official Wizards Commander pre-constructed products).
+    const fetchPreconSets = async () => {
+      if (preconSets !== null) return;
+      setPreconLoading(true); setPreconError("");
+      try {
+        const r = await fetch("https://api.scryfall.com/sets");
+        if (!r.ok) throw new Error(`Scryfall: HTTP ${r.status}`);
+        const j = await r.json();
+        const data = (j.data || [])
+          .filter(s => s.set_type === "commander")
+          .sort((a, b) => (b.released_at || "").localeCompare(a.released_at || ""));
+        setPreconSets(data);
+      } catch (e) {
+        setPreconError(e.message || "Failed to load pre-con sets");
+        setPreconSets([]);
+      } finally {
+        setPreconLoading(false);
+      }
+    };
+
+    // Fetch all cards in a Scryfall set, paginated.
+    const fetchPreconCards = async (setCode) => {
+      if (preconCardsBySet[setCode]) return preconCardsBySet[setCode];
+      const out = [];
+      let url = `https://api.scryfall.com/cards/search?q=${encodeURIComponent("e:"+setCode)}&unique=cards&order=set&include_extras=true`;
+      let safety = 0;
+      while (url && safety++ < 20) {
+        const r = await fetch(url);
+        if (!r.ok) {
+          if (r.status === 404) break; // set with no cards
+          throw new Error(`Scryfall: HTTP ${r.status}`);
+        }
+        const j = await r.json();
+        (j.data || []).forEach(c => out.push(c));
+        url = j.has_more ? j.next_page : null;
+      }
+      setPreconCardsBySet(prev => ({ ...prev, [setCode]: out }));
+      return out;
+    };
+
+    const togglePreconExpand = async (setCode) => {
+      if (preconExpanded === setCode) { setPreconExpanded(null); return; }
+      setPreconExpanded(setCode);
+      if (!preconCardsBySet[setCode]) {
+        try { await fetchPreconCards(setCode); }
+        catch (e) { setPreconError(e.message); }
+      }
+    };
+
+    // Create a new binder containing every card from a precon set (qty 1 each).
+    // Cards become standard rows with the binder's printing id; Scryfall data
+    // is cached so the binder renders immediately without a re-enrichment pass.
+    const importPreconAsBinder = async (set) => {
+      setPreconImporting(set.code);
+      setPreconError("");
+      try {
+        const cards = preconCardsBySet[set.code] || await fetchPreconCards(set.code);
+        const name = uniqueName(set.name, (groups.binders || []).map(b => b.name));
+        const ts = Date.now();
+        const cache = getSFCache();
+        const rows = cards.map(p => {
+          try {
+            const slim = slimSF(p);
+            cache[(p.id   || "").toLowerCase()] = { d: slim, ts };
+            cache[(p.name || "").toLowerCase()] = { d: slim, ts };
+          } catch {}
+          return { name: p.name, qty: 1, id: p.id, condition:"NM", finish:"normal", lang:"en" };
+        });
+        try { setSFCache(cache); } catch {}
+        const newBinder = {
+          name, type:"binder", cards: rows, commanderName: null,
+          source:"precon", precon: { set: set.code, released_at: set.released_at },
+          tags:["precon"],
+        };
+        const nextGroups = { ...groups, binders: [...(groups.binders || []), newBinder] };
+        const nextBinInc = { ...binInc, [name]: true };
+        setBinInc(nextBinInc);
+        persistGroups(nextGroups, deckInc, nextBinInc);
+        // Pre-populate enriched cache so opening the binder shows full Scryfall info.
+        setBinderEnriched(m => ({
+          ...m,
+          [name]: rows.map(r => ({ ...r, scryfall: cards.find(c => c.id === r.id) || null })),
+        }));
+        setPreconImporting(null);
+        setPhase("select");
+      } catch (e) {
+        setPreconError(e.message || "Failed to import pre-con");
+        setPreconImporting(null);
+      }
+    };
+
+    // Auto-fetch the set list when the user enters the precons phase.
+    useEffect(() => {
+      if (phase === "precons" && preconSets === null && !preconLoading) {
+        fetchPreconSets();
+      }
+    }, [phase, preconSets, preconLoading]);
+
     // ── Shared loading screen ────────────────────────────────────────────────
     const isLoading = ["loading_cmdr","analyzing","building","enriching"].includes(phase);
     const loadingTitle = phase === "loading_cmdr" ? "Scanning collection for commanders…"
@@ -5088,16 +5195,16 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                    reachable via the contextual sub-nav rendered below. -->
               <div style=${{ display:"flex", gap:0, marginTop:10, flexWrap:"wrap" }}>
                 ${[
-                  // "Home" is active for the build flow itself; once a deck
-                  // has been opened FROM a stored source (Collection / Library)
-                  // we treat the deck view as belonging to that section
-                  // rather than to Home.
+                  { label:"🏠 Home",
+                    active: phase==="ready" && activeTab==="home",
+                    onClick: () => { resetHome(); setTab("home"); } },
                   { label:"⚒ Forge",
-                    active: (["ready", "pick", "building", "analyzing", "loading_cmdr"].includes(phase))
+                    active: (["pick", "building", "analyzing", "loading_cmdr"].includes(phase))
+                      || (phase === "ready" && activeTab !== "home")
                       || (phase === "deck" && !fromCollection && !fromSaved),
-                    onClick: resetHome },
+                    onClick: () => { setPhase("ready"); setTab(activeTab === "home" ? "build" : activeTab); } },
                   { label:"📋 Collection",
-                    active: phase==="select" || phase==="import" || phase==="binder_view",
+                    active: phase==="select" || phase==="import" || phase==="binder_view" || phase==="precons",
                     onClick: navToCollection },
                   { label:`📚 Library${(library.length + (groups.decks?.length || 0)) > 0 ? " ("+(library.length + (groups.decks?.length || 0))+")" : ""}`,
                     active: phase==="saved_list"
@@ -5121,12 +5228,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 `)}
               </div>
 
-              <!-- Contextual sub-nav for Home: the deck-building flow lives
-                   here. Visible only while you're inside Home (any phase
-                   that's part of the build flow). The sub-items navigate
-                   between Commanders list, AI Suggestions, and the Deck
-                   view without leaving Home. -->
-              ${(["ready", "pick", "building", "analyzing", "loading_cmdr"].includes(phase)
+              <!-- Contextual sub-nav for Forge: visible only inside the
+                   deck-building flow (not on Home / dashboard). -->
+              ${((["pick", "building", "analyzing", "loading_cmdr"].includes(phase))
+                  || (phase === "ready" && activeTab !== "home")
                   || (phase === "deck" && !fromCollection && !fromSaved)) && html`
                 <div style=${{
                   display:"flex", gap:0, marginTop:6, paddingLeft:6, flexWrap:"wrap",
@@ -5153,6 +5258,35 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           : item.active ? "#f0d080" : "rgba(255,255,255,0.55)",
                         borderRadius:"4px 4px 0 0", padding:"6px 12px", fontSize:11,
                         fontFamily:"inherit", cursor: item.disabled ? "default" : "pointer",
+                        marginBottom:"-1px", transition:"all .15s",
+                      }}>
+                      ${item.label}
+                    </button>
+                  `)}
+                </div>
+              `}
+
+              <!-- Contextual sub-nav for Collection: Overview + Pre-cons. -->
+              ${["select","import","binder_view","precons"].includes(phase) && html`
+                <div style=${{
+                  display:"flex", gap:0, marginTop:6, paddingLeft:6, flexWrap:"wrap",
+                  borderTop:"1px solid rgba(255,255,255,0.08)",
+                }}>
+                  ${[
+                    { label:"📦 Overview",
+                      active: phase==="select" || phase==="import" || phase==="binder_view",
+                      onClick: navToCollection },
+                    { label:"🛒 Pre-cons",
+                      active: phase==="precons",
+                      onClick: () => setPhase("precons") },
+                  ].map(item => html`
+                    <button key=${item.label} onClick=${item.onClick}
+                      style=${{
+                        background: item.active ? "rgba(0,0,0,0.18)" : "transparent",
+                        border:"none", borderBottom: item.active ? "2px solid #f0c080" : "2px solid transparent",
+                        color: item.active ? "#f0d080" : "rgba(255,255,255,0.55)",
+                        borderRadius:"4px 4px 0 0", padding:"6px 12px", fontSize:11,
+                        fontFamily:"inherit", cursor:"pointer",
                         marginBottom:"-1px", transition:"all .15s",
                       }}>
                       ${item.label}
@@ -6078,6 +6212,163 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           `;
           })()}
 
+          <!-- ── PRE-CON BROWSER ───────────────────────────────────────── -->
+          ${phase === "precons" && (() => {
+            const q = (preconQuery || "").trim().toLowerCase();
+            const sets = (preconSets || []).filter(s => {
+              if (!q) return true;
+              return s.name.toLowerCase().includes(q)
+                  || (s.code || "").toLowerCase().includes(q)
+                  || (s.released_at || "").includes(q);
+            });
+            const fmtDate = s => (s || "").slice(0, 10);
+            return html`
+              <div style=${{ maxWidth:1080, margin:"0 auto" }}>
+                <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:12, marginBottom:16 }}>
+                  <div>
+                    <h2 style=${{ fontSize:18, color:"#3a1a00", marginBottom:6 }}>Pre-constructed decks</h2>
+                    <p style=${{ fontSize:13, color:"#7a5a3a", maxWidth:640, lineHeight:1.55 }}>
+                      Wizards-published Commander pre-cons sourced from Scryfall. Each set typically ships several decks bundled together.
+                      Importing adds every card in the set to a new binder so you can split, edit, and forge from it.
+                    </p>
+                  </div>
+                </div>
+
+                ${preconError && html`
+                  <div style=${{
+                    marginBottom:12, padding:"10px 14px", background:"#fff0e8",
+                    border:"1px solid #d8a090", borderRadius:8, color:"#a04020", fontSize:12,
+                  }}>${preconError}</div>
+                `}
+
+                ${preconLoading && preconSets === null && html`
+                  <div style=${{
+                    padding:"40px 20px", textAlign:"center", color:"#7a5a3a", fontSize:13,
+                  }}>Loading pre-con sets from Scryfall…</div>
+                `}
+
+                ${preconSets !== null && html`
+                  <div style=${{
+                    marginBottom:14, display:"flex", alignItems:"center", gap:10,
+                    background:"#fff", border:"1px solid #ddd0b8", borderRadius:8,
+                    padding:"8px 12px",
+                  }}>
+                    <span style=${{ fontSize:14, color:"#8a6a4a" }}>🔍</span>
+                    <input type="search" value=${preconQuery}
+                      onInput=${e => setPreconQuery(e.target.value)}
+                      placeholder="Search by set name, code, or release year…"
+                      style=${{
+                        flex:1, border:"none", outline:"none", background:"transparent",
+                        fontFamily:"inherit", fontSize:13, color:"#1e0f00", padding:0,
+                      }} />
+                    <span style=${{ fontSize:11, color:"#8a6a4a" }}>
+                      ${sets.length} of ${preconSets.length} sets
+                    </span>
+                  </div>
+
+                  <div style=${{ display:"flex", flexDirection:"column", gap:8 }}>
+                    ${sets.map(s => {
+                      const expanded = preconExpanded === s.code;
+                      const cards = preconCardsBySet[s.code] || null;
+                      const importing = preconImporting === s.code;
+                      const alreadyImported = (groups.binders || []).some(b => b.precon?.set === s.code);
+                      return html`
+                        <div key=${s.code} style=${{
+                          background:"#fff", border:"1px solid #ddd0b8", borderRadius:8,
+                          overflow:"hidden",
+                        }}>
+                          <div onClick=${() => togglePreconExpand(s.code)}
+                            style=${{
+                              display:"flex", alignItems:"center", gap:14,
+                              padding:"12px 16px", cursor:"pointer",
+                              background: expanded ? "#fff8ee" : "#fff",
+                            }}>
+                            ${s.icon_svg_uri && html`
+                              <img src=${s.icon_svg_uri} alt="" style=${{ width:28, height:28, objectFit:"contain", flexShrink:0 }} />
+                            `}
+                            <div style=${{ flex:1, minWidth:0 }}>
+                              <div style=${{ fontSize:14, fontWeight:700, color:"#2a1000",
+                                whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                                ${s.name}
+                              </div>
+                              <div style=${{ fontSize:11, color:"#7a5a3a", marginTop:2 }}>
+                                ${(s.code || "").toUpperCase()} · ${fmtDate(s.released_at)} · ${s.card_count || "?"} cards
+                                ${alreadyImported && html`<span style=${{
+                                  marginLeft:8, padding:"1px 7px", borderRadius:10, fontSize:10,
+                                  background:"#e8f0d8", color:"#3a6020", fontWeight:600,
+                                }}>imported</span>`}
+                              </div>
+                            </div>
+                            <button onClick=${(e) => { e.stopPropagation(); importPreconAsBinder(s); }}
+                              disabled=${importing}
+                              style=${{
+                                ...btn, fontSize:11, padding:"6px 12px", whiteSpace:"nowrap",
+                                opacity: importing ? 0.6 : 1, cursor: importing ? "wait" : "pointer",
+                              }}>
+                              ${importing ? "Importing…" : "+ Add to collection"}
+                            </button>
+                            <span style=${{ fontSize:12, color:"#7a5a3a", flexShrink:0 }}>${expanded ? "▲" : "▼"}</span>
+                          </div>
+                          ${expanded && html`
+                            <div style=${{
+                              padding:"10px 16px 14px", borderTop:"1px solid #ece0c8",
+                              background:"#fbf6ec",
+                            }}>
+                              ${!cards && html`
+                                <div style=${{ fontSize:12, color:"#7a5a3a", padding:"10px 0" }}>
+                                  Loading cards…
+                                </div>
+                              `}
+                              ${cards && cards.length === 0 && html`
+                                <div style=${{ fontSize:12, color:"#7a5a3a" }}>No cards found for this set.</div>
+                              `}
+                              ${cards && cards.length > 0 && html`
+                                <div style=${{
+                                  display:"grid",
+                                  gridTemplateColumns:"repeat(auto-fill, minmax(220px, 1fr))",
+                                  gap:6,
+                                  maxHeight:360, overflow:"auto",
+                                  paddingRight:6,
+                                }}>
+                                  ${cards.slice(0, 200).map(c => html`
+                                    <div key=${c.id} style=${{
+                                      display:"flex", alignItems:"center", gap:6,
+                                      fontSize:11, color:"#3a1a00", padding:"3px 6px",
+                                      background:"#fff", border:"1px solid #ece0c8",
+                                      borderRadius:6, minWidth:0,
+                                    }}>
+                                      <span style=${{ flex:1, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                                        ${c.name}
+                                      </span>
+                                      ${typeof c.cmc === "number" && html`
+                                        <span style=${{ fontSize:10, color:"#8a6a4a", flexShrink:0 }}>${c.cmc}</span>
+                                      `}
+                                    </div>
+                                  `)}
+                                </div>
+                                ${cards.length > 200 && html`
+                                  <div style=${{ fontSize:11, color:"#8a6a4a", marginTop:6, fontStyle:"italic" }}>
+                                    Showing first 200 of ${cards.length}. Import to see them all.
+                                  </div>
+                                `}
+                              `}
+                            </div>
+                          `}
+                        </div>
+                      `;
+                    })}
+                  </div>
+
+                  ${sets.length === 0 && preconSets.length > 0 && html`
+                    <div style=${{ padding:"30px 20px", textAlign:"center", color:"#8a6a4a", fontSize:13 }}>
+                      No sets match "${preconQuery}".
+                    </div>
+                  `}
+                `}
+              </div>
+            `;
+          })()}
+
           <!-- ── BINDER VIEW (Phase A) ─────────────────────────────────── -->
           ${phase === "binder_view" && viewingBinder && (() => {
             const binder = (groups.binders || []).find(b => b.name === viewingBinder);
@@ -6877,27 +7168,39 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   </div>
                 `;
 
+                // ── Deck-count by color identity (every deck) ──────────────
+                const deckColorCounts = { W:0, U:0, B:0, R:0, G:0, C:0 };
+                (groups.decks || []).forEach(d => {
+                  const ci = deckColorIdentity(d);
+                  if (!ci || ci.length === 0) deckColorCounts.C++;
+                  else ci.forEach(c => { if (deckColorCounts[c] != null) deckColorCounts[c]++; });
+                });
+
+                const maxColor      = Math.max(1, ...Object.values(colorCounts));
+                const maxDeckColor  = Math.max(1, ...Object.values(deckColorCounts));
+
+                // Pip-style swatch colors (rough mapping; only used for bars)
+                const COLOR_HEX = { W:"#f7e7b0", U:"#5a8ad0", B:"#3a3a3a", R:"#d05030", G:"#5a9050", C:"#9a8a78" };
+
+                const bar = (count, max, hex) => html`
+                  <div style=${{
+                    flex:1, height:8, background:"#eee0c8", borderRadius:4, overflow:"hidden",
+                  }}>
+                    <div style=${{
+                      width: `${Math.round((count / max) * 100)}%`,
+                      height:"100%", background: hex, borderRadius:4,
+                    }}></div>
+                  </div>
+                `;
+
                 return html`
                   <div>
-                    <!-- Action cards -->
-                    <div style=${{ display:"flex", gap:14, marginBottom:24, flexWrap:"wrap" }}>
-                      ${actionCard("⚒", "Forge a new deck",
-                        "Pick a commander, set archetypes, let the AI build a 99-card deck from your collection.",
-                        onForge, "#c07030")}
-                      ${actionCard("⬆", "Update collection",
-                        "Re-import your Manabox / Moxfield CSV to refresh card counts and printings.",
-                        onUpdate, "#7a8a3a")}
-                      ${actionCard("📚", "Check your decks",
-                        `Browse your ${(library.length + (groups.decks?.length || 0))} saved decks and edit, analyse, or share them.`,
-                        onCheck, "#3a6a9a")}
-                    </div>
-
-                    <!-- Stats grid -->
+                    <!-- Stats grid: top of dashboard -->
                     <div style=${{ ...label, marginBottom:10 }}>Collection at a glance</div>
                     <div style=${{
                       display:"grid",
                       gridTemplateColumns:"repeat(auto-fill, minmax(180px, 1fr))",
-                      gap:12, marginBottom:24,
+                      gap:12, marginBottom:18,
                     }}>
                       ${statTile("Total cards",
                         totalQtyAll.toLocaleString(),
@@ -6915,28 +7218,72 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         "#3a6a9a")}
                     </div>
 
-                    <!-- Color breakdown -->
-                    ${coloredCount > 0 && html`
-                      <div style=${{
-                        background:"#fff", border:"1px solid #e0c890", borderRadius:8,
-                        padding:"14px 16px", marginBottom:24,
-                      }}>
-                        <div style=${{ ...label, marginBottom:10 }}>Cards by colour</div>
-                        <div style=${{ display:"flex", gap:18, flexWrap:"wrap" }}>
-                          ${["W","U","B","R","G","C"].map(c => html`
-                            <div key=${c} style=${{ display:"flex", alignItems:"center", gap:6 }}>
-                              <${Pip} c=${c} size=${22} />
-                              <span style=${{ fontSize:14, fontWeight:700, color:"#2a1000" }}>
-                                ${colorCounts[c].toLocaleString()}
-                              </span>
-                            </div>
-                          `)}
+                    <!-- Visualizations row: cards by color + decks by color -->
+                    <div style=${{
+                      display:"grid",
+                      gridTemplateColumns:"repeat(auto-fit, minmax(260px, 1fr))",
+                      gap:12, marginBottom:24,
+                    }}>
+                      ${coloredCount > 0 && html`
+                        <div style=${{
+                          background:"#fff", border:"1px solid #e0c890", borderRadius:8,
+                          padding:"14px 16px",
+                        }}>
+                          <div style=${{ ...label, marginBottom:10 }}>Cards by colour</div>
+                          <div style=${{ display:"flex", flexDirection:"column", gap:7 }}>
+                            ${["W","U","B","R","G","C"].map(c => html`
+                              <div key=${c} style=${{ display:"flex", alignItems:"center", gap:10 }}>
+                                <${Pip} c=${c} size=${18} />
+                                ${bar(colorCounts[c], maxColor, COLOR_HEX[c])}
+                                <span style=${{ fontSize:12, color:"#2a1000", fontWeight:600, minWidth:44, textAlign:"right" }}>
+                                  ${colorCounts[c].toLocaleString()}
+                                </span>
+                              </div>
+                            `)}
+                          </div>
+                          <div style=${{ fontSize:10, color:"#8a6a4a", marginTop:8, fontStyle:"italic" }}>
+                            From binders you've opened. Open more for a fuller picture.
+                          </div>
                         </div>
-                        <div style=${{ fontSize:11, color:"#8a6a4a", marginTop:8, fontStyle:"italic" }}>
-                          Based on binders you've opened (Scryfall data cached). Open more binders to see the full picture.
+                      `}
+
+                      ${(groups.decks || []).length > 0 && html`
+                        <div style=${{
+                          background:"#fff", border:"1px solid #e0c890", borderRadius:8,
+                          padding:"14px 16px",
+                        }}>
+                          <div style=${{ ...label, marginBottom:10 }}>Decks by colour identity</div>
+                          <div style=${{ display:"flex", flexDirection:"column", gap:7 }}>
+                            ${["W","U","B","R","G","C"].map(c => html`
+                              <div key=${c} style=${{ display:"flex", alignItems:"center", gap:10 }}>
+                                <${Pip} c=${c} size=${18} />
+                                ${bar(deckColorCounts[c], maxDeckColor, COLOR_HEX[c])}
+                                <span style=${{ fontSize:12, color:"#2a1000", fontWeight:600, minWidth:44, textAlign:"right" }}>
+                                  ${deckColorCounts[c].toLocaleString()}
+                                </span>
+                              </div>
+                            `)}
+                          </div>
+                          <div style=${{ fontSize:10, color:"#8a6a4a", marginTop:8, fontStyle:"italic" }}>
+                            Counts each colour a deck's identity touches (mono decks count once).
+                          </div>
                         </div>
-                      </div>
-                    `}
+                      `}
+                    </div>
+
+                    <!-- Action cards -->
+                    <div style=${{ ...label, marginBottom:10 }}>Get started</div>
+                    <div style=${{ display:"flex", gap:14, marginBottom:24, flexWrap:"wrap" }}>
+                      ${actionCard("⚒", "Forge a new deck",
+                        "Pick a commander, set archetypes, let the AI build a 99-card deck from your collection.",
+                        onForge, "#c07030")}
+                      ${actionCard("⬆", "Update collection",
+                        "Re-import your Manabox / Moxfield CSV to refresh card counts and printings.",
+                        onUpdate, "#7a8a3a")}
+                      ${actionCard("📚", "Check your decks",
+                        `Browse your ${(library.length + (groups.decks?.length || 0))} saved decks and edit, analyse, or share them.`,
+                        onCheck, "#3a6a9a")}
+                    </div>
 
                     <!-- Deck highlights -->
                     ${enrichedDecks.length > 0 && html`
