@@ -6957,17 +6957,16 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               if (!bySet.has(k)) bySet.set(k, []);
               bySet.get(k).push(e);
             });
-            const groupedSets = [...bySet.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+            // Preserve mtg.wtf's upstream order — they list newest products
+            // first, so this gives a chronological "latest first" feel without
+            // needing a real release-date sort. (Map keeps insertion order.)
+            const groupedSets = [...bySet.entries()];
 
             return html`
               <div style=${{ maxWidth:1080, margin:"0 auto" }}>
                 <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:12, marginBottom:16 }}>
                   <div>
-                    <h2 style=${{ fontSize:18, color:"var(--fg-text-heading)", marginBottom:6 }}>Pre-constructed decks</h2>
-                    <p style=${{ fontSize:13, color:"var(--fg-text-soft)", maxWidth:680, lineHeight:1.55 }}>
-                      Wizards-published <strong>Commander pre-cons</strong> (~100 cards), sourced from <strong>mtg.wtf/deck</strong> and cached here.
-                      A monthly refresh sweeps for new releases; you can force one below. Partner decks bring both commanders in automatically.
-                    </p>
+                    <h2 style=${{ fontSize:18, color:"var(--fg-text-heading)", margin:0 }}>Pre-constructed decks</h2>
                   </div>
                   <div style=${{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:6, flexShrink:0 }}>
                     <button onClick=${refreshPreconCache}
@@ -7084,12 +7083,13 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 <div style=${{
                                     display:"flex", alignItems:"center", gap:10,
                                     padding:"12px 14px",
-                                    position:"relative", minHeight: cmdrArt ? 78 : "auto",
+                                    position:"relative", minHeight: cmdrArt ? 120 : "auto",
                                     background: cmdrArt
                                       ? `linear-gradient(90deg, var(--bg-surface) 0%, var(--bg-surface) 25%, rgba(0,0,0,0) 70%), url("${cmdrArt}")`
                                       : "var(--bg-surface)",
                                     backgroundSize: cmdrArt ? "cover" : "auto",
-                                    backgroundPosition: cmdrArt ? "right center" : "initial",
+                                    backgroundPosition: cmdrArt ? "right top" : "initial",
+                                    backgroundRepeat: "no-repeat",
                                   }}>
                                   <div style=${{ flex:1, minWidth:0, position:"relative", zIndex:1 }}>
                                     <div style=${{ fontSize:13, fontWeight:700, color:"var(--fg-text-strong)",
