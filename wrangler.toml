@@ -34,12 +34,13 @@ binding = "STATE"
 id = "87d006da67f64ce19eaab1865c674174"
 
 # ── Scheduled tasks ─────────────────────────────────────────────────────
-# Daily precon refresh: re-parses mtg.wtf/deck and downloads any new/changed
+# Monthly precon refresh: re-parses mtg.wtf/deck and downloads any new/changed
 # decks via their /download endpoint. See worker/index.js → refreshPrecons.
-# Free tier allows up to 3 cron triggers per Worker; daily @ 06:00 UTC keeps
-# headroom for ad-hoc additions.
+# New Wizards precon products drop a few times a year, so a monthly sweep
+# catches them with plenty of margin. The '↻ Check for updates' button in the
+# precon browser triggers an immediate refresh between cron runs.
 [triggers]
-crons = ["0 6 * * *"]
+crons = ["0 6 1 * *"]
 # preview_id = "PASTE_PREVIEW_KV_NAMESPACE_ID_HERE"   # only needed for `wrangler dev`
 
 # Note
