@@ -6334,6 +6334,33 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       }
     }, [phase, preconIndex, preconLoading]);
 
+    // ── One-time migration: drop legacy precon imports ──────────────────────
+    // Precon imports prior to the /download_with_printings switch carried
+    // whatever printing Scryfall guessed for each card (usually the latest
+    // reprint, not the actual precon printing). Wiping them on next load
+    // lets the user re-import with the correct cards. The migration
+    // flag-keys itself in localStorage so it never runs twice for the same
+    // user. After everyone has run it once the whole useEffect can be
+    // deleted — the flag becomes inert.
+    useEffect(() => {
+      const FLAG = "cmdr_forge_mig_drop_legacy_precons_v1";
+      try {
+        if (localStorage.getItem(FLAG)) return;
+        if (!groups || !Array.isArray(groups.decks) || groups.decks.length === 0) return;
+        const stale = groups.decks.filter(d => d.source === "precon");
+        if (stale.length === 0) {
+          localStorage.setItem(FLAG, "1");
+          return;
+        }
+        const nextDecks = groups.decks.filter(d => d.source !== "precon");
+        const nextDeckInc = { ...deckInc };
+        stale.forEach(d => { delete nextDeckInc[d.name]; });
+        setDeckInc(nextDeckInc);
+        persistGroups({ ...groups, decks: nextDecks }, nextDeckInc, binInc);
+        localStorage.setItem(FLAG, "1");
+      } catch {}
+    }, [groups]);
+
     // ── Shared loading screen ────────────────────────────────────────────────
     const isLoading = ["loading_cmdr","analyzing","building","enriching"].includes(phase);
     const loadingTitle = phase === "loading_cmdr" ? "Scanning collection for commanders…"
