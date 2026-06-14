@@ -733,43 +733,6 @@
     return { suggestions: [], status: "network", slug, http: lastHttp, error: lastErr };
   }
 
-  // Fetch the EDHRec top-salt page and return { saltByName, status }.
-  // saltByName: Map<lowercaseCardName, saltScore (0..4)>. Covers the top ~200
-  // saltiest cards in EDH — enough to score most decks' meaningful saltiness,
-  // since cards outside that list are by definition not salty. Cards not in
-  // the map are treated as salt 0 by callers.
-  async function fetchEDHRecSalt() {
-    const target = "https://json.edhrec.com/pages/top/salt.json";
-    for (const { name, wrap } of EDHREC_PROXIES) {
-      let r;
-      try { r = await fetch(wrap(target)); }
-      catch { continue; }
-      if (!r.ok) continue;
-      let data;
-      try { data = await r.json(); } catch { continue; }
-      const cardlists = data?.container?.json_dict?.cardlists || [];
-      const m = new Map();
-      cardlists.forEach(list => {
-        (list.cardviews || []).forEach(cv => {
-          if (!cv.name) return;
-          // EDHRec stores salt on cardviews as either `salt` or `label`.
-          // The /top/salt page uses `salt` (number 0..4). Fall back to
-          // parsing the label string ("salt 3.42") just in case.
-          let salt = typeof cv.salt === "number" ? cv.salt : null;
-          if (salt == null && typeof cv.label === "string") {
-            const m2 = cv.label.match(/([0-9]+(?:\.[0-9]+)?)/);
-            if (m2) salt = parseFloat(m2[1]);
-          }
-          if (typeof salt === "number" && !Number.isNaN(salt)) {
-            m.set(cv.name.toLowerCase(), salt);
-          }
-        });
-      });
-      if (m.size > 0) return { saltByName: m, status: "ok", via: name };
-    }
-    return { saltByName: new Map(), status: "network" };
-  }
-
   // ── Commander Spellbook ──────────────────────────────────────────────────────
   // Public combo database. Given a commander + card pool, returns:
   //   - `have`:   combos achievable with cards already in the pool
@@ -2166,7 +2129,6 @@
     // We enrich on-demand the first time a binder is opened, then keep results
     // in memory for instant return visits.
     const [collQuery,       setCollQuery]       = useState("");
-    const [saltMap,         setSaltMap]         = useState(null); // Map<lcName, salt> | null while loading
     const [theme,           setTheme]           = useState(() => {
       try { return localStorage.getItem(LS_THEME) || "parchment"; } catch { return "parchment"; }
     });
@@ -2926,19 +2888,6 @@
         localStorage.setItem(LS_THEME, theme);
       } catch {}
     }, [theme]);
-
-    // Lazy-fetch the EDHRec top-salt map once on first ready/select view —
-    // it powers the "Most salty deck" stat on the Forge dashboard. We don't
-    // block the UI on it; the stat just hides until the map arrives.
-    useEffect(() => {
-      if (saltMap !== null) return;
-      if (!["ready","select","saved_list","deck","binder_view"].includes(phase)) return;
-      let cancelled = false;
-      fetchEDHRecSalt().then(({ saltByName }) => {
-        if (!cancelled) setSaltMap(saltByName);
-      }).catch(() => { if (!cancelled) setSaltMap(new Map()); });
-      return () => { cancelled = true; };
-    }, [phase, saltMap]);
 
     // Track scroll, viewport width and header height.
     useEffect(() => {
@@ -5366,40 +5315,65 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       }
     };
 
-    // Create a new binder containing every card from a precon set (qty 1 each).
-    // Cards become standard rows with the binder's printing id; Scryfall data
-    // is cached so the binder renders immediately without a re-enrichment pass.
-    const importPreconAsBinder = async (set) => {
-      setPreconImporting(set.code);
+    // A card in a precon set counts as a 'commander candidate' if it's a
+    // legendary creature, OR a planeswalker whose oracle text says it can
+    // be your commander. Mirrors Scryfall's is:commander heuristic.
+    const isPreconCommander = (c) => {
+      const t = (c.type_line || "").toLowerCase();
+      if (t.includes("legendary") && t.includes("creature")) return true;
+      if (t.includes("planeswalker") && /can be your commander/i.test(c.oracle_text || "")) return true;
+      return false;
+    };
+
+    // Create a new Deck (Commander format) seeded with the chosen commander
+    // and every card from the precon set. The deck is overstuffed when the
+    // set bundles multiple precons, so the user can prune in deck view. The
+    // commander itself is excluded from the 99 so its qty:1 stays in selCmd
+    // rather than the maindeck.
+    const importPreconAsDeck = async (set, commander) => {
+      setPreconImporting(set.code + "::" + commander.id);
       setPreconError("");
       try {
         const cards = preconCardsBySet[set.code] || await fetchPreconCards(set.code);
-        const name = uniqueName(set.name, (groups.binders || []).map(b => b.name));
+        const deckName = uniqueName(`${commander.name} (${set.name})`, (groups.decks || []).map(d => d.name));
         const ts = Date.now();
         const cache = getSFCache();
-        const rows = cards.map(p => {
-          try {
-            const slim = slimSF(p);
-            cache[(p.id   || "").toLowerCase()] = { d: slim, ts };
-            cache[(p.name || "").toLowerCase()] = { d: slim, ts };
-          } catch {}
-          return { name: p.name, qty: 1, id: p.id, condition:"NM", finish:"normal", lang:"en" };
-        });
-        try { setSFCache(cache); } catch {}
-        const newBinder = {
-          name, type:"binder", cards: rows, commanderName: null,
-          source:"precon", precon: { set: set.code, released_at: set.released_at },
-          tags:["precon"],
+        const rows = cards
+          .filter(p => p.id !== commander.id)
+          .map(p => {
+            try {
+              const slim = slimSF(p);
+              cache[(p.id   || "").toLowerCase()] = { d: slim, ts };
+              cache[(p.name || "").toLowerCase()] = { d: slim, ts };
+            } catch {}
+            return { name: p.name, qty: 1, id: p.id, condition:"NM", finish:"normal", lang:"en" };
+          });
+        // Cache the commander too so badges render without an extra fetch.
+        try {
+          const slim = slimSF(commander);
+          cache[(commander.id   || "").toLowerCase()] = { d: slim, ts };
+          cache[(commander.name || "").toLowerCase()] = { d: slim, ts };
+          setSFCache(cache);
+        } catch {}
+        const newDeck = {
+          name: deckName,
+          type: "deck",
+          format: "commander",
+          commanderName: commander.name,
+          source: "precon",
+          precon: { set: set.code, released_at: set.released_at },
+          tags: ["precon"],
+          selCmd: {
+            name: commander.name,
+            card: { name: commander.name, scryfall: commander },
+            commanderCandidates: [],
+          },
+          cards: rows,
         };
-        const nextGroups = { ...groups, binders: [...(groups.binders || []), newBinder] };
-        const nextBinInc = { ...binInc, [name]: true };
-        setBinInc(nextBinInc);
-        persistGroups(nextGroups, deckInc, nextBinInc);
-        // Pre-populate enriched cache so opening the binder shows full Scryfall info.
-        setBinderEnriched(m => ({
-          ...m,
-          [name]: rows.map(r => ({ ...r, scryfall: cards.find(c => c.id === r.id) || null })),
-        }));
+        const nextGroups = { ...groups, decks: [...(groups.decks || []), newDeck] };
+        const nextDeckInc = { ...deckInc, [deckName]: false }; // locked by default like other decks
+        setDeckInc(nextDeckInc);
+        persistGroups(nextGroups, nextDeckInc, binInc);
         setPreconImporting(null);
         setPhase("select");
       } catch (e) {
@@ -5592,8 +5566,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 }}>
                   ${[
                     { label:"📦 Overview",
-                      active: phase==="select" || phase==="import" || phase==="binder_view",
-                      onClick: navToCollection },
+                      active: phase==="select" || phase==="binder_view",
+                      onClick: () => { if (groups.decks.length || groups.binders.length) setPhase("select"); else setPhase("import"); } },
+                    { label:"⬆ Update",
+                      active: phase==="import",
+                      onClick: () => { setCsv(""); setError(""); setPhase("import"); } },
                     { label:"🛒 Pre-cons",
                       active: phase==="precons",
                       onClick: () => setPhase("precons") },
@@ -6641,8 +6618,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     ${sets.map(s => {
                       const expanded = preconExpanded === s.code;
                       const cards = preconCardsBySet[s.code] || null;
-                      const importing = preconImporting === s.code;
-                      const alreadyImported = (groups.binders || []).some(b => b.precon?.set === s.code);
+                      const commanders = cards ? cards.filter(isPreconCommander) : null;
+                      const importedDeckCount = (groups.decks || []).filter(d => d.precon?.set === s.code).length;
                       return html`
                         <div key=${s.code} style=${{
                           background:"var(--bg-surface)", border:"1px solid var(--border-neutral)", borderRadius:8,
@@ -6664,20 +6641,12 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               </div>
                               <div style=${{ fontSize:11, color:"var(--fg-text-soft)", marginTop:2 }}>
                                 ${(s.code || "").toUpperCase()} · ${fmtDate(s.released_at)} · ${s.card_count || "?"} cards
-                                ${alreadyImported && html`<span style=${{
+                                ${importedDeckCount > 0 && html`<span style=${{
                                   marginLeft:8, padding:"1px 7px", borderRadius:10, fontSize:10,
                                   background:"var(--success-bg)", color:"var(--success-text)", fontWeight:600,
-                                }}>imported</span>`}
+                                }}>${importedDeckCount} deck${importedDeckCount===1?"":"s"} imported</span>`}
                               </div>
                             </div>
-                            <button onClick=${(e) => { e.stopPropagation(); importPreconAsBinder(s); }}
-                              disabled=${importing}
-                              style=${{
-                                ...btn, fontSize:11, padding:"6px 12px", whiteSpace:"nowrap",
-                                opacity: importing ? 0.6 : 1, cursor: importing ? "wait" : "pointer",
-                              }}>
-                              ${importing ? "Importing…" : "+ Add to collection"}
-                            </button>
                             <span style=${{ fontSize:12, color:"var(--fg-text-soft)", flexShrink:0 }}>${expanded ? "▲" : "▼"}</span>
                           </div>
                           ${expanded && html`
@@ -6693,12 +6662,76 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               ${cards && cards.length === 0 && html`
                                 <div style=${{ fontSize:12, color:"var(--fg-text-soft)" }}>No cards found for this set.</div>
                               `}
+
+                              ${commanders && commanders.length > 0 && html`
+                                <div style=${{ ...label, marginTop:0, marginBottom:8 }}>
+                                  Pick a commander to import as a deck
+                                </div>
+                                <div style=${{
+                                  display:"grid",
+                                  gridTemplateColumns:"repeat(auto-fill, minmax(220px, 1fr))",
+                                  gap:8, marginBottom:14,
+                                }}>
+                                  ${commanders.map(cmd => {
+                                    const importing = preconImporting === (s.code + "::" + cmd.id);
+                                    const art = cmd.image_uris?.art_crop
+                                             || cmd.card_faces?.[0]?.image_uris?.art_crop
+                                             || cmd.image_uris?.small
+                                             || cmd.card_faces?.[0]?.image_uris?.small || null;
+                                    const ci = cmd.color_identity || [];
+                                    const alreadyHere = (groups.decks || []).some(d => d.precon?.set === s.code && d.commanderName === cmd.name);
+                                    return html`
+                                      <div key=${cmd.id} style=${{
+                                        background:"var(--bg-surface)", border:"1px solid var(--border-neutral)",
+                                        borderRadius:8, overflow:"hidden",
+                                        display:"flex", flexDirection:"column",
+                                      }}>
+                                        ${art && html`
+                                          <img src=${art} alt="" style=${{
+                                            width:"100%", height:80, objectFit:"cover",
+                                            display:"block",
+                                          }} />
+                                        `}
+                                        <div style=${{ padding:"8px 10px", flex:1, display:"flex", flexDirection:"column", gap:6 }}>
+                                          <div style=${{ fontSize:12, fontWeight:700, color:"var(--fg-text-strong)",
+                                            whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }} title=${cmd.name}>
+                                            ${cmd.name}
+                                          </div>
+                                          <div style=${{ display:"flex", alignItems:"center", gap:4, minHeight:18 }}>
+                                            ${ci.map(c => html`<${Pip} key=${c} c=${c} size=${14} />`)}
+                                            ${ci.length === 0 && html`<${Pip} c=${"C"} size=${14} />`}
+                                          </div>
+                                          <button onClick=${() => importPreconAsDeck(s, cmd)}
+                                            disabled=${importing || alreadyHere}
+                                            style=${{
+                                              ...btn, fontSize:11, padding:"5px 10px", whiteSpace:"nowrap",
+                                              opacity: (importing || alreadyHere) ? 0.55 : 1,
+                                              cursor: importing ? "wait" : alreadyHere ? "default" : "pointer",
+                                            }}>
+                                            ${importing ? "Importing…" : alreadyHere ? "✓ Deck created" : "+ Import as deck"}
+                                          </button>
+                                        </div>
+                                      </div>
+                                    `;
+                                  })}
+                                </div>
+                              `}
+
+                              ${commanders && commanders.length === 0 && cards && cards.length > 0 && html`
+                                <div style=${{ fontSize:12, color:"var(--fg-text-soft)", marginBottom:12, fontStyle:"italic" }}>
+                                  No legendary commander candidates found in this set.
+                                </div>
+                              `}
+
                               ${cards && cards.length > 0 && html`
+                                <div style=${{ ...label, marginTop:6, marginBottom:6 }}>
+                                  All cards in this set (${cards.length})
+                                </div>
                                 <div style=${{
                                   display:"grid",
                                   gridTemplateColumns:"repeat(auto-fill, minmax(220px, 1fr))",
                                   gap:6,
-                                  maxHeight:360, overflow:"auto",
+                                  maxHeight:300, overflow:"auto",
                                   paddingRight:6,
                                 }}>
                                   ${cards.slice(0, 200).map(c => html`
@@ -6719,7 +6752,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 </div>
                                 ${cards.length > 200 && html`
                                   <div style=${{ fontSize:11, color:"var(--fg-text-muted)", marginTop:6, fontStyle:"italic" }}>
-                                    Showing first 200 of ${cards.length}. Import to see them all.
+                                    Showing first 200 of ${cards.length}.
                                   </div>
                                 `}
                               `}
@@ -7477,16 +7510,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   });
                   return hits > 0 ? Math.round(s * 100) / 100 : null;
                 };
-                const deckSalt = (d) => {
-                  if (d.deckData?.salt != null) return d.deckData.salt;
-                  if (!saltMap || saltMap.size === 0) return null;
-                  let s = 0, hits = 0;
-                  (d.cards || []).forEach(c => {
-                    const v = saltMap.get((c.name || "").toLowerCase());
-                    if (typeof v === "number") { s += v * (c.qty || 1); hits++; }
-                  });
-                  return hits > 0 ? Math.round(s * 100) / 100 : 0;
-                };
+                // Only use the per-deck salt that comes with enriched deck
+                // data (e.g. Archidekt's per-card oracleCard.salt summed in
+                // extractArchInsights). Decks that haven't been enriched
+                // simply have no salt score yet.
+                const deckSalt = (d) => (d.deckData?.salt != null ? d.deckData.salt : null);
                 const isFullDeck = (d) => {
                   const t = totalQty(d.cards || []);
                   const fmt = d.format || "commander";
@@ -7732,14 +7760,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           </div>
                         `}
                       </div>
-                      ${!saltiest && saltMap && saltMap.size > 0 && html`
+                      ${!saltiest && enrichedDecks.length > 0 && html`
                         <div style=${{ fontSize:11, color:"var(--fg-text-muted)", marginTop:-12, marginBottom:18, fontStyle:"italic" }}>
-                          No salt scores yet — saltiest deck appears once you have decks with cards in the EDHRec top-salt list.
-                        </div>
-                      `}
-                      ${!saltMap && html`
-                        <div style=${{ fontSize:11, color:"var(--fg-text-muted)", marginTop:-12, marginBottom:18, fontStyle:"italic" }}>
-                          Loading salt scores from EDHRec…
+                          Saltiest deck appears once at least one deck has been enriched (e.g. pushed to Archidekt and refreshed) — salt comes from per-card EDHRec scores in the enriched deck data.
                         </div>
                       `}
                     `}
