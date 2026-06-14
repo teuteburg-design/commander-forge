@@ -513,13 +513,17 @@
       commander_legal: sf.legalities?.commander === "legal",
     };
     if (sf.image_uris)
-      s.image_uris = { small: sf.image_uris.small, normal: sf.image_uris.normal };
+      s.image_uris = {
+        small: sf.image_uris.small,
+        normal: sf.image_uris.normal,
+        art_crop: sf.image_uris.art_crop,
+      };
     if (sf.card_faces)
       s.card_faces = sf.card_faces.map(f => ({
         name: f.name, mana_cost: f.mana_cost,
         type_line: f.type_line, oracle_text: f.oracle_text,
         image_uris: f.image_uris
-          ? { small: f.image_uris.small, normal: f.image_uris.normal } : undefined,
+          ? { small: f.image_uris.small, normal: f.image_uris.normal, art_crop: f.image_uris.art_crop } : undefined,
       }));
     if (sf.prices) s.prices = { usd: sf.prices.usd };
     if (sf.related_uris?.edhrec)
@@ -2396,6 +2400,7 @@
     const [preconExpanded,  setPreconExpanded]  = useState(null);   // "<set>/<slug>" currently expanded, or null
     const [preconDetail,    setPreconDetail]    = useState({});     // { "set/slug": parsedDeck }
     const [preconImporting, setPreconImporting] = useState(null);   // "set/slug" while importing
+    const [viewingPrecon,   setViewingPrecon]   = useState(null);   // { entry } when on the precon detail page
     const [preconUpdated,   setPreconUpdated]   = useState(0);
     const [preconRefreshing,setPreconRefreshing]= useState(false);
     const [preconCmdrArt,   setPreconCmdrArt]   = useState({});   // { lcName: art_crop_url }
@@ -5613,20 +5618,38 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       }
     };
 
-    const togglePreconExpand = async (key, entry) => {
-      if (preconExpanded === key) { setPreconExpanded(null); return; }
-      setPreconExpanded(key);
+    // Navigate to the full precon-detail page. Fetches the decklist if we
+    // haven't already, and resolves every card in it against Scryfall so the
+    // detail view can render mana costs / type lines / art alongside the
+    // names. Falls through silently if the network hops fail — the page
+    // still works with just names.
+    const openPreconView = async (entry) => {
+      setViewingPrecon({ entry });
+      setPhase("precon_view");
+      window.scrollTo({ top: 0 });
+      const key = entry.set + "/" + entry.slug;
       if (!preconDetail[key]) {
         try {
           const { deck } = await fetchMtgWtfDeck(entry.set, entry.slug);
           setPreconDetail(prev => ({ ...prev, [key]: deck }));
-          // Resolve just the commanders so the preview shows colour identity.
-          // Full card resolution happens at import time.
+          // Eager-resolve every card so the detail view shows colour identity,
+          // type lines, art_crop on the commander, etc.
+          const allNames = [...deck.commanders, ...deck.cards.map(c => c.name)];
+          try { await resolveCardsByName(allNames); } catch {}
+          // Bump precon art map for any commanders we just resolved.
           if (deck.commanders.length) {
-            try { await resolveCardsByName(deck.commanders); } catch {}
-            // Bump state so the row re-renders with the cached Scryfall data.
-            setPreconDetail(prev => ({ ...prev }));
+            const cache = getSFCache();
+            const update = {};
+            deck.commanders.forEach(n => {
+              const sf = cache[n.toLowerCase()]?.d;
+              const art = sf?.image_uris?.art_crop
+                       || sf?.card_faces?.[0]?.image_uris?.art_crop;
+              if (art) update[n.toLowerCase()] = art;
+            });
+            if (Object.keys(update).length) setPreconCmdrArt(prev => ({ ...prev, ...update }));
           }
+          // Force a re-render via the detail map.
+          setPreconDetail(prev => ({ ...prev }));
         } catch (e) {
           setPreconError(e.message);
         }
@@ -5846,7 +5869,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       || (phase === "deck" && !fromCollection && !fromSaved),
                     onClick: () => { setPhase("ready"); setTab(activeTab === "home" ? "build" : activeTab); } },
                   { label:"📋 Collection",
-                    active: phase==="select" || phase==="import" || phase==="binder_view" || phase==="precons",
+                    active: phase==="select" || phase==="import" || phase==="binder_view" || phase==="precons" || phase==="precon_view",
                     onClick: navToCollection },
                   { label:`📚 Library${(library.length + (groups.decks?.length || 0)) > 0 ? " ("+(library.length + (groups.decks?.length || 0))+")" : ""}`,
                     active: phase==="saved_list"
@@ -5909,7 +5932,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               `}
 
               <!-- Contextual sub-nav for Collection: Overview + Pre-cons. -->
-              ${["select","import","binder_view","precons"].includes(phase) && html`
+              ${["select","import","binder_view","precons","precon_view"].includes(phase) && html`
                 <div style=${{
                   display:"flex", gap:0, marginTop:6, paddingLeft:6, flexWrap:"wrap",
                   borderTop:"1px solid var(--header-overlay)",
@@ -5922,8 +5945,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       active: phase==="import",
                       onClick: () => { setCsv(""); setError(""); setPhase("import"); } },
                     { label:"🛒 Pre-cons",
-                      active: phase==="precons",
-                      onClick: () => setPhase("precons") },
+                      active: phase==="precons" || phase==="precon_view",
+                      onClick: () => { setViewingPrecon(null); setPhase("precons"); } },
                   ].map(item => html`
                     <button key=${item.label} onClick=${item.onClick}
                       style=${{
@@ -7038,58 +7061,51 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         </div>
                         <div style=${{
                           display:"grid",
-                          gridTemplateColumns:"repeat(auto-fill, minmax(280px, 1fr))",
+                          gridTemplateColumns:"repeat(2, minmax(0, 1fr))",
                           gap:8,
                         }}>
                           ${entries.map(entry => {
                             const key = entry.set + "/" + entry.slug;
-                            const expanded = preconExpanded === key;
-                            const detail = preconDetail[key] || null;
                             const importing = preconImporting === key;
                             const alreadyHere = (groups.decks || []).some(d => d.precon?.set === entry.set && d.precon?.slug === entry.slug);
-                            const resolved = detail ? (() => {
-                              const cache = getSFCache();
-                              return detail.commanders.map(n => ({
-                                name: n,
-                                sf: cache[n.toLowerCase()]?.d || null,
-                              }));
-                            })() : null;
-                            // Commander art: from the prefetched bg map (worker-provided
-                            // commanders list) OR fall back to the expanded-deck Scryfall
-                            // resolve. Both populate the same SF cache.
-                            const firstCmdr = (entry.commanders || [])[0] || (detail?.commanders || [])[0];
+                            const firstCmdr = (entry.commanders || [])[0];
                             const cmdrArt = firstCmdr ? preconCmdrArt[firstCmdr.toLowerCase()] : null;
                             return html`
-                              <div key=${key} style=${{
-                                background:"var(--bg-surface)", border:"1px solid var(--border-pale)",
-                                borderRadius:6, overflow:"hidden", position:"relative",
-                              }}>
-                                <div onClick=${() => togglePreconExpand(key, entry)}
-                                  style=${{
+                              <div key=${key}
+                                onClick=${() => openPreconView(entry)}
+                                style=${{
+                                  background:"var(--bg-surface)", border:"1px solid var(--border-pale)",
+                                  borderRadius:6, overflow:"hidden", position:"relative", cursor:"pointer",
+                                  transition:"border-color .15s, box-shadow .15s",
+                                }}
+                                onMouseOver=${e => { e.currentTarget.style.borderColor = "var(--accent-soft)"; e.currentTarget.style.boxShadow = "0 2px 8px rgba(0,0,0,0.08)"; }}
+                                onMouseOut=${e => { e.currentTarget.style.borderColor = "var(--border-pale)"; e.currentTarget.style.boxShadow = "none"; }}
+                              >
+                                <div style=${{
                                     display:"flex", alignItems:"center", gap:10,
-                                    padding:"10px 12px", cursor:"pointer",
-                                    position:"relative", minHeight: cmdrArt ? 64 : "auto",
+                                    padding:"12px 14px",
+                                    position:"relative", minHeight: cmdrArt ? 78 : "auto",
                                     background: cmdrArt
-                                      ? `linear-gradient(90deg, var(--bg-surface) 0%, rgba(0,0,0,0) 60%), url("${cmdrArt}")`
-                                      : (expanded ? "var(--bg-surface-soft)" : "var(--bg-surface)"),
+                                      ? `linear-gradient(90deg, var(--bg-surface) 0%, var(--bg-surface) 25%, rgba(0,0,0,0) 70%), url("${cmdrArt}")`
+                                      : "var(--bg-surface)",
                                     backgroundSize: cmdrArt ? "cover" : "auto",
                                     backgroundPosition: cmdrArt ? "right center" : "initial",
                                   }}>
                                   <div style=${{ flex:1, minWidth:0, position:"relative", zIndex:1 }}>
-                                    <div style=${{ fontSize:13, fontWeight:600, color:"var(--fg-text-strong)",
+                                    <div style=${{ fontSize:13, fontWeight:700, color:"var(--fg-text-strong)",
                                       whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
-                                      textShadow: cmdrArt ? "0 1px 2px var(--bg-surface)" : "none" }}>
+                                      textShadow: cmdrArt ? "0 1px 3px var(--bg-surface), 0 0 6px var(--bg-surface)" : "none" }}>
                                       ${entry.name}
                                     </div>
                                     ${firstCmdr && html`
-                                      <div style=${{ fontSize:10, color:"var(--fg-text-soft)", marginTop:1,
+                                      <div style=${{ fontSize:11, color:"var(--fg-text-soft)", marginTop:2,
                                         whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
-                                        textShadow: cmdrArt ? "0 1px 2px var(--bg-surface)" : "none" }}>
+                                        textShadow: cmdrArt ? "0 1px 3px var(--bg-surface), 0 0 6px var(--bg-surface)" : "none" }}>
                                         👑 ${firstCmdr}${(entry.commanders || []).length > 1 ? ` + ${entry.commanders[1]}` : ""}
                                       </div>
                                     `}
-                                    <div style=${{ fontSize:10, color:"var(--fg-text-muted)", marginTop:1,
-                                      textShadow: cmdrArt ? "0 1px 2px var(--bg-surface)" : "none" }}>
+                                    <div style=${{ fontSize:10, color:"var(--fg-text-muted)", marginTop:2,
+                                      textShadow: cmdrArt ? "0 1px 3px var(--bg-surface), 0 0 6px var(--bg-surface)" : "none" }}>
                                       ${entry.cardCount ? `${entry.cardCount} cards` : entry.type}
                                       ${alreadyHere && html`<span style=${{
                                         marginLeft:6, padding:"1px 6px", borderRadius:10, fontSize:9,
@@ -7107,78 +7123,180 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                     }}>
                                     ${importing ? "Importing…" : alreadyHere ? "✓ Imported" : "+ Import"}
                                   </button>
-                                  <span style=${{ fontSize:12, color:"var(--fg-text-soft)", flexShrink:0, position:"relative", zIndex:1 }}>${expanded ? "▲" : "▼"}</span>
                                 </div>
 
-                                ${expanded && html`
-                                  <div style=${{
-                                    padding:"10px 14px 12px", borderTop:"1px solid var(--border-pale)",
-                                    background:"var(--bg-surface-soft)",
-                                  }}>
-                                    ${!detail && html`
-                                      <div style=${{ fontSize:12, color:"var(--fg-text-soft)", padding:"6px 0" }}>
-                                        Loading decklist…
-                                      </div>
-                                    `}
-                                    ${detail && html`
-                                      ${detail.commanders.length > 0 && html`
-                                        <div style=${{ ...label, marginTop:0, marginBottom:6 }}>
-                                          Commander${detail.commanders.length > 1 ? "s" : ""}${detail.partners ? " (Partner)" : ""}
-                                        </div>
-                                        <div style=${{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:10 }}>
-                                          ${resolved.map(r => html`
-                                            <div key=${r.name} style=${{
-                                              display:"flex", alignItems:"center", gap:6,
-                                              padding:"4px 8px", borderRadius:6,
-                                              background:"var(--bg-surface)", border:"1px solid var(--border-pale)",
-                                            }}>
-                                              <span style=${{ fontSize:12, fontWeight:600, color:"var(--fg-text-strong)" }}>${r.name}</span>
-                                              ${r.sf?.color_identity && html`
-                                                <span style=${{ display:"inline-flex", gap:2 }}>
-                                                  ${(r.sf.color_identity || []).map(c => html`<${Pip} key=${c} c=${c} size=${13} />`)}
-                                                </span>
-                                              `}
-                                            </div>
-                                          `)}
-                                        </div>
-                                      `}
-
-                                      <div style=${{ ...label, marginTop:6, marginBottom:6 }}>
-                                        Decklist (${detail.cards.reduce((s, c) => s + (c.qty || 1), 0)} cards)
-                                      </div>
-                                      <div style=${{
-                                        display:"grid",
-                                        gridTemplateColumns:"repeat(auto-fill, minmax(220px, 1fr))",
-                                        gap:4, maxHeight:280, overflow:"auto", paddingRight:6,
-                                      }}>
-                                        ${detail.cards.slice(0, 200).map((c, i) => html`
-                                          <div key=${c.name+i} style=${{
-                                            display:"flex", alignItems:"center", gap:6,
-                                            fontSize:11, color:"var(--fg-text-heading)", padding:"2px 6px",
-                                            background:"var(--bg-surface)", border:"1px solid var(--border-pale)",
-                                            borderRadius:4, minWidth:0,
-                                          }}>
-                                            <span style=${{ flexShrink:0, color:"var(--fg-text-muted)" }}>${c.qty}×</span>
-                                            <span style=${{ flex:1, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
-                                              ${c.name}
-                                            </span>
-                                          </div>
-                                        `)}
-                                      </div>
-                                      ${detail.cards.length > 200 && html`
-                                        <div style=${{ fontSize:11, color:"var(--fg-text-muted)", marginTop:6, fontStyle:"italic" }}>
-                                          Showing first 200 of ${detail.cards.length}.
-                                        </div>
-                                      `}
-                                    `}
-                                  </div>
-                                `}
                               </div>
                             `;
                           })}
                         </div>
                       </div>
                     `;
+                    })}
+                  </div>
+                `}
+              </div>
+            `;
+          })()}
+
+          <!-- ── PRE-CON DETAIL ('deck list view') ──────────────────────── -->
+          ${phase === "precon_view" && viewingPrecon && (() => {
+            const entry = viewingPrecon.entry;
+            const key = entry.set + "/" + entry.slug;
+            const detail = preconDetail[key] || null;
+            const cache = getSFCache();
+            const importing = preconImporting === key;
+            const alreadyHere = (groups.decks || []).some(d => d.precon?.set === entry.set && d.precon?.slug === entry.slug);
+            const cmdrs = (detail?.commanders || entry.commanders || []).map(n => ({
+              name: n,
+              sf: cache[n.toLowerCase()]?.d || null,
+            }));
+            const heroArt = cmdrs[0]?.sf?.image_uris?.art_crop
+                         || cmdrs[0]?.sf?.card_faces?.[0]?.image_uris?.art_crop
+                         || (cmdrs[0] ? preconCmdrArt[cmdrs[0].name.toLowerCase()] : null);
+            // Group cards by section header (Creature / Instant / Land / …) so
+            // the view mirrors the library's deck layout.
+            const grouped = new Map();
+            (detail?.cards || []).forEach(c => {
+              const sec = c.section || "Other";
+              if (!grouped.has(sec)) grouped.set(sec, []);
+              grouped.get(sec).push(c);
+            });
+            // Stable, readable section order: lands last, creatures first.
+            const sectionRank = (s) => {
+              const t = s.toLowerCase();
+              if (t.startsWith("creature")) return 1;
+              if (t.startsWith("planeswalker")) return 2;
+              if (t.startsWith("instant")) return 3;
+              if (t.startsWith("sorcery")) return 4;
+              if (t.startsWith("artifact")) return 5;
+              if (t.startsWith("enchantment")) return 6;
+              if (t.startsWith("battle")) return 7;
+              if (t.startsWith("land")) return 9;
+              return 8;
+            };
+            const orderedSections = [...grouped.entries()]
+              .sort(([a], [b]) => sectionRank(a) - sectionRank(b) || a.localeCompare(b));
+            return html`
+              <div style=${{ maxWidth:1080, margin:"0 auto" }}>
+                <!-- Top bar: back + import + meta -->
+                <div style=${{ display:"flex", alignItems:"center", gap:10, marginBottom:14, flexWrap:"wrap" }}>
+                  <button onClick=${() => { setPhase("precons"); setViewingPrecon(null); }}
+                    style=${{ ...btnSec, fontSize:12, padding:"6px 12px" }}>← Back to pre-cons</button>
+                  <div style=${{ flex:1, minWidth:0 }}>
+                    <h2 style=${{ fontSize:20, color:"var(--fg-text-heading)", margin:0 }}>${entry.name}</h2>
+                    <div style=${{ fontSize:12, color:"var(--fg-text-soft)", marginTop:2 }}>
+                      ${entry.setName}
+                      <span style=${{
+                        marginLeft:6, padding:"1px 7px", borderRadius:4, fontSize:10, fontWeight:700,
+                        background:"var(--bg-tag)", color:"var(--fg-text-soft)", letterSpacing:0.5,
+                      }}>${(entry.set || "").toUpperCase()}</span>
+                      ${entry.cardCount && html`<span> · ${entry.cardCount} cards</span>`}
+                      ${detail?.releasedAt && html`<span> · released ${detail.releasedAt}</span>`}
+                    </div>
+                  </div>
+                  <button onClick=${() => importPreconAsDeck(entry)}
+                    disabled=${importing || alreadyHere}
+                    style=${{
+                      ...btn, fontSize:13, padding:"7px 14px", whiteSpace:"nowrap",
+                      opacity: (importing || alreadyHere) ? 0.55 : 1,
+                      cursor: importing ? "wait" : alreadyHere ? "default" : "pointer",
+                    }}>
+                    ${importing ? "Importing…" : alreadyHere ? "✓ Imported" : "+ Import as deck"}
+                  </button>
+                </div>
+
+                <!-- Commander hero -->
+                ${cmdrs.length > 0 && html`
+                  <div style=${{
+                    position:"relative", overflow:"hidden",
+                    background:"var(--bg-surface)", border:"1px solid var(--border-neutral)",
+                    borderRadius:10, marginBottom:18, minHeight: heroArt ? 160 : 80,
+                    backgroundImage: heroArt ? `linear-gradient(90deg, var(--bg-surface) 0%, var(--bg-surface) 25%, rgba(0,0,0,0) 80%), url("${heroArt}")` : "none",
+                    backgroundSize: heroArt ? "cover" : "auto",
+                    backgroundPosition: heroArt ? "right center" : "initial",
+                  }}>
+                    <div style=${{ padding:"18px 22px", position:"relative", zIndex:1, maxWidth:"60%" }}>
+                      <div style=${{ fontSize:10, letterSpacing:2, color:"var(--fg-text-muted)", textTransform:"uppercase", fontWeight:700, marginBottom:6 }}>
+                        Commander${cmdrs.length > 1 ? "s" : ""}${detail?.partners ? " · Partner" : ""}
+                      </div>
+                      ${cmdrs.map(r => html`
+                        <div key=${r.name} style=${{ marginBottom:6 }}>
+                          <span style=${{ fontSize:16, fontWeight:700, color:"var(--fg-text-strong)",
+                            textShadow: heroArt ? "0 1px 3px var(--bg-surface), 0 0 6px var(--bg-surface)" : "none" }}>
+                            ${r.name}
+                          </span>
+                          ${r.sf?.color_identity && html`
+                            <span style=${{ display:"inline-flex", gap:3, marginLeft:8, verticalAlign:"middle" }}>
+                              ${(r.sf.color_identity || []).map(c => html`<${Pip} key=${c} c=${c} size=${15} />`)}
+                            </span>
+                          `}
+                          ${r.sf?.type_line && html`
+                            <div style=${{ fontSize:11, color:"var(--fg-text-soft)", marginTop:2,
+                              textShadow: heroArt ? "0 1px 3px var(--bg-surface)" : "none" }}>
+                              ${r.sf.type_line}
+                            </div>
+                          `}
+                        </div>
+                      `)}
+                    </div>
+                  </div>
+                `}
+
+                ${!detail && html`
+                  <div style=${{ padding:"40px 20px", textAlign:"center", color:"var(--fg-text-soft)", fontSize:13 }}>
+                    Loading decklist…
+                  </div>
+                `}
+
+                ${detail && html`
+                  <div style=${{
+                    display:"grid",
+                    gridTemplateColumns:"repeat(auto-fill, minmax(320px, 1fr))",
+                    gap:16,
+                  }}>
+                    ${orderedSections.map(([section, cards]) => {
+                      const total = cards.reduce((s, c) => s + (c.qty || 1), 0);
+                      return html`
+                        <div key=${section} style=${{
+                          background:"var(--bg-surface)", border:"1px solid var(--border-neutral)",
+                          borderRadius:8, padding:"10px 12px",
+                        }}>
+                          <div style=${{ fontSize:11, letterSpacing:1.5, textTransform:"uppercase",
+                            color:"var(--accent)", fontWeight:700, marginBottom:8 }}>
+                            ${section.replace(/\s*\(\d+\)\s*$/, "")} · ${total}
+                          </div>
+                          <div style=${{ display:"flex", flexDirection:"column", gap:3 }}>
+                            ${cards.map((c, i) => {
+                              const sf = cache[(c.name || "").toLowerCase()]?.d;
+                              const ci = sf?.color_identity || [];
+                              return html`
+                                <div key=${c.name+i} style=${{
+                                  display:"flex", alignItems:"center", gap:6,
+                                  fontSize:12, color:"var(--fg-text-heading)", padding:"3px 4px",
+                                  borderRadius:4, minWidth:0,
+                                }}>
+                                  <span style=${{ flexShrink:0, color:"var(--fg-text-muted)", minWidth:18 }}>
+                                    ${c.qty}×
+                                  </span>
+                                  <span style=${{ flex:1, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                                    ${c.name}
+                                  </span>
+                                  ${ci.length > 0 && html`
+                                    <span style=${{ display:"inline-flex", gap:1, flexShrink:0 }}>
+                                      ${ci.map(col => html`<${Pip} key=${col} c=${col} size=${11} />`)}
+                                    </span>
+                                  `}
+                                  ${typeof sf?.cmc === "number" && html`
+                                    <span style=${{ fontSize:10, color:"var(--fg-text-muted)", flexShrink:0, minWidth:14, textAlign:"right" }}>
+                                      ${sf.cmc}
+                                    </span>
+                                  `}
+                                </div>
+                              `;
+                            })}
+                          </div>
+                        </div>
+                      `;
                     })}
                   </div>
                 `}

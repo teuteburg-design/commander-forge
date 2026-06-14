@@ -326,12 +326,18 @@ async function refreshPrecons(env, { reason = "unknown", force = false } = {}) {
       && old.type === u.type
       && old.cardCount === u.cardCount
       && old.setName === u.setName;
-    if (unchanged) {
+    // Backfill path: old entries cached before commanders[] enrichment was
+    // added still lack it. Treat them as dirty so a refresh re-pulls them
+    // and attaches commanders[]. Doesn't reset the streak — these are
+    // 'old' entries, so finding a long run of them stops scanning past the
+    // already-enriched top of the list.
+    const needsBackfill = unchanged && (!old.commanders || !old.commanders.length);
+    if (unchanged && !needsBackfill) {
       streak++;
       if (streak >= PRECON_STREAK_CUTOFF) { truncated = true; break; }
       continue;
     }
-    streak = 0;
+    if (!unchanged) streak = 0;
     dirty.push(u);
     if (dirty.length >= PRECON_MAX_DOWNLOADS) { truncated = true; break; }
   }
