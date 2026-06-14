@@ -4611,12 +4611,14 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       // Preserve the user's in-progress built deck if there is one — opening
       // a saved deck shouldn't silently lose unsaved work. We restore it via
       // the "↩ Back to your built deck" button in the deck view.
-      if (!fromSaved && deck && selCmd) {
+      if (!fromSaved && deck && selCmd && !previewingPrecon) {
         setUnsavedDeck({ deck, selCmd });
       }
+      setPreviewingPrecon(null);
       setSelCmd(entry.selCmd);
       setDeck(entry.deck);
       setFromSaved(true);
+      setFromCollection(false);
       setLibSaved(true);   // already saved — no need to offer again
       setDeckSvd(false);
       setError("");
@@ -4846,9 +4848,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     const openImportedDeck = async (rawDeck, returnTo = "library") => {
       // Cache hit — open immediately.
       if (rawDeck.deckData && rawDeck.selCmd) {
-        if (!fromSaved && !fromCollection && deck && selCmd) {
+        if (!fromSaved && !fromCollection && deck && selCmd && !previewingPrecon) {
           setUnsavedDeck({ deck, selCmd });
         }
+        setPreviewingPrecon(null);
         setSelCmd(rawDeck.selCmd);
         setDeck(rawDeck.deckData);
         setFromSaved(returnTo === "library");
@@ -4891,9 +4894,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         addLog(`✅ Ready — opening "${rawDeck.name}".`);
 
         // Preserve unsaved built deck if any.
-        if (!fromSaved && !fromCollection && deck && selCmd) {
+        if (!fromSaved && !fromCollection && deck && selCmd && !previewingPrecon) {
           setUnsavedDeck({ deck, selCmd });
         }
+        setPreviewingPrecon(null);
         setSelCmd(enrSel);
         setDeck(enrDeck);
         setFromSaved(returnTo === "library");
@@ -5453,6 +5457,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       // Reset menu/rename state so it doesn't bleed across decks.
       setDeckMenuOpen(false);
       setDeckRenameValue(null);
+      // Clear any lingering precon-preview state so a saved deck view doesn't
+      // render the preview's "+ Import as deck" button.
+      setPreviewingPrecon(null);
       // Forge-generated decks have their own opener that resets some
       // collection-specific flags (libSaved etc.) correctly.
       if (d.source === "generated" && d.deckData && d.selCmd) {
@@ -5532,9 +5539,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     const loadCollectionDeck = d => {
       if (d.source !== "generated" || !d.deckData || !d.selCmd) return;
       // Preserve any unsaved built deck the same way loadFromLibrary does.
-      if (!fromSaved && !fromCollection && deck && selCmd) {
+      if (!fromSaved && !fromCollection && deck && selCmd && !previewingPrecon) {
         setUnsavedDeck({ deck, selCmd });
       }
+      setPreviewingPrecon(null);
       setSelCmd(d.selCmd);
       setDeck(d.deckData);
       setFromSaved(false);
@@ -5594,6 +5602,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
     const restoreUnsavedDeck = () => {
       if (!unsavedDeck) return;
+      setPreviewingPrecon(null);
       setDeck(unsavedDeck.deck);
       setSelCmd(unsavedDeck.selCmd);
       setFromSaved(false);
@@ -6224,11 +6233,12 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       || (phase === "deck" && !fromCollection && !fromSaved && !previewingPrecon),
                     onClick: () => { setPhase("ready"); setTab(activeTab === "home" ? "build" : activeTab); } },
                   { label:"📋 Collection",
-                    active: phase==="select" || phase==="import" || phase==="binder_view" || phase==="precons" || (phase==="deck" && !!previewingPrecon),
+                    active: phase==="select" || phase==="import" || phase==="binder_view" || phase==="precons"
+                      || (phase==="deck" && (fromCollection || !!previewingPrecon)),
                     onClick: navToCollection },
                   { label:`📚 Library${(library.length + (groups.decks?.length || 0)) > 0 ? " ("+(library.length + (groups.decks?.length || 0))+")" : ""}`,
                     active: phase==="saved_list"
-                      || (phase === "deck" && (fromCollection || fromSaved)),
+                      || (phase === "deck" && fromSaved && !fromCollection),
                     onClick: () => setPhase("saved_list") },
                   { label:"⚙ Settings",    active: phase==="setup",
                     onClick: () => { setPrev(phase); setAKI(apiKeys); setPhase("setup"); } },
@@ -7205,22 +7215,15 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       ${groups.decks.length === 0 ? "No decks yet. Create an empty one, build & save, or import a CSV with deck data." : `No decks match "${collQuery}".`}
                     </div>`
                   : sortedDecks.map((d, i) => {
-                      const total = cardTotal(d.cards);
+                      // Maindeck rows + commander(s) in the command zone.
+                      const maindeck = cardTotal(d.cards);
+                      const cmdrCount = (d.commanderName ? 1 : 0) + ((d.partner || d.partnerName) ? 1 : 0);
                       const fmt = (d.format || "commander");
                       const isCmdr = fmt === "commander";
-                      // Partner deck → 2 commanders in the command zone, so
-                      // the maindeck-only side targets 98 (total still 100).
-                      const hasPartner = !!d.partner || !!d.partnerName;
+                      const total  = maindeck + (isCmdr ? cmdrCount : 0);
                       const target = isCmdr ? 100 : 60;
-                      const cmdrMin = hasPartner ? 98 : 99;
-                      const complete = isCmdr
-                        ? (total >= cmdrMin && total <= 100)
-                        : (total >= target);
-                      const badge = isCmdr
-                        ? (total === 100 ? "✓ 100/100"
-                          : total === cmdrMin ? (hasPartner ? "✓ 98 + 2 cmdrs" : "✓ 99 + cmdr")
-                          : `${total}/100`)
-                        : `${total}/${target}`;
+                      const complete = total >= target;
+                      const badge = complete ? `✓ ${total} cards` : `${total}/${target}`;
                       const isGen = d.source === "generated" && d.deckData;
                       const included = !!deckInc[d.name];
                       const colors = deckColorIdentity(d);
@@ -9149,20 +9152,19 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   </div>
                   <div style=${{ fontSize:11, color:"var(--fg-text-muted)" }}>
                     ${(() => {
-                      const t = deck.categories.reduce((s,c) => s+c.cards.length, 0);
-                      // Partner decks have two commanders in the command zone,
-                      // so the maindeck target is 98 instead of 99.
-                      const hasPartner = !!deck.partner;
-                      const target = hasPartner ? 98 : 99;
-                      const ok = t === target;
-                      const okLabel = hasPartner ? "✓ 98 + 2 commanders" : "✓ 99 + commander";
+                      // Total = maindeck + commander(s) in the command zone.
+                      const maindeck = deck.categories.reduce((s,c) => s+c.cards.length, 0);
+                      const cmdrCount = (selCmd ? 1 : 0) + (deck.partner ? 1 : 0);
+                      const total = maindeck + cmdrCount;
+                      const target = 100; // Commander deck size
+                      const ok = total >= target;
                       return html`
-                        <span>${t} cards · ${deck.categories.length} categories</span>
+                        <span>${total} cards · ${deck.categories.length} categories</span>
                         <span style=${{
                           marginLeft:8, padding:"1px 8px", borderRadius:10, fontSize:10, fontWeight:700,
                           background: ok ? "var(--success-soft)" : "var(--warning-bg)",
                           color: ok ? "var(--success-text)" : "var(--warning)",
-                        }}>${ok ? okLabel : `${t}/${target} ⚠`}</span>
+                        }}>${ok ? `✓ ${total} cards` : `${total}/${target} ⚠`}</span>
                       `;
                     })()}
                   </div>
