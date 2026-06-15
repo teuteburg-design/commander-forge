@@ -10338,7 +10338,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       const faces = (sf?.card_faces || card.faces || []).filter(f => f.image_uris);
                       const isDFC = faces.length >= 2;
                       // Front face only for the row: name, mana, thumbnail.
-                      const frontName = isDFC ? dvFront(card.name) : card.name;
+                      const frontName = isDFC
+                        ? (faces[0]?.name || (card.name || "").split("//")[0].trim())
+                        : card.name;
                       const frontSmall = (faces[0]?.image_uris?.small)
                         || card.img
                         || sf?.image_uris?.small || null;
