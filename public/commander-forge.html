@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.06.15-e-debug";
+  const APP_VERSION = "v2026.06.15-f-debug";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -4989,11 +4989,23 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     const ensureDeckResolved = async (rawDeck) => {
       const token = ++openDeckTokenRef.current;
       try {
-        const names = [rawDeck.commanderName, rawDeck.partnerName].filter(Boolean);
-        const reqs = [
-          ...names.map(n => ({ name: n, qty: 1, id: "" })),
-          ...(rawDeck.cards || []).map(c => ({ name: c.name, id: c.id || "", qty: c.qty || 1 })),
-        ];
+        // Collect every card that's actually DISPLAYED: commander names + the
+        // raw rows + every card in deckData.categories. A card can live in the
+        // rendered categories but be absent/renamed in rawDeck.cards (AI decks
+        // keep cards only in deckData; DFCs differ between the two), so pulling
+        // from both is what guarantees nothing is left unresolved.
+        const seen = new Set();
+        const reqs = [];
+        const push = (name, id) => {
+          const k = (name || "").toLowerCase();
+          if (!name || seen.has(k)) return;
+          seen.add(k);
+          reqs.push({ name, id: id || "", qty: 1 });
+        };
+        [rawDeck.commanderName, rawDeck.partnerName].forEach(n => push(n));
+        (rawDeck.cards || []).forEach(c => push(c.name, c.id));
+        (rawDeck.deckData?.categories || []).forEach(cat =>
+          (cat.cards || []).forEach(c => push(c.name, c.id)));
         if (!reqs.length) return;
         // fetchAllScryfall returns each request with its resolved .scryfall —
         // use THAT directly instead of trusting the global cache keys (which
@@ -5034,7 +5046,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         setUnsavedDeck({ deck, selCmd });
       }
       setPreviewingPrecon(null);
-      setCmdrFlipped(false); setFlippedCards({});
+      setCmdrFlipped(false); setFlippedCards({}); setDeckCardMenu(null);
       setSelCmd(entry.selCmd);
       // Library entries live outside groups.decks, so heal in-memory only.
       setDeck(healDeckData(entry.deck, entry.selCmd).deckData);
@@ -5045,6 +5057,15 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setError("");
       restoreArchResult(entry.deck);
       setPhase("deck");
+      // Resolve any missing card data + re-heal (same as the collection path).
+      ensureDeckResolved({
+        name: entry.deck?.theme,
+        commanderName: entry.selCmd?.name,
+        partnerName: entry.deck?.partner?.name,
+        cards: [],
+        deckData: entry.deck,
+        selCmd: entry.selCmd,
+      });
     };
 
     // ── Imported-deck enrichment ───────────────────────────────────────────
