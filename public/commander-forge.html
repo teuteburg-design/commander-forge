@@ -5689,6 +5689,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       if (d.source === "generated" && d.deckData && d.selCmd) {
         return loadCollectionDeck(d);
       }
+      // Precons (and any other lean deck without cached deckData but with
+      // card references) rebuild their view from the Scryfall cache.
+      if (d.source === "precon" && (d.cards || []).length && !d.deckData) {
+        return openLeanDeck(d, "collection");
+      }
       if (!(d.cards || []).length && !d.deckData) {
         alert(`"${d.name}" is empty — add cards via the Build flow or import a CSV first.`);
         return;
@@ -5778,6 +5783,63 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setPhase("deck");
     };
 
+    // Open a LEAN deck (precon) — one that stores only cheap card references
+    // (cards rows + commander name strings), no cached deckData. We rebuild
+    // the full categorised deck view on the fly from the Scryfall cache,
+    // fetching only the cards the cache has evicted. No EDHRec / Spellbook
+    // calls — those are reserved for the heavyweight enrich path. This is
+    // what keeps the per-deck localStorage footprint tiny.
+    const openLeanDeck = async (d, returnTo = "collection") => {
+      setDeckMenuOpen(false); setDeckRenameValue(null);
+      if (!fromSaved && !fromCollection && deck && selCmd && !previewingPrecon) {
+        setUnsavedDeck({ deck, selCmd });
+      }
+      setPreviewingPrecon(null);
+      setError("");
+      setPhase("enriching");
+      setLog([]); setProg(0);
+      addLog(`📦 Opening "${d.name}"…`);
+      try {
+        const cmdrNames = [d.commanderName, d.partnerName].filter(Boolean);
+        const reqs = [
+          ...cmdrNames.map(n => ({ name: n, qty: 1, id: "" })),
+          ...(d.cards || []),
+        ];
+        // Cache-first resolve; only evicted cards hit the network. Keys by id
+        // so the exact precon printing comes back.
+        await fetchAllScryfall(reqs, p => setProg(Math.min(85, p|0)), m => addLog("   " + m));
+        const cache = getSFCache();
+        // Reuse buildPreconDeckData by synthesising the { entry, detail } it
+        // expects from the saved deck's own references.
+        const entry = {
+          name:    d.name,
+          set:     d.precon?.set || "",
+          setName: d.precon?.setName || d.precon?.set || "",
+          slug:    d.precon?.slug || "",
+        };
+        const detail = {
+          commanders: cmdrNames,
+          cards: (d.cards || []).map(r => ({
+            name: r.name, qty: r.qty || 1, set: r.set || null, number: r.collector_number || null,
+          })),
+        };
+        const { selCmd: sel, deck: deckObj } = buildPreconDeckData(entry, detail, cache);
+        if (deckObj) deckObj.theme = d.name;
+        setSelCmd(sel);
+        setDeck(deckObj);
+        setFromSaved(returnTo === "library");
+        setFromCollection(returnTo === "collection");
+        setLibSaved(false);
+        setDeckSvd(true);
+        setProg(100);
+        setPhase("deck");
+        window.scrollTo({ top: 0 });
+      } catch (e) {
+        setError(`Couldn't open deck: ${e?.message || e}`);
+        setPhase("error");
+      }
+    };
+
     // Swap the commander of the currently-open deck to a different card from
     // the deck's commanderCandidates list (legal commanders found during
     // enrichment). Used to fix auto-detect mis-picks (e.g. a precon where
@@ -5862,8 +5924,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           return {
             ...d,
             partnerName: partnerEntry.name,
-            partner:     partnerEntry,
-            deckData:    nextDeck,
+            // partner object + deckData only persisted for non-lean decks;
+            // lean precons just keep partnerName and rebuild on open.
+            ...(d.deckData ? { partner: partnerEntry, deckData: nextDeck } : {}),
             // Drop the chosen card from the persisted maindeck rows too.
             cards: (d.cards || []).filter(c =>
               (c.name || "").toLowerCase() !== (partnerCard.name || "").toLowerCase()),
@@ -5916,7 +5979,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           const { partner: _q, partnerName: _r, ...drest } = d;
           return {
             ...drest,
-            deckData: nextDeck,
+            // Only re-persist deckData for decks that already cached it;
+            // lean precons stay lean (rebuilt on open from cards + cache).
+            ...(d.deckData ? { deckData: nextDeck } : {}),
             cards: [...(d.cards || []), {
               name: partner.name, qty: 1,
               ...(sf.id ? { id: sf.id } : {}),
@@ -5953,11 +6018,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           if (d.name !== matchName) return d;
           return {
             ...d,
+            // Names are the source of truth for lean decks (rebuilt on open).
             commanderName: newSelCmd.name,
             partnerName: newPartner.name,
-            selCmd: newSelCmd,
-            partner: newPartner,
-            ...(d.deckData ? { deckData: { ...d.deckData, partner: newPartner } } : {}),
+            // selCmd / partner / deckData objects only for non-lean decks.
+            ...(d.deckData ? { selCmd: newSelCmd, partner: newPartner, deckData: { ...d.deckData, partner: newPartner } } : {}),
           };
         });
         if (updated !== groups.decks) {
@@ -6303,59 +6368,31 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         const isCommanderFormat = preconCategory(entry.type) === "commander";
         const fmt = isCommanderFormat ? "commander" : "casual";
 
-        // Build the fully-categorised deckData up front, mirroring what
-        // enrichImportedDeck would compute on first open. We pass the
-        // FRESH cache map (slimSF objects) we just populated so every
-        // card lookup hits — no re-fetch. EDHRec / Spellbook arrays stay
-        // empty; the user can opt-in to enrich a precon later if wanted.
-        let preconDeckData = null;
-        let preconSelCmd = null;
-        if (isCommanderFormat) {
-          const built = buildPreconDeckData(entry, detail, cache);
-          preconSelCmd = built.selCmd;
-          preconDeckData = built.deck;
-          // Override the preview-only theme name with the imported deck's
-          // unique name so the deck view header shows the user-visible name.
-          if (preconDeckData) preconDeckData.theme = deckName;
-        }
-
+        // LEAN STORAGE: we deliberately do NOT persist the full categorised
+        // deckData / selCmd / partner objects. Each card's heavy data (image
+        // URL, mana cost, type line, colours) already lives ONCE in the
+        // Scryfall cache, keyed by id + name. The deck entry only keeps cheap
+        // references — the `cards` rows (name/qty/id/finish) plus the
+        // commander name strings. openLeanDeck rebuilds the full deck view
+        // from the cache on open (re-fetching only cards the cache evicted).
+        // This keeps ~20 precons from blowing the localStorage quota.
         const newDeck = {
           name: deckName,
           type: "deck",
           format: fmt,
-          commanderName: isCommanderFormat ? primary?.name : null,
+          commanderName: isCommanderFormat ? (primary?.name || null) : null,
+          ...(isCommanderFormat && partner?.name ? { partnerName: partner.name } : {}),
           source: "precon",
           precon: {
             set: entry.set,
             slug: entry.slug,
+            setName: detail.setName || entry.setName || null,
             released_at: detail.releasedAt || null,
             mtgwtf_type: detail.type || entry.type,
           },
           tags: ["precon"],
           cards: rows,
-          // Cached deck-view data: opening this deck from the Collection
-          // skips enrichImportedDeck and lands on the deck view immediately.
-          ...(preconDeckData ? { deckData: preconDeckData, enrichedAt: Date.now() } : {}),
         };
-        if (preconSelCmd) {
-          newDeck.selCmd = preconSelCmd;
-        } else if (isCommanderFormat && primary?.sf) {
-          newDeck.selCmd = {
-            name: primary.name,
-            card: { name: primary.name, scryfall: primary.sf },
-            commanderCandidates: [],
-          };
-        }
-        // Partner: buildPreconDeckData already attached deck.partner if there
-        // are 2 commanders. Also stash partnerName + partner on the deck-entry
-        // top level for the Collection-overview badge / future Library lookup.
-        if (isCommanderFormat && partner?.sf) {
-          newDeck.partnerName = partner.name;
-          newDeck.partner = {
-            name: partner.name,
-            card: { name: partner.name, scryfall: partner.sf },
-          };
-        }
 
         const nextGroups = { ...groups, decks: [...(groups.decks || []), newDeck] };
         const nextDeckInc = { ...deckInc, [deckName]: false };
