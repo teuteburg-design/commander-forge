@@ -4921,6 +4921,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   || sfCache[cf]?.d || null;
           const tl = card.type_line || sf?.type_line || "";
           const patched = { ...card };
+          // Drop the legacy "Added from collection." note — it carried no value.
+          if (patched.reason === "Added from collection.") { patched.reason = ""; changed = true; }
           if (!patched.type_line && tl) patched.type_line = tl;
           if (!patched.img && sf) patched.img = sf.image_uris?.small || sf.card_faces?.[0]?.image_uris?.small || null;
           if ((!patched.color_identity || !patched.color_identity.length) && sf?.color_identity) patched.color_identity = sf.color_identity;
@@ -5694,23 +5696,43 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             cmc: slim?.cmc,
             color_identity: slim?.color_identity || [],
             img: slim?.image_uris?.small || slim?.card_faces?.[0]?.image_uris?.small || null,
-            reason: "Added from collection.",
+            reason: "",
             category: catName,
+            id: row.id || null,
           });
         }
         nextDeckData = { ...nextDeckData, categories: newCat };
       }
 
+      // If the added card is a legal commander (legendary creature, planeswalker
+      // that "can be your commander", etc.) make it selectable as the deck's
+      // commander by adding it to the candidate list the sidebar picker reads.
+      const addedIsCommander = !!(slim && isCommander(slim));
+      const withCandidate = (sel) => {
+        if (!sel) return sel;
+        const cands = new Set(sel.commanderCandidates || []);
+        if (sel.name) cands.add(sel.name);   // keep the current commander listed
+        cands.add(row.name);
+        return { ...sel, commanderCandidates: [...cands] };
+      };
+
       const nextBinders = (groups.binders || []).map(b =>
         b.name === binderName ? { ...b, cards: nextBinderCards } : b);
-      const nextDecks = (groups.decks || []).map(d =>
-        d.name === deckName ? { ...d, cards: nextDeckCards, deckData: nextDeckData } : d);
+      const nextDecks = (groups.decks || []).map(d => {
+        if (d.name !== deckName) return d;
+        const nd = { ...d, cards: nextDeckCards, deckData: nextDeckData };
+        if (addedIsCommander && d.selCmd) nd.selCmd = withCandidate(d.selCmd);
+        return nd;
+      });
       persistGroups({ ...groups, binders: nextBinders, decks: nextDecks });
 
       // If we're viewing this deck right now, refresh the in-memory deck
       // object so the categories panel re-renders immediately.
       if (deck && deck.theme === deckName && nextDeckData) {
         setDeck(nextDeckData);
+      }
+      if (deck && deck.theme === deckName && addedIsCommander) {
+        setSelCmd(s => withCandidate(s));
       }
       // Drop the binder's enriched cache so the binder view re-fetches the
       // up-to-date counts the next time it opens.
