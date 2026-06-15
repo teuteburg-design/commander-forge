@@ -10399,7 +10399,6 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               `}
                             </div>
                             <div style=${{ display:"flex", alignItems:"center", gap:4, marginBottom:2 }}>
-                              ${colorId.map(c => html`<${Pip} key=${c} c=${c} />`)}
                               ${typeLine && html`
                                 <span style=${{ fontSize:10, color:"var(--fg-text-muted)", fontStyle:"italic" }}>
                                   ${typeLine.split("//")[0].trim().replace(/—/g, "·").substring(0, 40)}
@@ -10413,11 +10412,13 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               <button onClick=${e => { e.stopPropagation(); setDeckCardMenu(m => m === cardKey ? null : cardKey); }}
                                 title="Card actions"
                                 style=${{
-                                  background:"var(--bg-surface)", border:"1px solid var(--border)", borderRadius:6,
-                                  padding:"2px 7px", fontSize:13, color:"var(--fg-text-soft)",
-                                  cursor:"pointer", fontFamily:"inherit", lineHeight:1,
-                                  boxShadow:"0 1px 3px rgba(0,0,0,0.15)",
-                                }}>⋯</button>
+                                  background:"transparent", border:"none",
+                                  padding:"2px 5px", cursor:"pointer",
+                                  display:"flex", flexDirection:"column", alignItems:"center", gap:3,
+                                  lineHeight:1,
+                                }}>
+                                ${[0,1,2].map(i => html`<span key=${i} style=${{ display:"block", width:4, height:4, borderRadius:"50%", background:"var(--fg-text-muted)" }}></span>`)}
+                              </button>
                               ${deckCardMenu === cardKey && html`
                                 <div onClick=${e => { e.stopPropagation(); setDeckCardMenu(null); }}
                                   style=${{ position:"fixed", inset:0, zIndex:60 }}></div>
