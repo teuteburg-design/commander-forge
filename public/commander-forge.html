@@ -441,8 +441,13 @@
   // a whole batch of 75 cards (the bug that caused "fewer commanders than expected"
   // after a cache clear).
   async function fetchBatch(cards) {
+    // Scryfall's /cards/collection `name` identifier matches the FRONT FACE
+    // of a double-faced / split / adventure card, NOT the combined
+    // "Front // Back" string — sending the full name returns not_found. So
+    // strip to the front face for name lookups. (id lookups are unaffected.)
+    const frontFace = (n) => (n || "").split("//")[0].trim();
     const body = JSON.stringify({
-      identifiers: cards.map(c => c.id ? { id: c.id } : { name: c.name }),
+      identifiers: cards.map(c => c.id ? { id: c.id } : { name: frontFace(c.name) }),
     });
     let lastErr = null;
     for (let attempt = 0; attempt < 4; attempt++) {
