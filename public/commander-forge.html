@@ -3101,6 +3101,8 @@
 
     const [expandedDeckCard, setExpandedCard] = useState(null);
     const [cardTooltip,  setCardTooltip]  = useState(null); // { img, name, x, y }
+    const [flippedCards, setFlippedCards] = useState({}); // { [cardKey]: true } — DFC showing back face
+    const [cmdrFlipped,  setCmdrFlipped]  = useState(false); // commander sidebar showing back face
 
     // ── Archidekt integration ───────────────────────────────────────────
     const [archUser,    setArchUser]    = useState("");
@@ -4846,6 +4848,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         setUnsavedDeck({ deck, selCmd });
       }
       setPreviewingPrecon(null);
+      setCmdrFlipped(false); setFlippedCards({});
       setSelCmd(entry.selCmd);
       setDeck(entry.deck);
       setFromSaved(true);
@@ -5688,6 +5691,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       // Reset menu/rename state so it doesn't bleed across decks.
       setDeckMenuOpen(false);
       setDeckRenameValue(null);
+      setCmdrFlipped(false); setFlippedCards({});
       // Clear any lingering precon-preview state so a saved deck view doesn't
       // render the preview's "+ Import as deck" button.
       setPreviewingPrecon(null);
@@ -6294,6 +6298,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         setUnsavedDeck({ deck, selCmd });
       }
       setPreviewingPrecon({ entry });
+      setCmdrFlipped(false); setFlippedCards({});
       setFromSaved(false); setFromCollection(false);
       setLibSaved(false); setDeckSvd(false);
       setError("");
@@ -9262,7 +9267,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             <!-- ── Sticky commander sidebar ── -->
             ${wideEnough && (() => {
               const sf  = selCmd.card?.scryfall || {};
-              const img = sf.image_uris?.normal || sf.card_faces?.[0]?.image_uris?.normal;
+              const cmdrFaces = (sf.card_faces || []).filter(f => f.image_uris);
+              const cmdrIsDFC = cmdrFaces.length >= 2;
+              const frontImg = sf.image_uris?.normal || cmdrFaces[0]?.image_uris?.normal;
+              const backImg  = cmdrFaces[1]?.image_uris?.normal || null;
+              const img = (cmdrIsDFC && cmdrFlipped) ? backImg : frontImg;
               const ci  = sf.color_identity || [];
               const oracleLines = [sf.oracle_text, ...(sf.card_faces||[]).map(f => f.oracle_text)]
                 .filter(Boolean);
@@ -9327,9 +9336,24 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   })()}
 
                   ${img && html`
-                    <img src=${img} alt=${selCmd.card.name}
-                      style=${{ width:"100%", borderRadius:10,
-                        boxShadow:"0 4px 16px rgba(0,0,0,0.28)", display:"block", marginBottom:10 }} />
+                    <div style=${{ position:"relative", marginBottom:10 }}>
+                      <img src=${img} alt=${selCmd.card.name}
+                        style=${{ width:"100%", borderRadius:10,
+                          boxShadow:"0 4px 16px rgba(0,0,0,0.28)", display:"block" }} />
+                      ${cmdrIsDFC && html`
+                        <button onClick=${() => setCmdrFlipped(f => !f)}
+                          title=${`Flip to ${cmdrFlipped ? cmdrFaces[0]?.name : cmdrFaces[1]?.name}`}
+                          style=${{
+                            position:"absolute", bottom:8, right:8,
+                            display:"inline-flex", alignItems:"center", gap:4,
+                            background:"var(--accent)", color:"var(--on-accent)",
+                            border:"1px solid var(--bg-surface)", borderRadius:16,
+                            padding:"4px 10px", fontSize:11, fontWeight:700,
+                            cursor:"pointer", fontFamily:"inherit",
+                            boxShadow:"0 2px 6px rgba(0,0,0,0.3)",
+                          }}>⟳ Flip</button>
+                      `}
+                    </div>
                   `}
 
                   <div style=${{ fontSize:13, fontWeight:700, color:"var(--fg-text-heading)",
@@ -10019,14 +10043,37 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 const nonBasicLands = isLandCat ? cat.cards.filter(c => !isBasicCard(c)) : [];
 
                 // Helper to render a grid of deck cards (hover-only — no click-to-expand).
+                const dvCache = getSFCache();
+                const dvFront = n => (n || "").toLowerCase().split("//")[0].trim();
                 const renderCardGrid = (cards, idxOffset = 0) => html`
                   <div style=${{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))", gap:6, marginBottom:8 }}>
                     ${cards.map((card, idx) => {
                       const realIdx = idx + idxOffset;
                       const cardKey = cat.name + "|" + card.name + "|" + realIdx;
-                      const isBasic = /basic land/i.test(card.type_line || "") ||
+                      // Self-heal: if the deck card is missing data (older saved
+                      // decks, or a card the build couldn't resolve), pull the
+                      // full Scryfall record from the cache by id then front-face
+                      // name. This also gives us card_faces for DFC flip support.
+                      const sf = dvCache[(card.id || "").toLowerCase()]?.d
+                              || dvCache[(card.name || "").toLowerCase()]?.d
+                              || dvCache[dvFront(card.name)]?.d
+                              || null;
+                      const faces = (sf?.card_faces || []).filter(f => f.image_uris);
+                      const isDFC = faces.length >= 2;
+                      const isFlipped = !!flippedCards[cardKey];
+                      const frontSmall = card.img
+                        || sf?.image_uris?.small
+                        || faces[0]?.image_uris?.small || null;
+                      const backSmall  = faces[1]?.image_uris?.small || null;
+                      const shownSmall = isDFC && isFlipped ? backSmall : frontSmall;
+                      const normalImg  = shownSmall ? shownSmall.replace("/small/", "/normal/") : null;
+                      const isBasic = /basic land/i.test((card.type_line || sf?.type_line) || "") ||
                         ["Plains","Island","Swamp","Mountain","Forest","Wastes"].includes(card.name);
-                      const normalImg = card.img ? card.img.replace("/small/", "/normal/") : null;
+                      // Display fields fall back to the cached Scryfall record.
+                      const typeLine = card.type_line || sf?.type_line || "";
+                      const manaCost = card.mana_cost || sf?.mana_cost || faces[0]?.mana_cost || "";
+                      const colorId  = (card.color_identity && card.color_identity.length)
+                        ? card.color_identity : (sf?.color_identity || []);
                       return html`
                         <div key=${cardKey}
                           onMouseEnter=${e => showTooltip(e, normalImg, card.name)}
@@ -10038,23 +10085,43 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             border: isBasic ? "1px solid #90b0d0" : "1px solid var(--border-soft)",
                             transition:"all .15s",
                           }}>
-                          ${card.img && html`<img src=${card.img} alt=${card.name}
-                            style=${{ width:30, borderRadius:3, flexShrink:0, marginTop:2 }} />`}
+                          ${shownSmall && html`
+                            <div style=${{ position:"relative", flexShrink:0, marginTop:2 }}>
+                              <img src=${shownSmall} alt=${card.name}
+                                style=${{ width:30, borderRadius:3, display:"block" }} />
+                              ${isDFC && html`
+                                <button onClick=${e => { e.stopPropagation(); setFlippedCards(m => ({ ...m, [cardKey]: !m[cardKey] })); }}
+                                  title=${`Flip — ${isFlipped ? faces[0]?.name : faces[1]?.name}`}
+                                  style=${{
+                                    position:"absolute", bottom:-4, right:-6,
+                                    width:16, height:16, borderRadius:"50%", padding:0,
+                                    background:"var(--accent)", color:"var(--on-accent)",
+                                    border:"1px solid var(--bg-surface)", cursor:"pointer",
+                                    fontSize:9, lineHeight:1, fontFamily:"inherit",
+                                    display:"flex", alignItems:"center", justifyContent:"center",
+                                  }}>⟳</button>
+                              `}
+                            </div>
+                          `}
                           <div style=${{ flex:1, minWidth:0 }}>
                             <div style=${{ display:"flex", alignItems:"center", gap:6,
                               marginBottom:1, flexWrap:"wrap" }}>
                               <span style=${{ color:"var(--fg-text-strong)", fontSize:11, fontWeight:600 }}>${card.name}</span>
-                              ${card.mana_cost && html`<${ManaCost} cost=${card.mana_cost} size=${13} />`}
+                              ${manaCost && html`<${ManaCost} cost=${manaCost} size=${13} />`}
+                              ${isDFC && html`
+                                <span style=${{ fontSize:9, padding:"1px 6px", borderRadius:10, fontWeight:600,
+                                  background:"var(--bg-surface-active)", color:"var(--accent-dark)" }}>DFC</span>
+                              `}
                               ${isBasic && html`
                                 <span style=${{ fontSize:9, padding:"1px 6px", borderRadius:10, fontWeight:600,
                                   background:"var(--info-bg)", color:"var(--info)" }}>Basic</span>
                               `}
                             </div>
                             <div style=${{ display:"flex", alignItems:"center", gap:4, marginBottom:2 }}>
-                              ${(card.color_identity || []).map(c => html`<${Pip} key=${c} c=${c} />`)}
-                              ${card.type_line && html`
+                              ${colorId.map(c => html`<${Pip} key=${c} c=${c} />`)}
+                              ${typeLine && html`
                                 <span style=${{ fontSize:10, color:"var(--fg-text-muted)", fontStyle:"italic" }}>
-                                  ${(card.type_line || "").replace(/—/g, "·").substring(0, 40)}
+                                  ${typeLine.replace(/—/g, "·").substring(0, 40)}
                                 </span>
                               `}
                             </div>
