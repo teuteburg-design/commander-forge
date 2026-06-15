@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.06.15-f-debug";
+  const APP_VERSION = "v2026.06.15-g-debug";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -4951,10 +4951,20 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           const patched = { ...card };
           // Drop the legacy "Added from collection." note — it carried no value.
           if (patched.reason === "Added from collection.") { patched.reason = ""; changed = true; }
-          if (!patched.type_line && tl) patched.type_line = tl;
-          if (!patched.img && sf) patched.img = sf.image_uris?.small || sf.card_faces?.[0]?.image_uris?.small || null;
-          if ((!patched.color_identity || !patched.color_identity.length) && sf?.color_identity) patched.color_identity = sf.color_identity;
-          if (!patched.mana_cost && (sf?.mana_cost || sf?.card_faces?.[0]?.mana_cost)) patched.mana_cost = sf.mana_cost || sf.card_faces[0].mana_cost;
+          if (!patched.type_line && tl) { patched.type_line = tl; changed = true; }
+          if (!patched.img && sf) { patched.img = sf.image_uris?.small || sf.card_faces?.[0]?.image_uris?.small || null; changed = true; }
+          if ((!patched.color_identity || !patched.color_identity.length) && sf?.color_identity) { patched.color_identity = sf.color_identity; changed = true; }
+          if (!patched.mana_cost && (sf?.mana_cost || sf?.card_faces?.[0]?.mana_cost)) { patched.mana_cost = sf.mana_cost || sf.card_faces[0].mana_cost; changed = true; }
+          // Store DFC face data + commander flag directly on the card so the
+          // deck view works even when the SF cache is evicted (full localStorage).
+          if (sf?.card_faces?.length >= 2 && (!patched.faces || patched.faces.length < 2)) {
+            patched.faces = sf.card_faces.map(f => ({
+              name: f.name, mana_cost: f.mana_cost, type_line: f.type_line,
+              oracle_text: f.oracle_text, image_uris: f.image_uris,
+            }));
+            changed = true;
+          }
+          if (sf && patched.can_be_commander == null) { patched.can_be_commander = isCommander(sf); changed = true; }
           const target = categorise(tl);
           if (target !== cat.name) changed = true;
           byCat[target].push(patched);
@@ -10325,7 +10335,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               || dvCache[(card.name || "").toLowerCase()]?.d
                               || dvCache[dvFront(card.name)]?.d
                               || null;
-                      const faces = (sf?.card_faces || []).filter(f => f.image_uris);
+                      const faces = (sf?.card_faces || card.faces || []).filter(f => f.image_uris);
                       const isDFC = faces.length >= 2;
                       // Front face only for the row: name, mana, thumbnail.
                       const frontName = isDFC ? dvFront(card.name) : card.name;
@@ -10349,8 +10359,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       const colorId  = (card.color_identity && card.color_identity.length)
                         ? card.color_identity : (sf?.color_identity || []);
                       const editable = (groups.decks || []).some(d => d.name === deck.theme) && !isBasic;
-                      const canBeCmdr = sf && isCommander(sf)
-                        && dvFront(sf.name || card.name) !== dvFront(selCmd?.name || "");
+                      const canBeCmdr = (sf ? isCommander(sf) : card.can_be_commander === true)
+                        && dvFront((sf?.name || card.name)) !== dvFront(selCmd?.name || "");
                       const menuItem = {
                         display:"block", width:"100%", textAlign:"left",
                         padding:"7px 10px", fontSize:12, color:"var(--fg-text-heading)",
@@ -10397,7 +10407,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             ${card.reason && html`<div style=${{ color:"var(--fg-text-soft)", fontSize:10, lineHeight:1.4 }}>${card.reason}</div>`}
                             ${(card.name || "").includes("//") && html`
                               <div style=${{ fontSize:9, color:"var(--danger)", fontFamily:"monospace", marginTop:2 }}>
-                                DBG sf:${sf ? "Y" : "N"} faces:${faces.length} cmd:${sf ? (isCommander(sf) ? "Y" : "N") : "-"} sel:${(selCmd?.name || "∅").split("//")[0].trim()}
+                                DBG sf:${sf ? "Y" : "N"} cf:${card.faces ? card.faces.length : 0} cmd:${sf ? (isCommander(sf) ? "Y" : "N") : (card.can_be_commander === true ? "Y(c)" : "N")} sel:${(selCmd?.name || "∅").split("//")[0].trim()}
                               </div>
                             `}
                           </div>
