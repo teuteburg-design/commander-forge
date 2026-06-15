@@ -3108,6 +3108,7 @@
     // import_review screen can render the change summary. Null = no review pending.
     const [importReview, setImportReview] = useState(null);
     const csvFileRef = useRef(null);
+    const openDeckTokenRef = useRef(0);   // guards async deck-resolve against fast navigation
     const readCsvFile = (file) => {
       if (!file) return;
       // Permissive on type — Manabox exports vary (text/csv, application/vnd.ms-excel,
@@ -4952,6 +4953,28 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       return deckData;
     };
 
+    // After opening a deck, make sure every card + commander has Scryfall data
+    // in the cache (fetching only the misses), then re-heal so cards that were
+    // sitting in "Other" with no art/type — because their data had been
+    // evicted or never resolved — get categorised and the commander picker can
+    // see them. Guarded by a token so navigating to another deck mid-fetch
+    // doesn't clobber the new view.
+    const ensureDeckResolved = async (rawDeck) => {
+      const token = ++openDeckTokenRef.current;
+      try {
+        const names = [rawDeck.commanderName, rawDeck.partnerName].filter(Boolean);
+        const reqs = [
+          ...names.map(n => ({ name: n, qty: 1, id: "" })),
+          ...(rawDeck.cards || []).map(c => ({ name: c.name, id: c.id || "", qty: c.qty || 1 })),
+        ];
+        if (!reqs.length) return;
+        await fetchAllScryfall(reqs, () => {}, () => {});
+        if (openDeckTokenRef.current !== token) return;   // user navigated away
+        const healed = applyHealAndOpen(rawDeck, rawDeck.selCmd);
+        setDeck(prev => (prev && prev.theme === rawDeck.name ? healed : prev));
+      } catch {}
+    };
+
     const loadFromLibrary = entry => {
       // Preserve the user's in-progress built deck if there is one — opening
       // a saved deck shouldn't silently lose unsaved work. We restore it via
@@ -5214,6 +5237,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         setError("");
         restoreArchResult(rawDeck.deckData);
         setPhase("deck");
+        ensureDeckResolved(rawDeck);   // fetch any missing card data, then re-heal
         return;
       }
 
@@ -5931,6 +5955,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setError("");
       restoreArchResult(d.deckData);
       setPhase("deck");
+      ensureDeckResolved(d);   // fetch any missing card data, then re-heal
     };
 
     // Open a LEAN deck (precon) — one that stores only cheap card references
