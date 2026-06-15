@@ -325,6 +325,10 @@
   import htm from "https://esm.sh/htm@3";
   const html = htm.bind(h);
 
+  // Build marker — shown next to the wordmark so we can confirm which build
+  // a browser is actually running (edge/browser caching can serve stale JS).
+  const APP_VERSION = "v2026.06.15-b";
+
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
   const LS_MODEL      = "cmdr_forge_model";        // legacy single-model (migrated on load)
@@ -4910,13 +4914,15 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // type_line (own field, else the SF cache by id / name / front face),
     // patches missing display fields, and drops any maindeck card that's
     // actually the commander/partner. Returns { changed, deckData }.
-    const healDeckData = (deckData, selCmdObj) => {
+    const healDeckData = (deckData, selCmdObj, cacheOverride) => {
       if (!deckData || !Array.isArray(deckData.categories)) return { changed: false, deckData };
-      const sfCache = getSFCache();
+      const sfCache = cacheOverride || getSFCache();
       const front = (n) => (n || "").toLowerCase().split("//")[0].trim();
       const CAT_ORDER = ["Creatures","Instants","Sorceries","Enchantments","Artifacts","Planeswalkers","Battles","Other","Lands"];
       const categorise = (tl) => {
-        const t = (tl || "").toLowerCase();
+        // Categorise by the FRONT face only ("Enchantment // Instant" → an
+        // Enchantment, not an Instant); the front face is the card's main type.
+        const t = (tl || "").toLowerCase().split("//")[0].trim();
         if (/\bland\b/.test(t))     return "Lands";
         if (/creature/.test(t))     return "Creatures";
         if (/instant/.test(t))      return "Instants";
@@ -4987,10 +4993,34 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           ...(rawDeck.cards || []).map(c => ({ name: c.name, id: c.id || "", qty: c.qty || 1 })),
         ];
         if (!reqs.length) return;
-        await fetchAllScryfall(reqs, () => {}, () => {});
+        // fetchAllScryfall returns each request with its resolved .scryfall —
+        // use THAT directly instead of trusting the global cache keys (which
+        // historically only stored one key per card and made name lookups
+        // miss). Build an explicit name-keyed map (full + front face) and
+        // hand it to healDeckData so categorisation can't miss.
+        const enr = await fetchAllScryfall(reqs, () => {}, () => {});
         if (openDeckTokenRef.current !== token) return;   // user navigated away
-        const healed = applyHealAndOpen(rawDeck, rawDeck.selCmd);
-        setDeck(prev => (prev && prev.theme === rawDeck.name ? healed : prev));
+        const front = (n) => (n || "").toLowerCase().split("//")[0].trim();
+        const override = { ...getSFCache() };
+        const ts = Date.now();
+        for (const e of enr) {
+          if (!e?.scryfall) continue;
+          const val = { d: e.scryfall, ts };
+          for (const nm of [e.name, e.scryfall.name]) {
+            if (!nm) continue;
+            override[nm.toLowerCase()] = val;
+            override[front(nm)] = val;
+          }
+          if (e.id) override[String(e.id).toLowerCase()] = val;
+          if (e.scryfall.id) override[String(e.scryfall.id).toLowerCase()] = val;
+        }
+        const { changed, deckData } = healDeckData(rawDeck.deckData, rawDeck.selCmd, override);
+        if (changed) {
+          const updated = (groups.decks || []).map(x =>
+            x.name === rawDeck.name ? { ...x, deckData } : x);
+          persistGroups({ ...groups, decks: updated });
+        }
+        setDeck(prev => (prev && prev.theme === rawDeck.name ? deckData : prev));
       } catch {}
     };
 
@@ -6698,7 +6728,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             <div style=${{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
               <div>
                 <div style=${{ fontSize:9, letterSpacing:5, color:"var(--header-accent)",
-                  textTransform:"uppercase", marginBottom:2 }}>Commander Forge</div>
+                  textTransform:"uppercase", marginBottom:2 }}>Commander Forge <span style=${{ opacity:0.5, letterSpacing:1 }}>${APP_VERSION}</span></div>
                 <h1 style=${{ margin:0, fontSize:22, color:"var(--header-text)", fontWeight:700 }}>MTG Deck Builder</h1>
               </div>
               ${(() => {
