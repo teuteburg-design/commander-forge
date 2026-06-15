@@ -3184,6 +3184,9 @@
 
     const [scrolled,     setScrolled]     = useState(false);
     const [wideEnough,   setWideEnough]   = useState(() => window.innerWidth >= 860);
+    const [veryWide,     setVeryWide]     = useState(() => window.innerWidth >= 1100);
+    const [deckHover,    setDeckHover]    = useState(null); // { img, backImg, name }
+    const deckHoverTimerRef = useRef(null);
     const [headerH,      setHeaderH]      = useState(0);
     const [sfCacheVer,   setSFCacheVer]   = useState(0); // bumped to refresh cache display
 
@@ -3547,6 +3550,7 @@
       const onUpdate = () => {
         setScrolled(window.scrollY > 220);
         setWideEnough(window.innerWidth >= 860);
+        setVeryWide(window.innerWidth >= 1100);
         if (headerRef.current) setHeaderH(headerRef.current.offsetHeight);
       };
       onUpdate();
@@ -10323,7 +10327,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 const dvCache = getSFCache();
                 const dvFront = n => (n || "").toLowerCase().split("//")[0].trim();
                 const renderCardGrid = (cards, idxOffset = 0) => html`
-                  <div style=${{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))", gap:6, marginBottom:8 }}>
+                  <div style=${{ display:"grid", gridTemplateColumns:`repeat(auto-fill,minmax(${veryWide ? 200 : 260}px,1fr))`, gap:6, marginBottom:8 }}>
                     ${cards.map((card, idx) => {
                       const realIdx = idx + idxOffset;
                       const cardKey = cat.name + "|" + card.name + "|" + realIdx;
@@ -10371,8 +10375,19 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       };
                       return html`
                         <div key=${cardKey}
-                          onMouseEnter=${e => showTooltip(e, frontNormal, frontName, backNormal)}
-                          onMouseLeave=${hideTooltip}
+                          onMouseEnter=${e => {
+                            if (veryWide) {
+                              clearTimeout(deckHoverTimerRef.current);
+                              deckHoverTimerRef.current = setTimeout(() =>
+                                setDeckHover(frontNormal ? { img: frontNormal, backImg: backNormal, name: frontName } : null), 180);
+                            } else {
+                              showTooltip(e, frontNormal, frontName, backNormal);
+                            }
+                          }}
+                          onMouseLeave=${() => {
+                            if (veryWide) { clearTimeout(deckHoverTimerRef.current); }
+                            else hideTooltip();
+                          }}
                           class="deck-card"
                           style=${{
                             alignItems:"flex-start",
@@ -10494,6 +10509,40 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               </div>
             </div>
             <!-- end flex right column -->
+
+            <!-- ── Card preview panel (wide screens only) ── -->
+            ${veryWide && html`
+              <div style=${{
+                position:"sticky", top: (headerH + 12) + "px",
+                flexShrink:0, width:210,
+                maxHeight: `calc(100vh - ${headerH + 24}px)`,
+                overflowY:"auto", alignSelf:"flex-start",
+              }}
+                onMouseEnter=${() => clearTimeout(deckHoverTimerRef.current)}
+                onMouseLeave=${() => { clearTimeout(deckHoverTimerRef.current); setDeckHover(null); }}
+              >
+                ${deckHover
+                  ? html`<div style=${{
+                      background:"var(--bg-surface)", border:"1px solid var(--border-neutral)",
+                      borderRadius:10, overflow:"hidden",
+                      boxShadow:"0 4px 16px rgba(0,0,0,0.18)",
+                      animation:"fadeIn .12s ease",
+                    }}>
+                      <img src=${deckHover.img} alt=${deckHover.name}
+                        style=${{ width:"100%", display:"block" }} />
+                      ${deckHover.backImg && html`
+                        <img src=${deckHover.backImg} alt=${deckHover.name + " (back)"}
+                          style=${{ width:"100%", display:"block", borderTop:"2px solid var(--border-neutral)" }} />
+                      `}
+                    </div>`
+                  : html`<div style=${{
+                      border:"1px dashed var(--border-input)", borderRadius:10,
+                      height:290, display:"flex", alignItems:"center", justifyContent:"center",
+                      color:"var(--fg-text-faint)", fontSize:11,
+                    }}>hover a card</div>`
+                }
+              </div>
+            `}
             </div>
             <!-- end deck flex wrapper -->
           `}
