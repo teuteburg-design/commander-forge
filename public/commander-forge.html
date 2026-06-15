@@ -4840,6 +4840,73 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       }
     };
 
+    // Self-heal a cached deckData on open. Older imported/AI decks were
+    // categorised before the front-face / DFC fixes, so a double-faced
+    // commander could leak into the maindeck and cards could sit in "Other"
+    // with no art. This recomputes each card's bucket from its best
+    // type_line (own field, else the SF cache by id / name / front face),
+    // patches missing display fields, and drops any maindeck card that's
+    // actually the commander/partner. Returns { changed, deckData }.
+    const healDeckData = (deckData, selCmdObj) => {
+      if (!deckData || !Array.isArray(deckData.categories)) return { changed: false, deckData };
+      const sfCache = getSFCache();
+      const front = (n) => (n || "").toLowerCase().split("//")[0].trim();
+      const CAT_ORDER = ["Creatures","Instants","Sorceries","Enchantments","Artifacts","Planeswalkers","Battles","Other","Lands"];
+      const categorise = (tl) => {
+        const t = (tl || "").toLowerCase();
+        if (/\bland\b/.test(t))     return "Lands";
+        if (/creature/.test(t))     return "Creatures";
+        if (/instant/.test(t))      return "Instants";
+        if (/sorcery/.test(t))      return "Sorceries";
+        if (/enchantment/.test(t))  return "Enchantments";
+        if (/artifact/.test(t))     return "Artifacts";
+        if (/planeswalker/.test(t)) return "Planeswalkers";
+        if (/battle/.test(t))       return "Battles";
+        return "Other";
+      };
+      const cmdrFront    = front(selCmdObj?.name);
+      const partnerFront = front(deckData.partner?.name);
+      const byCat = Object.fromEntries(CAT_ORDER.map(c => [c, []]));
+      let changed = false;
+      for (const cat of deckData.categories) {
+        for (const card of (cat.cards || [])) {
+          const cf = front(card.name);
+          // Drop a maindeck card that is actually the commander / partner.
+          if (cf && (cf === cmdrFront || (partnerFront && cf === partnerFront))) { changed = true; continue; }
+          const sf = sfCache[(card.id || "").toLowerCase()]?.d
+                  || sfCache[(card.name || "").toLowerCase()]?.d
+                  || sfCache[cf]?.d || null;
+          const tl = card.type_line || sf?.type_line || "";
+          const patched = { ...card };
+          if (!patched.type_line && tl) patched.type_line = tl;
+          if (!patched.img && sf) patched.img = sf.image_uris?.small || sf.card_faces?.[0]?.image_uris?.small || null;
+          if ((!patched.color_identity || !patched.color_identity.length) && sf?.color_identity) patched.color_identity = sf.color_identity;
+          if (!patched.mana_cost && (sf?.mana_cost || sf?.card_faces?.[0]?.mana_cost)) patched.mana_cost = sf.mana_cost || sf.card_faces[0].mana_cost;
+          const target = categorise(tl);
+          if (target !== cat.name) changed = true;
+          byCat[target].push(patched);
+        }
+      }
+      if (!changed) return { changed: false, deckData };
+      const categories = CAT_ORDER.map(name => ({ name, cards: byCat[name] })).filter(c => c.cards.length);
+      return { changed: true, deckData: { ...deckData, categories } };
+    };
+
+    // Open a deck through the self-heal pass, persisting the repaired
+    // deckData back to the saved entry when it changed (so the fix sticks
+    // and syncs). Used by the cached-open paths below.
+    const applyHealAndOpen = (rawDeck, healedSel) => {
+      const { changed, deckData } = healDeckData(rawDeck.deckData, healedSel);
+      if (changed) {
+        const updated = (groups.decks || []).map(x =>
+          x.name === rawDeck.name ? { ...x, deckData } : x);
+        if (updated.some((x, i) => x !== (groups.decks || [])[i])) {
+          persistGroups({ ...groups, decks: updated });
+        }
+      }
+      return deckData;
+    };
+
     const loadFromLibrary = entry => {
       // Preserve the user's in-progress built deck if there is one — opening
       // a saved deck shouldn't silently lose unsaved work. We restore it via
@@ -4850,7 +4917,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setPreviewingPrecon(null);
       setCmdrFlipped(false); setFlippedCards({});
       setSelCmd(entry.selCmd);
-      setDeck(entry.deck);
+      // Library entries live outside groups.decks, so heal in-memory only.
+      setDeck(healDeckData(entry.deck, entry.selCmd).deckData);
       setFromSaved(true);
       setFromCollection(false);
       setLibSaved(true);   // already saved — no need to offer again
@@ -4992,9 +5060,15 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         return "Other";
       };
 
+      const frontFaceName = (n) => (n || "").toLowerCase().split("//")[0].trim();
+      const cmdrFrontName = frontFaceName(cmdrName);
       for (const raw of (rawDeck.cards || [])) {
-        if (raw.name === cmdrName) continue;   // commander stays in the command zone
-        const sfEntry = sfByName.get(raw.name.toLowerCase());
+        // Commander stays in the command zone. Compare on the front face so a
+        // double-faced row ("Front // Back") still matches a front-only
+        // commander name (and vice versa).
+        if (cmdrFrontName && frontFaceName(raw.name) === cmdrFrontName) continue;
+        const sfEntry = sfByName.get(raw.name.toLowerCase())
+                     || sfByName.get(frontFaceName(raw.name));
         const sf      = sfEntry?.scryfall || {};
         const isBasic = BASICS.has(raw.name);
         const tl      = sf.type_line || (isBasic ? `Basic Land — ${raw.name}` : "");
@@ -5087,7 +5161,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         }
         setPreviewingPrecon(null);
         setSelCmd(rawDeck.selCmd);
-        setDeck(rawDeck.deckData);
+        setDeck(applyHealAndOpen(rawDeck, rawDeck.selCmd));
         setFromSaved(returnTo === "library");
         setFromCollection(returnTo === "collection");
         setLibSaved(true);
@@ -5784,7 +5858,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       }
       setPreviewingPrecon(null);
       setSelCmd(d.selCmd);
-      setDeck(d.deckData);
+      setDeck(applyHealAndOpen(d, d.selCmd));
       setFromSaved(false);
       setFromCollection(true);
       setLibSaved(false);    // collection-saved decks aren't necessarily in Library
