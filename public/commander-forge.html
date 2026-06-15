@@ -655,8 +655,15 @@
           return;
         }
         const matched = new Set();
+        const front = s => (s || "").toLowerCase().split("//")[0].trim();
         data.forEach(sf => {
-          const loc = batch.find(c => c.id === sf.id || c.name.toLowerCase() === sf.name.toLowerCase());
+          // Match by id, full name, or front face — a request for the front
+          // face of a double-faced card ("Kuja, Genome Sorcerer") must still
+          // pair with Scryfall's full "Front // Back" response.
+          const loc = batch.find(c =>
+            c.id === sf.id
+            || c.name.toLowerCase() === sf.name.toLowerCase()
+            || front(c.name) === front(sf.name));
           if (loc) {
             matched.add(loc.name.toLowerCase());
             const key = (loc.id || loc.name).toLowerCase();
@@ -5816,8 +5823,19 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         // landed with an empty type_line, and got dumped into "Other".
         const ts = Date.now();
         const nameCache = {};
+        const frontFace = (n) => (n || "").toLowerCase().split("//")[0].trim();
         for (const e of enr) {
-          if (e?.scryfall && e.name) nameCache[e.name.toLowerCase()] = { d: e.scryfall, ts };
+          if (!e?.scryfall) continue;
+          const val = { d: e.scryfall, ts };
+          // Key by the row name, its front face, the Scryfall record's full
+          // name, and its front face — so a "Front // Back" lookup hits no
+          // matter which form the deck row / commander field stored.
+          for (const nm of [e.name, e.scryfall.name]) {
+            if (!nm) continue;
+            nameCache[nm.toLowerCase()] = val;
+            const f = frontFace(nm);
+            if (f && !nameCache[f]) nameCache[f] = val;
+          }
         }
         const cache = { ...getSFCache(), ...nameCache };
         // Reuse buildPreconDeckData by synthesising the { entry, detail } it
@@ -6158,9 +6176,19 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     const preconEntryName = (x) => (typeof x === "string" ? x : (x?.name || ""));
 
     const buildPreconDeckData = (entry, detail, sfCache) => {
-      const lookup = (n) => sfCache[(n || "").toLowerCase()]?.d || null;
+      // Double-faced / adventure cards carry a "Front // Back" name. The deck
+      // row, the commander field, the Scryfall record and the cache key don't
+      // always agree on full-vs-front form, so normalise to the front face
+      // for every comparison and do a front-face fallback on cache lookups.
+      const frontFace = (n) => (n || "").toLowerCase().split("//")[0].trim();
+      const lookup = (n) => {
+        const k = (n || "").toLowerCase();
+        return sfCache[k]?.d || sfCache[frontFace(n)]?.d || null;
+      };
       const primaryName = preconEntryName(detail.commanders[0]);
       const partnerName = preconEntryName(detail.commanders[1]);
+      const primaryFront = frontFace(primaryName);
+      const partnerFront = frontFace(partnerName);
       const primary = primaryName || null;
       const partner = partnerName || null;
       const cmdrSF  = primary ? lookup(primary) : null;
@@ -6198,7 +6226,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           ? { name: rawEntry, qty: 1 }
           : rawEntry;
         // Skip commanders — they live in the command zone, not the maindeck.
-        if (raw.name === primary || raw.name === partner) continue;
+        // Compare on the front face so a "Front // Back" row still matches a
+        // front-face-only commanderName (and vice versa).
+        const rawFront = frontFace(raw.name);
+        if (rawFront === primaryFront || (partnerFront && rawFront === partnerFront)) continue;
         const sf = lookup(raw.name) || {};
         const isBasic = BASICS.has(raw.name);
         const tl = sf.type_line || (isBasic ? `Basic Land — ${raw.name}` : "");
