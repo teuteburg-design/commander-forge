@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.06.15-b";
+  const APP_VERSION = "v2026.06.15-c";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -6091,44 +6091,100 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // enrichment). Used to fix auto-detect mis-picks (e.g. a precon where
     // the wrong legendary was chosen).
     const changeCommanderTo = async (newCmdrName) => {
-      if (!newCmdrName || !selCmd || newCmdrName === selCmd.name) return;
+      if (!newCmdrName) return;
+      const frontF = (n) => (n || "").toLowerCase().split("//")[0].trim();
+      const newFront = frontF(newCmdrName);
+      if (selCmd && frontF(selCmd.name) === newFront) return;   // already this commander
 
-      // Need full Scryfall data for the new commander. Try the Scryfall cache
-      // first; fall back to a fresh lookup so the sidebar renders properly.
-      let cmdrCard = null;
-      try {
-        const results = await fetchAllScryfall(
-          [{ name: newCmdrName, qty: 1, id: "" }],
-          () => {}, () => {},
-        );
-        cmdrCard = results.find(c => c.name.toLowerCase() === newCmdrName.toLowerCase()) || null;
-      } catch {}
+      // Resolve the new commander's Scryfall data (cache first, then network).
+      const cache = getSFCache();
+      let cmdrSF = cache[(newCmdrName || "").toLowerCase()]?.d || cache[newFront]?.d || null;
+      if (!cmdrSF) {
+        try {
+          const results = await fetchAllScryfall([{ name: newCmdrName, qty: 1, id: "" }], () => {}, () => {});
+          cmdrSF = results.find(c => frontF(c.name) === newFront)?.scryfall || results[0]?.scryfall || null;
+        } catch {}
+      }
 
+      const prevCmd = selCmd;   // the commander being replaced
       const newSelCmd = {
-        ...selCmd,
+        ...(selCmd || {}),
         name: newCmdrName,
-        card: cmdrCard || { name: newCmdrName, scryfall: {} },
-        // Keep commanderCandidates from the original so the picker stays usable.
-        commanderCandidates: selCmd.commanderCandidates || [],
+        card: cmdrSF ? { name: newCmdrName, scryfall: cmdrSF } : { name: newCmdrName, scryfall: {} },
+        commanderCandidates: selCmd?.commanderCandidates || [],
       };
-      setSelCmd(newSelCmd);
 
-      // Persist back to groups.decks if this deck is in the collection so the
-      // change survives reloads and cloud-syncs across devices.
-      if (fromCollection || fromSaved) {
-        // Find the matching entry in groups.decks (by saved selCmd name or
-        // by the current deck theme/name — generated decks store both).
-        const updatedDecks = groups.decks.map(d => {
-          if (d.deckData === deck || (d.selCmd && d.selCmd.name === selCmd.name && d.name)) {
-            return { ...d, selCmd: newSelCmd, commanderName: newCmdrName };
-          }
-          return d;
-        });
-        const nextGroups = { ...groups, decks: updatedDecks };
-        setGroups(nextGroups);
-        lsSetItemSafe(LS_BINDERS, JSON.stringify({
-          groups: nextGroups, deckInc, binInc,
+      // Simple front-face categoriser for moving the OLD commander back into
+      // the maindeck (so swapping doesn't lose it).
+      const categorise = (tl) => {
+        const t = (tl || "").toLowerCase().split("//")[0].trim();
+        if (/\bland\b/.test(t)) return "Lands";
+        if (/creature/.test(t)) return "Creatures";
+        if (/instant/.test(t)) return "Instants";
+        if (/sorcery/.test(t)) return "Sorceries";
+        if (/enchantment/.test(t)) return "Enchantments";
+        if (/artifact/.test(t)) return "Artifacts";
+        if (/planeswalker/.test(t)) return "Planeswalkers";
+        if (/battle/.test(t)) return "Battles";
+        return "Other";
+      };
+
+      // Rework a deckData object: drop the new commander from the maindeck,
+      // and add the previous commander back as a maindeck card.
+      const reworkDD = (dd) => {
+        if (!dd) return dd;
+        let cats = (dd.categories || []).map(c => ({
+          ...c, cards: (c.cards || []).filter(card => frontF(card.name) !== newFront),
         }));
+        const psf = prevCmd?.card?.scryfall;
+        if (prevCmd?.name && frontF(prevCmd.name) !== newFront && psf && psf.type_line) {
+          const catName = categorise(psf.type_line);
+          let cat = cats.find(c => c.name === catName);
+          if (!cat) { cat = { name: catName, cards: [] }; cats.push(cat); }
+          const exists = cat.cards.some(c => frontF(c.name) === frontF(prevCmd.name));
+          if (!exists) {
+            cat.cards = [...cat.cards, {
+              name: prevCmd.name, reason: "",
+              img: psf.image_uris?.small || psf.card_faces?.[0]?.image_uris?.small || null,
+              mana_cost: psf.mana_cost || psf.card_faces?.[0]?.mana_cost || "",
+              cmc: typeof psf.cmc === "number" ? psf.cmc : 0,
+              type_line: psf.type_line, color_identity: psf.color_identity || [],
+              id: psf.id || null,
+            }];
+          }
+        }
+        return { ...dd, categories: cats.filter(c => c.cards.length) };
+      };
+      // Rework the cheap raw rows similarly (drop new cmd, add old back).
+      const reworkRows = (rows) => {
+        if (!Array.isArray(rows)) return rows;
+        let next = rows.filter(r => frontF(r.name) !== newFront);
+        if (prevCmd?.name && frontF(prevCmd.name) !== newFront && prevCmd?.card?.scryfall?.id) {
+          const psf = prevCmd.card.scryfall;
+          if (!next.some(r => frontF(r.name) === frontF(prevCmd.name))) {
+            next = [...next, { name: prevCmd.name, qty: 1, id: psf.id || "", condition: "NM", finish: "normal", lang: "en" }];
+          }
+        }
+        return next;
+      };
+
+      setSelCmd(newSelCmd);
+      setDeck(d => reworkDD(d));
+
+      // Persist to groups.decks, matched by the deck's name (deck.theme).
+      const matchName = deck?.theme;
+      if (matchName) {
+        const updatedDecks = (groups.decks || []).map(d => {
+          if (d.name !== matchName) return d;
+          return {
+            ...d,
+            selCmd: newSelCmd,
+            commanderName: newCmdrName,
+            ...(d.deckData ? { deckData: reworkDD(d.deckData) } : {}),
+            cards: reworkRows(d.cards),
+          };
+        });
+        persistGroups({ ...groups, decks: updatedDecks });
       }
     };
 
@@ -10358,22 +10414,41 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             </div>
                             <div style=${{ color:"var(--fg-text-soft)", fontSize:10, lineHeight:1.4 }}>${card.reason}</div>
                           </div>
-                          ${((groups.decks || []).some(d => d.name === deck.theme)) && !isBasic && html`
-                            <button class="deck-card-remove"
-                              onClick=${e => {
-                                e.stopPropagation();
-                                setCardRemoveTarget("__uncategorised__");
-                                setCardRemove({ name: card.name, deckName: deck.theme });
-                              }}
-                              title="Move this card back into the collection"
-                              style=${{
-                                position:"absolute", top:4, right:4,
-                                background:"var(--bg-surface)", border:"1px solid var(--border)", borderRadius:6,
-                                padding:"2px 7px", fontSize:11, color:"var(--accent-dark)",
-                                cursor:"pointer", fontFamily:"inherit", lineHeight:1,
-                                boxShadow:"0 1px 3px rgba(0,0,0,0.15)",
-                              }}>↩</button>
-                          `}
+                          ${((groups.decks || []).some(d => d.name === deck.theme)) && !isBasic && (() => {
+                            // Offer "Set as commander" on any legal commander in
+                            // the maindeck that isn't already the commander.
+                            const canBeCmdr = sf && isCommander(sf)
+                              && (sf.name || card.name).toLowerCase().split("//")[0].trim()
+                                 !== (selCmd?.name || "").toLowerCase().split("//")[0].trim();
+                            return html`
+                              ${canBeCmdr && html`
+                                <button
+                                  onClick=${e => { e.stopPropagation(); changeCommanderTo(sf.name || card.name); }}
+                                  title="Set as this deck's commander"
+                                  style=${{
+                                    position:"absolute", top:4, right:32,
+                                    background:"var(--accent)", border:"1px solid var(--bg-surface)", borderRadius:6,
+                                    padding:"2px 7px", fontSize:11, color:"var(--on-accent)",
+                                    cursor:"pointer", fontFamily:"inherit", lineHeight:1,
+                                    boxShadow:"0 1px 3px rgba(0,0,0,0.15)",
+                                  }}>👑</button>
+                              `}
+                              <button class="deck-card-remove"
+                                onClick=${e => {
+                                  e.stopPropagation();
+                                  setCardRemoveTarget("__uncategorised__");
+                                  setCardRemove({ name: card.name, deckName: deck.theme });
+                                }}
+                                title="Move this card back into the collection"
+                                style=${{
+                                  position:"absolute", top:4, right:4,
+                                  background:"var(--bg-surface)", border:"1px solid var(--border)", borderRadius:6,
+                                  padding:"2px 7px", fontSize:11, color:"var(--accent-dark)",
+                                  cursor:"pointer", fontFamily:"inherit", lineHeight:1,
+                                  boxShadow:"0 1px 3px rgba(0,0,0,0.15)",
+                                }}>↩</button>
+                            `;
+                          })()}
                         </div>
                       `;
                     })}
