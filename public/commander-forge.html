@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.06.15-g-debug";
+  const APP_VERSION = "v2026.06.15-g";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -10405,11 +10405,6 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               `}
                             </div>
                             ${card.reason && html`<div style=${{ color:"var(--fg-text-soft)", fontSize:10, lineHeight:1.4 }}>${card.reason}</div>`}
-                            ${(card.name || "").includes("//") && html`
-                              <div style=${{ fontSize:9, color:"var(--danger)", fontFamily:"monospace", marginTop:2 }}>
-                                DBG sf:${sf ? "Y" : "N"} cf:${card.faces ? card.faces.length : 0} cmd:${sf ? (isCommander(sf) ? "Y" : "N") : (card.can_be_commander === true ? "Y(c)" : "N")} sel:${(selCmd?.name || "∅").split("//")[0].trim()}
-                              </div>
-                            `}
                           </div>
                           ${editable && html`
                             <div style=${{ position:"absolute", top:4, right:4 }}>
