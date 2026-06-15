@@ -6817,7 +6817,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           background:"var(--header-bg)", boxShadow:"0 2px 10px rgba(0,0,0,0.18)",
           position:"sticky", top:0, zIndex:200,
         }}>
-          <div style=${{ maxWidth:1280, margin:"0 auto", padding:"14px 20px 0" }}>
+          <div style=${{ maxWidth:1600, margin:"0 auto", padding:"14px 20px 0" }}>
             <div style=${{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
               <div>
                 <div style=${{ fontSize:9, letterSpacing:5, color:"var(--header-accent)",
@@ -7004,7 +7004,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           </div>
         </div>
 
-        <div style=${{ maxWidth:1280, margin:"0 auto", padding:"28px 20px" }}>
+        <div style=${{ maxWidth:1600, margin:"0 auto", padding:"28px 20px" }}>
 
           <!-- ── SETUP ─────────────────────────────────────────────────── -->
           ${phase === "setup" && html`
@@ -10535,11 +10535,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           style=${{ width:"100%", display:"block", borderTop:"2px solid var(--border-neutral)" }} />
                       `}
                     </div>`
-                  : html`<div style=${{
-                      border:"1px dashed var(--border-input)", borderRadius:10,
-                      height:290, display:"flex", alignItems:"center", justifyContent:"center",
-                      color:"var(--fg-text-faint)", fontSize:11,
-                    }}>hover a card</div>`
+                  : null
                 }
               </div>
             `}
