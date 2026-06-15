@@ -547,6 +547,54 @@
     }
   }
 
+  // Evict the oldest `fraction` of the Scryfall cache to free origin space.
+  // The SF cache is 100 % regenerable from Scryfall, so it's the first thing
+  // to sacrifice when another (non-regenerable) write hits the quota.
+  // Returns the number of entries dropped.
+  function evictSFCache(fraction = 0.5) {
+    try {
+      const cache = getSFCache();
+      const entries = Object.entries(cache).sort((a, b) => (a[1]?.ts || 0) - (b[1]?.ts || 0));
+      if (entries.length === 0) {
+        localStorage.removeItem(LS_SF_CACHE);
+        return 0;
+      }
+      const dropCount = Math.max(1, Math.ceil(entries.length * fraction));
+      const kept = Object.fromEntries(entries.slice(dropCount));
+      localStorage.setItem(LS_SF_CACHE, JSON.stringify(kept));
+      return dropCount;
+    } catch {
+      try { localStorage.removeItem(LS_SF_CACHE); } catch {}
+      return -1;
+    }
+  }
+
+  // Quota-safe localStorage write. On QuotaExceededError, progressively
+  // evicts the regenerable Scryfall cache and retries up to a few times.
+  // Returns true on success, false if it ultimately couldn't fit.
+  function lsSetItemSafe(key, value) {
+    try {
+      localStorage.setItem(key, value);
+      return true;
+    } catch (e) {
+      // Try freeing the SF cache in escalating chunks, then nuke it entirely.
+      for (const frac of [0.5, 1]) {
+        evictSFCache(frac);
+        try {
+          localStorage.setItem(key, value);
+          return true;
+        } catch {}
+      }
+      try {
+        localStorage.removeItem(LS_SF_CACHE);
+        localStorage.setItem(key, value);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+
   // Caller can pass `onLog` to receive human-readable status lines (cache
   // hit/miss counts, batch progress) — wired to the build log in the UI.
   async function fetchAllScryfall(cards, onProgress, onLog) {
@@ -2924,7 +2972,7 @@
       const nextGroups = { decks: groups.decks, binders: nextBinders };
       setGroups(nextGroups);
       try {
-        localStorage.setItem(LS_BINDERS, JSON.stringify({
+        lsSetItemSafe(LS_BINDERS, JSON.stringify({
           groups: nextGroups, deckInc, binInc,
         }));
       } catch {}
@@ -3299,7 +3347,7 @@
         setCmdrs(cleaned);
         if (cleaned.length !== (c.commanders || []).length) {
           // Persist the cleaned list so we don't filter again on next load.
-          localStorage.setItem(LS_COMMANDERS, JSON.stringify({ fp: c.fp, commanders: cleaned }));
+          lsSetItemSafe(LS_COMMANDERS, JSON.stringify({ fp: c.fp, commanders: cleaned }));
         }
       }
       const savedLib = localStorage.getItem(LS_LIBRARY);
@@ -3665,7 +3713,7 @@
         const nextGroups  = { decks: nextDecks, binders: groups.binders };
         setGroups(nextGroups);
         setDeckInc(nextDeckInc);
-        localStorage.setItem(LS_BINDERS, JSON.stringify({
+        lsSetItemSafe(LS_BINDERS, JSON.stringify({
           groups: nextGroups, deckInc: nextDeckInc, binInc,
         }));
         setManaboxUrl("");
@@ -3685,8 +3733,8 @@
 
     const confirmSelection = () => {
       const cards = computeUsable(groups, deckInc, binInc);
-      localStorage.setItem(LS_CARDS, JSON.stringify(cards));
-      localStorage.setItem(LS_BINDERS, JSON.stringify({ groups, deckInc, binInc }));
+      lsSetItemSafe(LS_CARDS, JSON.stringify(cards));
+      lsSetItemSafe(LS_BINDERS, JSON.stringify({ groups, deckInc, binInc }));
       setUsable(cards);
       // Invalidate commander cache if collection changed
       const rawCmdr = localStorage.getItem(LS_COMMANDERS);
@@ -3716,7 +3764,7 @@
         if (unm > 0) addLog(`ℹ️ Scryfall returned no match for ${unm} card(s) (renamed/typo'd?).`);
         const found = all.filter(c => isCommander(c.scryfall || {}));
         addLog(`👑 ${found.length} possible commanders found.`);
-        localStorage.setItem(LS_COMMANDERS, JSON.stringify({ fp: fingerprint(cards), commanders: found }));
+        lsSetItemSafe(LS_COMMANDERS, JSON.stringify({ fp: fingerprint(cards), commanders: found }));
         setCmdrs(found); setProg(100);
         setPhase("ready"); setTab("commanders");
       } catch(e) { setError(e.message); setPhase("error"); }
@@ -4609,7 +4657,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           if (updated.some((u, i) => u !== groups.decks[i])) {
             const nextGroups = { ...groups, decks: updated };
             setGroups(nextGroups);
-            localStorage.setItem(LS_BINDERS, JSON.stringify({
+            lsSetItemSafe(LS_BINDERS, JSON.stringify({
               groups: nextGroups, deckInc, binInc,
             }));
           }
@@ -4623,7 +4671,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         });
         if (updatedLib.some((u, i) => u !== library[i])) {
           setLibrary(updatedLib);
-          localStorage.setItem(LS_LIBRARY, JSON.stringify(updatedLib));
+          lsSetItemSafe(LS_LIBRARY, JSON.stringify(updatedLib));
         }
 
         setArchResult({ kind: "ok", url, msg, insights });
@@ -4652,7 +4700,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       );
       used.add(selCmd.card.name.toLowerCase());
       const remaining = usable.filter(c => !used.has(c.name.toLowerCase()));
-      localStorage.setItem(LS_CARDS, JSON.stringify(remaining));
+      lsSetItemSafe(LS_CARDS, JSON.stringify(remaining));
       setUsable(remaining); setDeckSvd(true);
     };
 
@@ -4741,10 +4789,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setGroups(nextGroups);
       setDeckInc(nextDeckInc);
       setUsable(nextUsable);
-      localStorage.setItem(LS_BINDERS, JSON.stringify({
+      lsSetItemSafe(LS_BINDERS, JSON.stringify({
         groups: nextGroups, deckInc: nextDeckInc, binInc,
       }));
-      localStorage.setItem(LS_CARDS, JSON.stringify(nextUsable));
+      lsSetItemSafe(LS_CARDS, JSON.stringify(nextUsable));
       setDeckSvd(true);
     };
 
@@ -4757,14 +4805,14 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       };
       const updated = [entry, ...library];   // newest first
       setLibrary(updated);
-      localStorage.setItem(LS_LIBRARY, JSON.stringify(updated));
+      lsSetItemSafe(LS_LIBRARY, JSON.stringify(updated));
       setLibSaved(true);
     };
 
     const deleteFromLibrary = id => {
       const updated = library.filter(e => e.id !== id);
       setLibrary(updated);
-      localStorage.setItem(LS_LIBRARY, JSON.stringify(updated));
+      lsSetItemSafe(LS_LIBRARY, JSON.stringify(updated));
     };
 
     // Re-hydrate the Insights panel from a deck's persisted archidekt info,
@@ -5064,7 +5112,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         );
         const nextGroups = { ...groups, decks: updatedDecks };
         setGroups(nextGroups);
-        localStorage.setItem(LS_BINDERS, JSON.stringify({ groups: nextGroups, deckInc, binInc }));
+        lsSetItemSafe(LS_BINDERS, JSON.stringify({ groups: nextGroups, deckInc, binInc }));
 
         setProg(100);
         addLog(`✅ Ready — opening "${rawDeck.name}".`);
@@ -5101,7 +5149,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     const persistGroups = (nextGroups, nextDeckInc = deckInc, nextBinInc = binInc) => {
       setGroups(nextGroups);
       try {
-        localStorage.setItem(LS_BINDERS, JSON.stringify({
+        lsSetItemSafe(LS_BINDERS, JSON.stringify({
           groups: nextGroups, deckInc: nextDeckInc, binInc: nextBinInc,
         }));
       } catch {}
@@ -5770,7 +5818,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         });
         const nextGroups = { ...groups, decks: updatedDecks };
         setGroups(nextGroups);
-        localStorage.setItem(LS_BINDERS, JSON.stringify({
+        lsSetItemSafe(LS_BINDERS, JSON.stringify({
           groups: nextGroups, deckInc, binInc,
         }));
       }
