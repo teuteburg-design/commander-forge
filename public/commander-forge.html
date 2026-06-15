@@ -9543,11 +9543,28 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     </a>
                   `}
 
-                  ${selCmd.commanderCandidates && selCmd.commanderCandidates.length > 1 && html`
-                    <!-- Commander picker — auto-detect can pick the wrong one
-                         (e.g. a precon where another legendary is more popular
-                         on EDHRec). Lets the user swap to any legal commander
-                         found in the deck. -->
+                  ${(() => {
+                    // Derive the candidate list LIVE from the deck's current
+                    // cards rather than only the stored commanderCandidates —
+                    // so any legendary creature / planeswalker you add from the
+                    // collection shows up here immediately, no re-add needed.
+                    const cache = getSFCache();
+                    const cands = new Set();
+                    if (selCmd.name) cands.add(selCmd.name);
+                    (selCmd.commanderCandidates || []).forEach(n => cands.add(n));
+                    const scan = (cardName) => {
+                      const k = (cardName || "").toLowerCase();
+                      const csf = cache[k]?.d || cache[k.split("//")[0].trim()]?.d;
+                      if (csf && isCommander(csf)) cands.add(csf.name || cardName);
+                    };
+                    (deck.categories || []).forEach(cat => (cat.cards || []).forEach(c => scan(c.name)));
+                    (deck.partner?.name) && cands.add(deck.partner.name);
+                    const candidateList = [...cands];
+                    if (candidateList.length <= 1) return "";
+                    return html`
+                    <!-- Commander picker — swap to any legal commander found in
+                         the deck (auto-detect can mis-pick, and cards added from
+                         the collection appear here live). -->
                     <div style=${{
                       marginTop:10, padding:"8px 10px", borderRadius:8,
                       background:"var(--bg-surface-soft)", border:"1px solid var(--border)",
@@ -9563,17 +9580,18 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           borderRadius:6, padding:"4px 6px", fontFamily:"inherit",
                           fontSize:11, color:"var(--fg-text-heading)", cursor:"pointer",
                         }}>
-                        ${selCmd.commanderCandidates.map(name => html`
+                        ${candidateList.map(name => html`
                           <option key=${name} value=${name}>
                             ${name === selCmd.name ? "✓ " : ""}${name}
                           </option>
                         `)}
                       </select>
                       <div style=${{ fontSize:10, color:"var(--fg-text-muted)", marginTop:4, lineHeight:1.5, fontStyle:"italic" }}>
-                        ${selCmd.commanderCandidates.length} legal commander${selCmd.commanderCandidates.length === 1 ? "" : "s"} found in this deck.
+                        ${candidateList.length} legal commander${candidateList.length === 1 ? "" : "s"} found in this deck.
                       </div>
                     </div>
-                  `}
+                    `;
+                  })()}
                 </div>
               `;
             })()}
