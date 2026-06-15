@@ -671,8 +671,22 @@
             || front(c.name) === front(sf.name));
           if (loc) {
             matched.add(loc.name.toLowerCase());
-            const key = (loc.id || loc.name).toLowerCase();
-            cache[key] = { d: slimSF(sf), ts: now };
+            const slim = slimSF(sf);
+            const entry = { d: slim, ts: now };
+            // Write EVERY key a later lookup might use: the request id, the
+            // request name, the Scryfall record name, and their front faces.
+            // Previously only (id || name) was written, so a card fetched by
+            // id couldn't be found by a name lookup (and vice versa) — which
+            // left double-faced cards stuck uncategorised in "Other".
+            const keys = new Set();
+            if (loc.id) keys.add(loc.id.toLowerCase());
+            if (sf.id)  keys.add(sf.id.toLowerCase());
+            for (const nm of [loc.name, sf.name]) {
+              if (!nm) continue;
+              keys.add(nm.toLowerCase());
+              keys.add(front(nm));
+            }
+            keys.forEach(k => { if (k) cache[k] = entry; });
             out.push({ ...loc, scryfall: sf });
             cacheUpdated = true;
           }
