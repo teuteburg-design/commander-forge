@@ -5807,8 +5807,19 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         ];
         // Cache-first resolve; only evicted cards hit the network. Keys by id
         // so the exact precon printing comes back.
-        await fetchAllScryfall(reqs, p => setProg(Math.min(85, p|0)), m => addLog("   " + m));
-        const cache = getSFCache();
+        const enr = await fetchAllScryfall(reqs, p => setProg(Math.min(85, p|0)), m => addLog("   " + m));
+        // fetchAllScryfall caches each card under a SINGLE key — the Scryfall
+        // id when the row carries one — but buildPreconDeckData looks cards up
+        // by NAME. So build a name-keyed map from the enriched results (each
+        // carries its resolved .scryfall) and merge it over the real cache.
+        // Without this, every row that had an id missed the name lookup,
+        // landed with an empty type_line, and got dumped into "Other".
+        const ts = Date.now();
+        const nameCache = {};
+        for (const e of enr) {
+          if (e?.scryfall && e.name) nameCache[e.name.toLowerCase()] = { d: e.scryfall, ts };
+        }
+        const cache = { ...getSFCache(), ...nameCache };
         // Reuse buildPreconDeckData by synthesising the { entry, detail } it
         // expects from the saved deck's own references.
         const entry = {
