@@ -1904,16 +1904,53 @@
     entry.source === "csv:manabox" ||
     entry.source === "csv:moxfield";
 
+  // Identify a card by its PRINTING, not just its name, so different
+  // printings of the same card (e.g. Sol Ring from SOC vs TMC) are tracked
+  // as distinct entries instead of collapsing into one name-keyed bucket.
+  function cardPrintingKey(c) {
+    return [
+      (c.name || "").toLowerCase(),
+      (c.id || ""),                 // Scryfall id — the main printing discriminator
+      (c.finish || "normal"),
+      (c.condition || "NM"),
+      c.misprint ? "1" : "0",
+      (c.lang || "en"),
+    ].join("|");
+  }
+  // Human label that disambiguates printings of the same card. Falls back to
+  // the bare name when there's nothing extra to show.
+  function cardPrintingLabel(c) {
+    const bits = [];
+    if (c.set) bits.push(String(c.set).toUpperCase());
+    if (c.finish && c.finish !== "normal") bits.push(c.finish);
+    if (c.condition && c.condition !== "NM") bits.push(c.condition);
+    if (c.lang && c.lang !== "en") bits.push(c.lang);
+    if (c.misprint) bits.push("misprint");
+    return bits.length ? `${c.name} (${bits.join(", ")})` : c.name;
+  }
+
   function diffCardLists(oldCards, newCards) {
-    const oldMap = new Map((oldCards || []).map(c => [c.name, c.qty || 1]));
-    const newMap = new Map((newCards || []).map(c => [c.name, c.qty || 1]));
+    // Aggregate quantities per printing key (handles duplicate rows safely).
+    const agg = (cards) => {
+      const m = new Map();
+      (cards || []).forEach(c => {
+        const k = cardPrintingKey(c);
+        if (m.has(k)) m.get(k).qty += (c.qty || 1);
+        else m.set(k, { card: c, qty: c.qty || 1 });
+      });
+      return m;
+    };
+    const oldMap = agg(oldCards);
+    const newMap = agg(newCards);
     const added = [], removed = [], qtyChanged = [];
-    for (const [name, qty] of newMap) {
-      if (!oldMap.has(name)) added.push({ name, qty });
-      else if (oldMap.get(name) !== qty) qtyChanged.push({ name, oldQty: oldMap.get(name), newQty: qty });
+    for (const [k, { card, qty }] of newMap) {
+      if (!oldMap.has(k)) added.push({ name: cardPrintingLabel(card), qty });
+      else if (oldMap.get(k).qty !== qty) {
+        qtyChanged.push({ name: cardPrintingLabel(card), oldQty: oldMap.get(k).qty, newQty: qty });
+      }
     }
-    for (const [name, qty] of oldMap) {
-      if (!newMap.has(name)) removed.push({ name, qty });
+    for (const [k, { card, qty }] of oldMap) {
+      if (!newMap.has(k)) removed.push({ name: cardPrintingLabel(card), qty });
     }
     return {
       added, removed, qtyChanged,
@@ -2065,6 +2102,8 @@
     const iBT   = hdr.findIndex(h => h === "binder type" || h === "binder_type");
     const iBN   = hdr.findIndex(h => h === "binder name" || h === "binder_name");
     const iSF   = hdr.findIndex(h => h.includes("scryfall"));
+    const iSet  = hdr.findIndex(h => h === "set code" || h === "set_code" || h === "set");
+    const iCN   = hdr.findIndex(h => h.includes("collector"));        // collector number
     const iCmd  = hdr.findIndex(h => h.includes("commander"));        // is_commander flag
     const iFoil = hdr.findIndex(h => h === "foil" || h === "finish");
     const iCond = hdr.findIndex(h => h === "condition");
@@ -2083,6 +2122,8 @@
       const bt   = btRaw === "binder" ? "binder" : "deck";
       const bn   = iBN >= 0 ? ((cols[iBN] || "").trim() || "Default Binder") : "Default Binder";
       const sfid = iSF >= 0 ? (cols[iSF] || "").trim() : "";
+      const setCode = iSet >= 0 ? (cols[iSet] || "").trim().toLowerCase() : "";
+      const cn      = iCN  >= 0 ? (cols[iCN]  || "").trim() : "";
       const isCmdr = iCmd >= 0 && /^(true|1|yes)$/i.test((cols[iCmd] || "").trim());
 
       // Finish / Condition / Misprint — new in the import pipeline. Fall back
@@ -2109,6 +2150,8 @@
         g.cards.get(rowKey).qty += qty;
       } else {
         const row = { name, qty, id: sfid, condition, finish, lang };
+        if (setCode) row.set = setCode;
+        if (cn) row.cn = cn;
         if (misprint) row.misprint = true;
         g.cards.set(rowKey, row);
       }
