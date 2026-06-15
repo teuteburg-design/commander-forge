@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.06.15-c";
+  const APP_VERSION = "v2026.06.15-d";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -3170,6 +3170,7 @@
     const [cardTooltip,  setCardTooltip]  = useState(null); // { img, name, x, y }
     const [flippedCards, setFlippedCards] = useState({}); // { [cardKey]: true } — DFC showing back face
     const [cmdrFlipped,  setCmdrFlipped]  = useState(false); // commander sidebar showing back face
+    const [deckCardMenu, setDeckCardMenu] = useState(null);  // cardKey whose ⋯ menu is open
 
     // ── Archidekt integration ───────────────────────────────────────────
     const [archUser,    setArchUser]    = useState("");
@@ -3230,21 +3231,22 @@
     const tooltipTimer = useRef(null);
     const headerRef    = useRef(null);
 
-    const showTooltip = (e, normalImg, name) => {
+    // backImg (optional) = second face of a double-faced card; when present
+    // the preview stacks both faces so a hover shows front AND back.
+    const showTooltip = (e, normalImg, name, backImg = null) => {
       if (!normalImg) return;
       clearTimeout(tooltipTimer.current);
       const rect = e.currentTarget.getBoundingClientRect();
       tooltipTimer.current = setTimeout(() => {
         const popW = 290;
-        // When the sticky left panel is visible, cards are already padded right of it —
-        // tooltips always have room to the right; fall back left only at the true right edge.
         const x = (rect.right + 14 + popW <= window.innerWidth - 20)
           ? rect.right + 14
           : Math.max(8, rect.left - popW - 14);
-        // Keep the tooltip clear of the sticky header — default to 12 px below it.
         const minY = (headerH || 60) + 12;
-        const y = Math.max(minY, Math.min(rect.top, window.innerHeight - 430));
-        setCardTooltip({ img: normalImg, name, x, y });
+        // Two stacked faces need ~2× the height — keep clear of the header.
+        const maxTop = window.innerHeight - (backImg ? 800 : 430);
+        const y = Math.max(minY, Math.min(rect.top, maxTop));
+        setCardTooltip({ img: normalImg, backImg, name, x, y });
       }, 420);
     };
     const hideTooltip = () => { clearTimeout(tooltipTimer.current); setCardTooltip(null); };
@@ -5903,7 +5905,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       // Reset menu/rename state so it doesn't bleed across decks.
       setDeckMenuOpen(false);
       setDeckRenameValue(null);
-      setCmdrFlipped(false); setFlippedCards({});
+      setCmdrFlipped(false); setFlippedCards({}); setDeckCardMenu(null);
       // Clear any lingering precon-preview state so a saved deck view doesn't
       // render the preview's "+ Import as deck" button.
       setPreviewingPrecon(null);
@@ -6784,7 +6786,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             <div style=${{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
               <div>
                 <div style=${{ fontSize:9, letterSpacing:5, color:"var(--header-accent)",
-                  textTransform:"uppercase", marginBottom:2 }}>Commander Forge <span style=${{ opacity:0.5, letterSpacing:1 }}>${APP_VERSION}</span></div>
+                  textTransform:"uppercase", marginBottom:2 }}>Commander Forge</div>
                 <h1 style=${{ margin:0, fontSize:22, color:"var(--header-text)", fontWeight:700 }}>MTG Deck Builder</h1>
               </div>
               ${(() => {
@@ -6972,6 +6974,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           <!-- ── SETUP ─────────────────────────────────────────────────── -->
           ${phase === "setup" && html`
             <div style=${{ maxWidth:560, margin:"0 auto" }}>
+              <div style=${{ textAlign:"right", fontSize:11, color:"var(--fg-text-muted)", marginBottom:8 }}>
+                Build <strong style=${{ color:"var(--fg-text-soft)" }}>${APP_VERSION}</strong>
+              </div>
               <!-- Theme picker -->
               <div class="card" style=${{ marginBottom:16 }}>
                 <div style=${label}>Appearance</div>
@@ -9673,55 +9678,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     </a>
                   `}
 
-                  ${(() => {
-                    // Derive the candidate list LIVE from the deck's current
-                    // cards rather than only the stored commanderCandidates —
-                    // so any legendary creature / planeswalker you add from the
-                    // collection shows up here immediately, no re-add needed.
-                    const cache = getSFCache();
-                    const cands = new Set();
-                    if (selCmd.name) cands.add(selCmd.name);
-                    (selCmd.commanderCandidates || []).forEach(n => cands.add(n));
-                    const scan = (cardName) => {
-                      const k = (cardName || "").toLowerCase();
-                      const csf = cache[k]?.d || cache[k.split("//")[0].trim()]?.d;
-                      if (csf && isCommander(csf)) cands.add(csf.name || cardName);
-                    };
-                    (deck.categories || []).forEach(cat => (cat.cards || []).forEach(c => scan(c.name)));
-                    (deck.partner?.name) && cands.add(deck.partner.name);
-                    const candidateList = [...cands];
-                    if (candidateList.length <= 1) return "";
-                    return html`
-                    <!-- Commander picker — swap to any legal commander found in
-                         the deck (auto-detect can mis-pick, and cards added from
-                         the collection appear here live). -->
-                    <div style=${{
-                      marginTop:10, padding:"8px 10px", borderRadius:8,
-                      background:"var(--bg-surface-soft)", border:"1px solid var(--border)",
-                    }}>
-                      <div style=${{
-                        fontSize:9, letterSpacing:2, color:"var(--accent-text)",
-                        textTransform:"uppercase", fontWeight:700, marginBottom:5,
-                      }}>Change commander</div>
-                      <select value=${selCmd.name}
-                        onChange=${e => changeCommanderTo(e.target.value)}
-                        style=${{
-                          width:"100%", background:"var(--bg-surface)", border:"1px solid var(--border-input)",
-                          borderRadius:6, padding:"4px 6px", fontFamily:"inherit",
-                          fontSize:11, color:"var(--fg-text-heading)", cursor:"pointer",
-                        }}>
-                        ${candidateList.map(name => html`
-                          <option key=${name} value=${name}>
-                            ${name === selCmd.name ? "✓ " : ""}${name}
-                          </option>
-                        `)}
-                      </select>
-                      <div style=${{ fontSize:10, color:"var(--fg-text-muted)", marginTop:4, lineHeight:1.5, fontStyle:"italic" }}>
-                        ${candidateList.length} legal commander${candidateList.length === 1 ? "" : "s"} found in this deck.
-                      </div>
-                    </div>
-                    `;
-                  })()}
+                  <!-- Commander selection now lives on each card's ⋯ menu in
+                       the deck grid ("👑 Set as commander"). The old sidebar
+                       dropdown was removed to avoid two competing controls. -->
                 </div>
               `;
             })()}
@@ -10347,23 +10306,39 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               || null;
                       const faces = (sf?.card_faces || []).filter(f => f.image_uris);
                       const isDFC = faces.length >= 2;
-                      const isFlipped = !!flippedCards[cardKey];
-                      const frontSmall = card.img
-                        || sf?.image_uris?.small
-                        || faces[0]?.image_uris?.small || null;
-                      const backSmall  = faces[1]?.image_uris?.small || null;
-                      const shownSmall = isDFC && isFlipped ? backSmall : frontSmall;
-                      const normalImg  = shownSmall ? shownSmall.replace("/small/", "/normal/") : null;
+                      // Front face only for the row: name, mana, thumbnail.
+                      const frontName = isDFC ? dvFront(card.name) : card.name;
+                      const frontSmall = (faces[0]?.image_uris?.small)
+                        || card.img
+                        || sf?.image_uris?.small || null;
+                      const frontNormal = frontSmall ? frontSmall.replace("/small/", "/normal/")
+                        : (faces[0]?.image_uris?.normal || sf?.image_uris?.normal || null);
+                      const backNormal = isDFC
+                        ? (faces[1]?.image_uris?.normal
+                           || (faces[1]?.image_uris?.small || "").replace("/small/", "/normal/") || null)
+                        : null;
                       const isBasic = /basic land/i.test((card.type_line || sf?.type_line) || "") ||
                         ["Plains","Island","Swamp","Mountain","Forest","Wastes"].includes(card.name);
                       // Display fields fall back to the cached Scryfall record.
+                      // For DFCs, show the FRONT face's mana only (no back-face cost).
                       const typeLine = card.type_line || sf?.type_line || "";
-                      const manaCost = card.mana_cost || sf?.mana_cost || faces[0]?.mana_cost || "";
+                      const manaCost = isDFC
+                        ? (faces[0]?.mana_cost || "")
+                        : (card.mana_cost || sf?.mana_cost || faces[0]?.mana_cost || "");
                       const colorId  = (card.color_identity && card.color_identity.length)
                         ? card.color_identity : (sf?.color_identity || []);
+                      const editable = (groups.decks || []).some(d => d.name === deck.theme) && !isBasic;
+                      const canBeCmdr = sf && isCommander(sf)
+                        && dvFront(sf.name || card.name) !== dvFront(selCmd?.name || "");
+                      const menuItem = {
+                        display:"block", width:"100%", textAlign:"left",
+                        padding:"7px 10px", fontSize:12, color:"var(--fg-text-heading)",
+                        background:"transparent", border:"none", borderRadius:5,
+                        cursor:"pointer", fontFamily:"inherit",
+                      };
                       return html`
                         <div key=${cardKey}
-                          onMouseEnter=${e => showTooltip(e, normalImg, card.name)}
+                          onMouseEnter=${e => showTooltip(e, frontNormal, frontName, backNormal)}
                           onMouseLeave=${hideTooltip}
                           class="deck-card"
                           style=${{
@@ -10372,28 +10347,14 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             border: isBasic ? "1px solid #90b0d0" : "1px solid var(--border-soft)",
                             transition:"all .15s",
                           }}>
-                          ${shownSmall && html`
-                            <div style=${{ position:"relative", flexShrink:0, marginTop:2 }}>
-                              <img src=${shownSmall} alt=${card.name}
-                                style=${{ width:30, borderRadius:3, display:"block" }} />
-                              ${isDFC && html`
-                                <button onClick=${e => { e.stopPropagation(); setFlippedCards(m => ({ ...m, [cardKey]: !m[cardKey] })); }}
-                                  title=${`Flip — ${isFlipped ? faces[0]?.name : faces[1]?.name}`}
-                                  style=${{
-                                    position:"absolute", bottom:-4, right:-6,
-                                    width:16, height:16, borderRadius:"50%", padding:0,
-                                    background:"var(--accent)", color:"var(--on-accent)",
-                                    border:"1px solid var(--bg-surface)", cursor:"pointer",
-                                    fontSize:9, lineHeight:1, fontFamily:"inherit",
-                                    display:"flex", alignItems:"center", justifyContent:"center",
-                                  }}>⟳</button>
-                              `}
-                            </div>
+                          ${frontSmall && html`
+                            <img src=${frontSmall} alt=${frontName}
+                              style=${{ width:30, borderRadius:3, flexShrink:0, marginTop:2, display:"block" }} />
                           `}
-                          <div style=${{ flex:1, minWidth:0 }}>
+                          <div style=${{ flex:1, minWidth:0, paddingRight: editable ? 24 : 0 }}>
                             <div style=${{ display:"flex", alignItems:"center", gap:6,
                               marginBottom:1, flexWrap:"wrap" }}>
-                              <span style=${{ color:"var(--fg-text-strong)", fontSize:11, fontWeight:600 }}>${card.name}</span>
+                              <span style=${{ color:"var(--fg-text-strong)", fontSize:11, fontWeight:600 }}>${frontName}</span>
                               ${manaCost && html`<${ManaCost} cost=${manaCost} size=${13} />`}
                               ${isDFC && html`
                                 <span style=${{ fontSize:9, padding:"1px 6px", borderRadius:10, fontWeight:600,
@@ -10408,47 +10369,52 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               ${colorId.map(c => html`<${Pip} key=${c} c=${c} />`)}
                               ${typeLine && html`
                                 <span style=${{ fontSize:10, color:"var(--fg-text-muted)", fontStyle:"italic" }}>
-                                  ${typeLine.replace(/—/g, "·").substring(0, 40)}
+                                  ${typeLine.split("//")[0].trim().replace(/—/g, "·").substring(0, 40)}
                                 </span>
                               `}
                             </div>
-                            <div style=${{ color:"var(--fg-text-soft)", fontSize:10, lineHeight:1.4 }}>${card.reason}</div>
+                            ${card.reason && html`<div style=${{ color:"var(--fg-text-soft)", fontSize:10, lineHeight:1.4 }}>${card.reason}</div>`}
                           </div>
-                          ${((groups.decks || []).some(d => d.name === deck.theme)) && !isBasic && (() => {
-                            // Offer "Set as commander" on any legal commander in
-                            // the maindeck that isn't already the commander.
-                            const canBeCmdr = sf && isCommander(sf)
-                              && (sf.name || card.name).toLowerCase().split("//")[0].trim()
-                                 !== (selCmd?.name || "").toLowerCase().split("//")[0].trim();
-                            return html`
-                              ${canBeCmdr && html`
-                                <button
-                                  onClick=${e => { e.stopPropagation(); changeCommanderTo(sf.name || card.name); }}
-                                  title="Set as this deck's commander"
-                                  style=${{
-                                    position:"absolute", top:4, right:32,
-                                    background:"var(--accent)", border:"1px solid var(--bg-surface)", borderRadius:6,
-                                    padding:"2px 7px", fontSize:11, color:"var(--on-accent)",
-                                    cursor:"pointer", fontFamily:"inherit", lineHeight:1,
-                                    boxShadow:"0 1px 3px rgba(0,0,0,0.15)",
-                                  }}>👑</button>
-                              `}
-                              <button class="deck-card-remove"
-                                onClick=${e => {
-                                  e.stopPropagation();
-                                  setCardRemoveTarget("__uncategorised__");
-                                  setCardRemove({ name: card.name, deckName: deck.theme });
-                                }}
-                                title="Move this card back into the collection"
+                          ${editable && html`
+                            <div style=${{ position:"absolute", top:4, right:4 }}>
+                              <button onClick=${e => { e.stopPropagation(); setDeckCardMenu(m => m === cardKey ? null : cardKey); }}
+                                title="Card actions"
                                 style=${{
-                                  position:"absolute", top:4, right:4,
                                   background:"var(--bg-surface)", border:"1px solid var(--border)", borderRadius:6,
-                                  padding:"2px 7px", fontSize:11, color:"var(--accent-dark)",
+                                  padding:"2px 7px", fontSize:13, color:"var(--fg-text-soft)",
                                   cursor:"pointer", fontFamily:"inherit", lineHeight:1,
                                   boxShadow:"0 1px 3px rgba(0,0,0,0.15)",
-                                }}>↩</button>
-                            `;
-                          })()}
+                                }}>⋯</button>
+                              ${deckCardMenu === cardKey && html`
+                                <div onClick=${e => { e.stopPropagation(); setDeckCardMenu(null); }}
+                                  style=${{ position:"fixed", inset:0, zIndex:60 }}></div>
+                                <div style=${{
+                                  position:"absolute", top:"115%", right:0, zIndex:61,
+                                  background:"var(--bg-surface)", border:"1px solid var(--border)", borderRadius:8,
+                                  boxShadow:"0 4px 16px rgba(0,0,0,0.18)", minWidth:170, padding:4,
+                                }}>
+                                  ${canBeCmdr && html`
+                                    <button style=${menuItem}
+                                      onMouseEnter=${e => e.currentTarget.style.background = "var(--bg-surface-active)"}
+                                      onMouseLeave=${e => e.currentTarget.style.background = "transparent"}
+                                      onClick=${e => { e.stopPropagation(); setDeckCardMenu(null); changeCommanderTo(sf.name || card.name); }}>
+                                      👑 Set as commander
+                                    </button>
+                                  `}
+                                  <button style=${menuItem}
+                                    onMouseEnter=${e => e.currentTarget.style.background = "var(--bg-surface-active)"}
+                                    onMouseLeave=${e => e.currentTarget.style.background = "transparent"}
+                                    onClick=${e => {
+                                      e.stopPropagation(); setDeckCardMenu(null);
+                                      setCardRemoveTarget("__uncategorised__");
+                                      setCardRemove({ name: card.name, deckName: deck.theme });
+                                    }}>
+                                    ↩ Remove from deck
+                                  </button>
+                                </div>
+                              `}
+                            </div>
+                          `}
                         </div>
                       `;
                     })}
@@ -11745,6 +11711,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           <img src=${cardTooltip.img} alt=${cardTooltip.name}
             style=${{ width:290, display:"block" }}
             onError=${e => { setCardTooltip(null); }} />
+          ${cardTooltip.backImg && html`
+            <img src=${cardTooltip.backImg} alt=${cardTooltip.name + " (back)"}
+              style=${{ width:290, display:"block", borderTop:"2px solid var(--accent-hover)" }} />
+          `}
         </div>
       `}
     `;
