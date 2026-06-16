@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.06.15-g";
+  const APP_VERSION = "v2026.06.16-a";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -518,6 +518,7 @@
       set:               (sf.set || "").toLowerCase(),  // 3-letter set code, e.g. "unf"
       set_name:          sf.set_name,      // full set name, e.g. "Commander 2021"
       set_type:          sf.set_type,      // "funny" = Unfinity / Un-sets
+      security_stamp:    sf.security_stamp,   // "acorn" = not tournament-legal
       collector_number:  sf.collector_number,  // per-printing identifier — used to push the EXACT version to Archidekt
       commander_legal: sf.legalities?.commander === "legal",
     };
@@ -2231,6 +2232,7 @@
     if (bad.includes(sf.layout)) return false;
     if (sf.border_color === "silver") return false;          // Un-sets
     if (sf.set_type === "funny")     return false;           // Unfinity etc.
+    if (sf.security_stamp === "acorn") return false;        // Unfinity acorn (non-tournament) cards
     // Set-code blocklist — catches Un-set cards even when border_color/set_type
     // aren't yet cached (older slim entries).
     if (sf.set && UN_SET_CODES.has(String(sf.set).toLowerCase())) return false;
@@ -2484,9 +2486,9 @@
         <div style=${{ flex:1, minWidth:0 }}>
           <div style=${{ color:"var(--accent-strong)", fontSize:14, fontWeight:700, marginBottom:4 }}>${sf.name || cand.name}</div>
           <div style=${{ display:"flex", alignItems:"center", gap:4, marginBottom:4, flexWrap:"wrap" }}>
-            ${ci.map(c => html`<${Pip} key=${c} c=${c} />`)}
-            ${ci.length === 0 && html`<span style=${{ fontSize:11, color:"var(--fg-text-soft)" }}>Colorless</span>`}
-            <span style=${{ fontSize:11, color:"var(--fg-text-muted)", marginLeft:4 }}>${sf.mana_cost || ""}</span>
+            ${sf.mana_cost
+              ? html`<${ManaCost} cost=${sf.mana_cost} size=${14} />`
+              : html`<span style=${{ fontSize:11, color:"var(--fg-text-soft)" }}>Colorless</span>`}
           </div>
           <div style=${{ fontSize:11, color:"var(--fg-text-soft)", fontStyle:"italic", marginBottom:6 }}>${sf.type_line || ""}</div>
           <div style=${{ fontSize:11, color:"var(--fg-text-heading)", lineHeight:1.6,
@@ -3112,11 +3114,14 @@
     const [cmdrs,    setCmdrs]    = useState([]);   // enriched commander objects
     const [cands,    setCands]    = useState([]);   // AI top-3
     const [pickedIdx,setPickedIdx]= useState(null); // which AI suggestion is highlighted
+    const [suggestUses,  setSuggestUses]  = useState(0);      // how many times AI Suggest was clicked
+    const [suggestedNames, setSuggestedNames] = useState([]); // names already returned by AI Suggest
     const [selCmd,   setSelCmd]   = useState(null);
     const [deck,       setDeck]      = useState(null);
     const [deckSaved,  setDeckSvd]  = useState(false);
     const [library,    setLibrary]  = useState([]);   // saved deck entries
     const [libSaved,   setLibSaved] = useState(false);// just saved to library
+    const [libEntryId, setLibEntryId] = useState(null); // id of the library entry currently open
     const [fromSaved,  setFromSaved]= useState(false);// viewing a saved deck
     const [fromCollection, setFromCollection] = useState(false); // viewing a deck opened from the Collection
     // Snapshot of the user's in-progress (unsaved) built deck — preserved when
@@ -3171,6 +3176,7 @@
     const [flippedCards, setFlippedCards] = useState({}); // { [cardKey]: true } — DFC showing back face
     const [cmdrFlipped,  setCmdrFlipped]  = useState(false); // commander sidebar showing back face
     const [deckCardMenu, setDeckCardMenu] = useState(null);  // cardKey whose ⋯ menu is open
+    const [showInsights, setShowInsights] = useState(true);  // toggle Collection Gaps / EDHRec / Combos
 
     // ── Archidekt integration ───────────────────────────────────────────
     const [archUser,    setArchUser]    = useState("");
@@ -3854,6 +3860,7 @@
 
     const analyze = useCallback(async () => {
       setPhase("analyzing"); setLog([]); setProg(0); setError("");
+      setSuggestUses(n => n + 1);
       try {
         const anyFilter = colorFilter.length > 0 || colorless;
         const filtered = anyFilter ? cmdrs.filter(c => {
@@ -3880,7 +3887,11 @@
           addLog(`💰 ${filtered.length - budgetFiltered.length} commanders over budget skipped.`);
         }
 
-        const sample = budgetFiltered.slice(0, 25);
+        const unseenFiltered = budgetFiltered.filter(c =>
+          !suggestedNames.includes((c.name || "").toLowerCase())
+        );
+        const pool = unseenFiltered.length >= 3 ? unseenFiltered : budgetFiltered;
+        const sample = pool.slice(0, 25);
         const list   = sample.map(c => {
           const price = c.scryfall?.prices?.usd ? `$${c.scryfall.prices.usd}` : "—";
           return `${c.name} | ${c.scryfall.mana_cost||"—"} | ${price} | ${(c.scryfall.oracle_text||"").slice(0,80)}`;
@@ -3908,6 +3919,7 @@
         const withCards = parsed.commanders.map(c => ({
           ...c, card: cmdrs.find(e => e.name.toLowerCase() === c.name.toLowerCase()) || cmdrs[0],
         }));
+        setSuggestedNames(prev => [...prev, ...withCards.map(c => c.name.toLowerCase())]);
         setCands(withCards); setPickedIdx(null); setProg(100);
         addLog(`✅ ${withCards.length} suggestions — pick your favourite!`);
         setPhase("pick");
@@ -4875,6 +4887,17 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         groups: nextGroups, deckInc: nextDeckInc, binInc,
       }));
       lsSetItemSafe(LS_CARDS, JSON.stringify(nextUsable));
+
+      // Issue 8: if this deck was in the Library, remove it now that it lives in Collection.
+      if (libSaved && libEntryId != null) {
+        const nextLibrary = library.filter(e => e.id !== libEntryId);
+        setLibrary(nextLibrary);
+        lsSetItemSafe(LS_LIBRARY, JSON.stringify(nextLibrary));
+        setLibEntryId(null);
+        setLibSaved(false);
+        setFromSaved(false);
+      }
+
       setDeckSvd(true);
     };
 
@@ -4895,6 +4918,39 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       const updated = library.filter(e => e.id !== id);
       setLibrary(updated);
       lsSetItemSafe(LS_LIBRARY, JSON.stringify(updated));
+    };
+
+    // Remove one card from a library deck's deckData.categories in-place.
+    const removeCardFromLibraryDeck = (cardName) => {
+      const updated = library.map(e => {
+        if ((e.deck?.theme || "") !== (deck?.theme || "")) return e;
+        const newCats = (e.deck?.categories || []).map(c => ({
+          ...c, cards: (c.cards || []).filter((card, i) => {
+            if ((card.name || "").toLowerCase() === cardName.toLowerCase()) {
+              // remove only the first match
+              if (!removeCardFromLibraryDeck._removed) { removeCardFromLibraryDeck._removed = true; return false; }
+            }
+            return true;
+          }),
+        })).filter(c => c.cards.length > 0);
+        removeCardFromLibraryDeck._removed = false;
+        const newDeck = { ...e.deck, categories: newCats };
+        return { ...e, deck: newDeck };
+      });
+      setLibrary(updated);
+      lsSetItemSafe(LS_LIBRARY, JSON.stringify(updated));
+      // Also update the live deck state so the tile disappears immediately.
+      setDeck(prev => {
+        if (!prev) return prev;
+        const newCats = (prev.categories || []).map(c => {
+          let removed = false;
+          return { ...c, cards: (c.cards || []).filter(card => {
+            if (!removed && (card.name || "").toLowerCase() === cardName.toLowerCase()) { removed = true; return false; }
+            return true;
+          })};
+        }).filter(c => c.cards.length > 0);
+        return { ...prev, categories: newCats };
+      });
     };
 
     // Re-hydrate the Insights panel from a deck's persisted archidekt info,
@@ -5060,13 +5116,14 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         setUnsavedDeck({ deck, selCmd });
       }
       setPreviewingPrecon(null);
-      setCmdrFlipped(false); setFlippedCards({}); setDeckCardMenu(null);
+      setCmdrFlipped(false); setFlippedCards({}); setDeckCardMenu(null); setDeckHover(null);
       setSelCmd(entry.selCmd);
       // Library entries live outside groups.decks, so heal in-memory only.
       setDeck(healDeckData(entry.deck, entry.selCmd).deckData);
       setFromSaved(true);
       setFromCollection(false);
       setLibSaved(true);   // already saved — no need to offer again
+      setLibEntryId(entry.id ?? null);
       setDeckSvd(false);
       setError("");
       restoreArchResult(entry.deck);
@@ -5313,7 +5370,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         if (!fromSaved && !fromCollection && deck && selCmd && !previewingPrecon) {
           setUnsavedDeck({ deck, selCmd });
         }
-        setPreviewingPrecon(null);
+        setPreviewingPrecon(null); setDeckHover(null);
         setSelCmd(rawDeck.selCmd);
         setDeck(applyHealAndOpen(rawDeck, rawDeck.selCmd));
         setFromSaved(returnTo === "library");
@@ -6031,7 +6088,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       if (!fromSaved && !fromCollection && deck && selCmd && !previewingPrecon) {
         setUnsavedDeck({ deck, selCmd });
       }
-      setPreviewingPrecon(null);
+      setPreviewingPrecon(null); setDeckHover(null);
       setSelCmd(d.selCmd);
       setDeck(applyHealAndOpen(d, d.selCmd));
       setFromSaved(false);
@@ -9262,15 +9319,21 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
                   <div style=${{ textAlign:"center" }}>
                     <button onClick=${analyze}
-                      disabled=${cmdrs.length === 0}
+                      disabled=${cmdrs.length === 0 || suggestUses >= 20}
                       style=${{ ...btn, padding:"13px 34px", fontSize:15,
-                        opacity: cmdrs.length === 0 ? 0.45 : 1,
-                        cursor: cmdrs.length === 0 ? "not-allowed" : "pointer" }}>
+                        opacity: (cmdrs.length === 0 || suggestUses >= 20) ? 0.45 : 1,
+                        cursor: (cmdrs.length === 0 || suggestUses >= 20) ? "not-allowed" : "pointer" }}>
                       ⚔️ AI Suggest Commanders
+                      <span style=${{ fontSize:11, opacity:0.75, marginLeft:6 }}>(${suggestUses}/20)</span>
                     </button>
                     ${cmdrs.length === 0 && html`
                       <p style=${{ fontSize:12, color:"var(--fg-text-muted)", marginTop:10 }}>
                         Click "Load Commanders" first to scan your collection.
+                      </p>
+                    `}
+                    ${suggestUses >= 20 && html`
+                      <p style=${{ fontSize:12, color:"var(--fg-text-muted)", marginTop:10 }}>
+                        Daily AI suggestion limit reached (20/20).
                       </p>
                     `}
                   </div>
@@ -9320,51 +9383,39 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     <!-- Colour filter -->
                     <div class="card" style=${{ marginBottom:16 }}>
                       <span style=${label}>Filter by Commander Colour Identity</span>
-                      <div style=${{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:12 }}>
+                      <div style=${{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:12 }}>
                         ${["W","U","B","R","G"].map(c => {
                           const on = colorFilter.includes(c);
                           return html`
                             <div key=${c}
                               onClick=${() => setCF(cf => cf.includes(c) ? cf.filter(x=>x!==c) : [...cf,c])}
+                              title=${C_LABEL[c]}
                               style=${{
-                                display:"flex", alignItems:"center", gap:8, cursor:"pointer",
-                                padding:"4px 12px 4px 4px", borderRadius:24,
+                                display:"flex", alignItems:"center", gap:4, cursor:"pointer",
+                                padding:"4px 10px 4px 6px", borderRadius:24,
                                 background: on ? "var(--bg-surface-active)" : "var(--bg-surface)",
                                 border: on ? "1px solid var(--accent-hover)" : "1px solid var(--border)",
                                 boxShadow: on ? "0 1px 6px rgba(192,112,48,0.18)" : "none",
                                 transition:"all .15s",
                               }}>
-                              <span style=${{
-                                width:30, height:30, borderRadius:"50%",
-                                background: C_BG[c],
-                                border: on ? "2px solid var(--fg-text-heading)" : "2px solid transparent",
-                                display:"flex", alignItems:"center", justifyContent:"center",
-                                fontSize:12, fontWeight:700,
-                                color: c==="W" ? "var(--fg-text-strong)" : "var(--bg-surface)",
-                                boxShadow:"0 1px 3px rgba(0,0,0,0.18)",
-                              }}>${c}</span>
-                              <span style=${{ fontSize:13, fontWeight: on ? 700 : 400,
+                              <${Pip} c=${c} size=${24} />
+                              <span style=${{ fontSize:12, fontWeight: on ? 700 : 400,
                                 color: on ? "var(--accent-strong)" : "var(--fg-text-body)" }}>${C_LABEL[c]}</span>
                             </div>
                           `;
                         })}
                         <div onClick=${() => setCL(v=>!v)}
+                          title="Colorless"
                           style=${{
-                            display:"flex", alignItems:"center", gap:8, cursor:"pointer",
-                            padding:"4px 12px 4px 4px", borderRadius:24,
+                            display:"flex", alignItems:"center", gap:4, cursor:"pointer",
+                            padding:"4px 10px 4px 6px", borderRadius:24,
                             background: colorless ? "var(--bg-surface-active)" : "var(--bg-surface)",
                             border: colorless ? "1px solid var(--accent-hover)" : "1px solid var(--border)",
                             boxShadow: colorless ? "0 1px 6px rgba(192,112,48,0.18)" : "none",
                             transition:"all .15s",
                           }}>
-                          <span style=${{
-                            width:30, height:30, borderRadius:"50%", background:"var(--fg-text-muted)",
-                            border: colorless ? "2px solid var(--fg-text-heading)" : "2px solid transparent",
-                            display:"flex", alignItems:"center", justifyContent:"center",
-                            fontSize:13, color:"var(--bg-surface)", fontWeight:700,
-                            boxShadow:"0 1px 3px rgba(0,0,0,0.18)",
-                          }}>∅</span>
-                          <span style=${{ fontSize:13, fontWeight: colorless ? 700 : 400,
+                          <${Pip} c=${"C"} size=${24} />
+                          <span style=${{ fontSize:12, fontWeight: colorless ? 700 : 400,
                             color: colorless ? "var(--accent-strong)" : "var(--fg-text-body)" }}>Colorless</span>
                         </div>
                       </div>
@@ -9587,12 +9638,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               const oracle = oracleLines.join("\n— // —\n");
               return html`
                 <div style=${{
-                  position:"sticky",
-                  top: headerH + "px",
                   flexShrink:0,
                   width:"clamp(220px, 22%, 300px)",
-                  maxHeight: `calc(100vh - ${headerH + 16}px)`,
-                  overflowY:"auto",
                   background:"rgba(255,249,241,0.97)",
                   border:"1px solid var(--border-strong)",
                   borderRadius:12,
@@ -9738,9 +9785,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     }}>📦 In Collection</span>`}
                   </div>
                   <h2 style=${{ margin:"0 0 6px", color:"var(--fg-text-heading)", fontSize:20 }}>${selCmd.card?.name}</h2>
-                  <div style=${{ marginBottom:8 }}>
-                    ${(selCmd.card?.scryfall?.color_identity||[]).map(c => html`<${Pip} key=${c} c=${c} />`)}
-                    <span style=${{ fontSize:10, color:"var(--fg-text-soft)", marginLeft:4 }}>
+                  <div style=${{ marginBottom:8, display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
+                    <${ManaCost} cost=${selCmd.card?.scryfall?.mana_cost || selCmd.card?.scryfall?.card_faces?.[0]?.mana_cost || ""} size=${15} />
+                    <span style=${{ fontSize:10, color:"var(--fg-text-soft)" }}>
                       ${selCmd.card?.scryfall?.type_line}
                     </span>
                   </div>
@@ -9875,7 +9922,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     <button onClick=${exportDeck} style=${{ ...btnSec, padding:"6px 14px", fontSize:11 }}>
                       ⬇ Export .txt
                     </button>
-                    ${!libSaved && html`<button onClick=${saveDeckToLibrary}
+                    ${!libSaved && !fromCollection && html`<button onClick=${saveDeckToLibrary}
                       style=${{ ...btn, padding:"6px 14px", fontSize:11,
                         background:"linear-gradient(135deg,var(--success),#2e8a44)" }}>
                       💾 Save to Library
@@ -9904,23 +9951,20 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       </button>
                     `;
                   })()}
-                  <button onClick=${() => {
-                      setDeckSvd(false); setLibSaved(false);
-                      if (previewingPrecon) {
-                        setPreviewingPrecon(null);
-                        setDeck(null); setSelCmd(null);
-                        setPhase("precons");
-                      } else if (fromCollection) { setFromCollection(false); setPhase("select"); }
-                      else if (fromSaved) { setFromSaved(false); setPhase("saved_list"); }
-                      else if (cands.length > 0) setPhase("pick");
-                      else { setPhase("ready"); setTab("commanders"); }
-                    }}
-                    style=${{ ...btnSec, padding:"6px 14px", fontSize:11 }}>
-                    ${previewingPrecon ? "← Back to pre-cons"
-                      : fromCollection ? "← Collection"
-                      : fromSaved   ? "← Library"
-                      :              "↩ Re-pick"}
-                  </button>
+                  ${(!fromSaved && !fromCollection) && html`
+                    <button onClick=${() => {
+                        setDeckSvd(false); setLibSaved(false);
+                        if (previewingPrecon) {
+                          setPreviewingPrecon(null);
+                          setDeck(null); setSelCmd(null);
+                          setPhase("precons");
+                        } else if (cands.length > 0) setPhase("pick");
+                        else { setPhase("ready"); setTab("commanders"); }
+                      }}
+                      style=${{ ...btnSec, padding:"6px 14px", fontSize:11 }}>
+                      ${previewingPrecon ? "← Back to pre-cons" : "↩ Re-pick"}
+                    </button>
+                  `}
                   ${(fromSaved || fromCollection) && unsavedDeck && html`
                     <button onClick=${restoreUnsavedDeck}
                       title="Return to the freshly-built deck you had before opening this one."
@@ -10077,7 +10121,18 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               `}
 
 
-              ${deck.warnings && deck.warnings.length > 0 && html`
+              ${(deck.warnings?.length || deck.edhrecSuggestions?.length || deck.combosHave?.length || deck.combosAlmost?.length) > 0 && html`
+                <div style=${{ display:"flex", justifyContent:"flex-end", marginBottom:6 }}>
+                  <button onClick=${() => setShowInsights(v => !v)}
+                    style=${{ background:"transparent", border:"1px solid var(--border-input)",
+                      borderRadius:20, padding:"3px 12px", fontSize:11, cursor:"pointer",
+                      color:"var(--fg-text-soft)", fontFamily:"inherit" }}>
+                    ${showInsights ? "▲ Hide insights" : "▼ Show insights"}
+                  </button>
+                </div>
+              `}
+
+              ${showInsights && deck.warnings && deck.warnings.length > 0 && html`
                 <div style=${{ background:"var(--bg-surface-soft)", border:"1px solid var(--border-input)", borderRadius:10,
                   padding:"14px 18px", marginBottom:18 }}>
                   <div style=${{ fontSize:11, letterSpacing:3, color:"var(--warning)", textTransform:"uppercase",
@@ -10093,7 +10148,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 </div>
               `}
 
-              ${deck.edhrecSuggestions && deck.edhrecSuggestions.length > 0 && html`
+              ${showInsights && deck.edhrecSuggestions && deck.edhrecSuggestions.length > 0 && html`
                 <div style=${{ background:"var(--info-bg)", border:"1px solid var(--info-border)", borderRadius:10,
                   padding:"14px 18px", marginBottom:18 }}>
                   <div style=${{ display:"flex", alignItems:"baseline", gap:10, marginBottom:8, flexWrap:"wrap" }}>
@@ -10139,7 +10194,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 </div>
               `}
 
-              ${deck.combosHave && deck.combosHave.length > 0 && html`
+              ${showInsights && deck.combosHave && deck.combosHave.length > 0 && html`
                 <div style=${{ background:"var(--bg-surface-soft)", border:"1px solid #d8a060", borderRadius:10,
                   padding:"14px 18px", marginBottom:18 }}>
                   <div style=${{ fontSize:11, letterSpacing:3, color:"var(--warning)", textTransform:"uppercase",
@@ -10174,7 +10229,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 </div>
               `}
 
-              ${deck.combosAlmost && deck.combosAlmost.length > 0 && html`
+              ${showInsights && deck.combosAlmost && deck.combosAlmost.length > 0 && html`
                 <div style=${{ background:"var(--bg-surface-soft)", border:"1px dashed var(--border-dashed)", borderRadius:10,
                   padding:"14px 18px", marginBottom:18 }}>
                   <div style=${{ fontSize:11, letterSpacing:3, color:"var(--accent-dark)", textTransform:"uppercase",
@@ -10364,7 +10419,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         : (card.mana_cost || sf?.mana_cost || faces[0]?.mana_cost || "");
                       const colorId  = (card.color_identity && card.color_identity.length)
                         ? card.color_identity : (sf?.color_identity || []);
-                      const editable = (groups.decks || []).some(d => d.name === deck.theme) && !isBasic;
+                      const editable = !isBasic && (
+                        (groups.decks || []).some(d => d.name === deck.theme) || fromSaved || fromCollection
+                      );
                       const canBeCmdr = (sf ? isCommander(sf) : card.can_be_commander === true)
                         && dvFront((sf?.name || card.name)) !== dvFront(selCmd?.name || "");
                       const menuItem = {
@@ -10504,9 +10561,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 </div>
               `; })}
 
-              <div style=${{ textAlign:"center", marginTop:32 }}>
-                <button onClick=${resetHome} style=${btnSec}>🔄 Start Over</button>
-              </div>
+              <div style=${{ marginTop:32 }}></div>
             </div>
             <!-- end flex right column -->
 
@@ -10576,7 +10631,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 </div>
               </div>
 
-              ${(unsavedDeck || (deck && selCmd && !libSaved && !fromSaved)) && html`
+              ${(unsavedDeck || (deck && selCmd && !libSaved && !fromSaved && !fromCollection)) && html`
                 <div style=${{
                   background:"var(--bg-surface-soft)", border:"1px solid var(--border-input)", borderRadius:10,
                   padding:"10px 14px", marginBottom:18, fontSize:12, color:"var(--accent-text)",
@@ -10736,7 +10791,6 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               ${isImported ? titleLabel : cmdrLabel}
                             </div>
                             <div style=${{ display:"flex", gap:4, flexWrap:"wrap", alignItems:"center", marginBottom:5 }}>
-                              ${ci.map(c => html`<${Pip} key=${c} c=${c} />`)}
                               ${sf.mana_cost && html`<${ManaCost} cost=${sf.mana_cost} size=${13} />`}
                             </div>
                             ${(!isImported || isEnriched) && html`
@@ -11484,8 +11538,12 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               }}>
                 <button onClick=${close} style=${{ ...btnSec, fontSize:12, padding:"7px 14px" }}>Cancel</button>
                 <button onClick=${() => {
-                    const target = cardRemoveTarget === "__uncategorised__" ? UNCATEGORISED : cardRemoveTarget;
-                    moveCardDeckToCollection(cardRemove.deckName, cardRemove.name, target);
+                    if (fromSaved) {
+                      removeCardFromLibraryDeck(cardRemove.name);
+                    } else {
+                      const target = cardRemoveTarget === "__uncategorised__" ? UNCATEGORISED : cardRemoveTarget;
+                      moveCardDeckToCollection(cardRemove.deckName, cardRemove.name, target);
+                    }
                     close();
                   }}
                   style=${{ ...btn, fontSize:12, padding:"7px 14px" }}>
