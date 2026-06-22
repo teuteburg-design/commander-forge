@@ -16,3 +16,10 @@ node_modules/
 
 # Claude Code config — local to this machine
 .claude/
+
+# wrangler files
+.wrangler
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example
