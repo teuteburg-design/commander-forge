@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.06.16-a";
+  const APP_VERSION = "v2026.10.09-a";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -420,21 +420,23 @@
   const PROVIDERS = {
     groq: {
       label: "Groq", keyHint: "gsk_…", keyUrl: "console.groq.com",
+      // Production models only. Llama 3.3 70B / 3.1 8B were shut down on
+      // 2026-08-16 and Gemma 2 9B on 2025-10-08 (console.groq.com/docs/deprecations).
       models: [
-        { id:"llama-3.3-70b-versatile", label:"Llama 3.3 70B (best quality)" },
-        { id:"llama-3.1-8b-instant",    label:"Llama 3.1 8B (faster)" },
-        { id:"gemma2-9b-it",            label:"Gemma 2 9B" },
+        { id:"openai/gpt-oss-120b", label:"GPT-OSS 120B (best quality)" },
+        { id:"openai/gpt-oss-20b",  label:"GPT-OSS 20B (faster)" },
       ],
     },
     gemini: {
       label: "Google Gemini", keyHint: "AIza…", keyUrl: "aistudio.google.com",
-      // GA models only — May-2025 preview SKUs (`*-preview-05-20`, `*-preview-05-06`)
-      // were retired once 2.5 Flash/Pro hit GA and now return 404.
+      // GA models only. 2.0 Flash / Flash Lite were shut down 2026-06-01; 2.5 is
+      // only served to keys that used it before (Sept-2026 release notes), so
+      // brand-new keys must use 3.x. Saved IDs not in this list reset to [0].
       models: [
-        { id:"gemini-2.5-flash",      label:"Gemini 2.5 Flash (recommended)" },
-        { id:"gemini-2.5-pro",        label:"Gemini 2.5 Pro (slower, stronger)" },
-        { id:"gemini-2.0-flash",      label:"Gemini 2.0 Flash" },
-        { id:"gemini-2.0-flash-lite", label:"Gemini 2.0 Flash Lite (fastest)" },
+        { id:"gemini-3.8-flash",      label:"Gemini 3.8 Flash (recommended)" },
+        { id:"gemini-3.5-flash-lite", label:"Gemini 3.5 Flash-Lite (fastest)" },
+        { id:"gemini-2.5-flash",      label:"Gemini 2.5 Flash (legacy)" },
+        { id:"gemini-2.5-pro",        label:"Gemini 2.5 Pro (legacy)" },
       ],
     },
   };
@@ -1344,6 +1346,10 @@
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
       body: JSON.stringify({
         model, temperature: 0.7, max_tokens: maxTokens,
+        // GPT-OSS models reason before answering; keep it short so the token
+        // budget goes to the deck JSON, and drop the reasoning text from the
+        // response (it arrives in a separate field, never in content).
+        ...(/^openai\/gpt-oss/.test(model || "") ? { reasoning_effort: "low", include_reasoning: false } : {}),
         // Force structured JSON output — eliminates prose wrappers like
         // "Here's the JSON:" that defeated safeParse.
         response_format: { type: "json_object" },
@@ -1397,30 +1403,46 @@
     };
   }
 
+  // Thinking models charge internal reasoning tokens against maxOutputTokens,
+  // so for structured output (deck JSON) we keep reasoning to a minimum:
+  //   - 2.5 Flash: thinkingBudget 0 turns it off entirely. 2.5 Pro rejects 0
+  //     (thinking-only model), so it keeps its default budget.
+  //   - 3.x: can't be turned off; thinkingLevel "minimal" (Flash-Lite only) or
+  //     "low" (Flash — "minimal" returns 400). Google advises against setting
+  //     temperature below the 1.0 default on 3.x (causes looping), so omit it.
+  // Mirrored in worker/index.js (geminiGenerationConfig) for the shared key.
+  function geminiGenerationConfig(model, maxTokens) {
+    const m = model || "";
+    const cfg = { maxOutputTokens: maxTokens, responseMimeType: "application/json" };
+    if (/^gemini-3/.test(m)) {
+      cfg.thinkingConfig = { thinkingLevel: /flash-lite/.test(m) ? "minimal" : "low" };
+    } else {
+      cfg.temperature = 0.7;
+      if (/^gemini-2\.5-flash/.test(m)) cfg.thinkingConfig = { thinkingBudget: 0 };
+    }
+    return cfg;
+  }
+
+  // Concatenate the visible text parts, skipping thought parts.
+  function geminiText(cand) {
+    return (cand.content?.parts || []).filter(p => !p.thought && p.text).map(p => p.text).join("");
+  }
+
   async function callGemini(apiKey, model, userText, systemText, maxTokens = 4096) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    // Gemini 2.5 ("thinking") models charge internal reasoning tokens against
-    // maxOutputTokens. For deterministic structured output (deck JSON) we
-    // explicitly disable thinking so the entire budget is available for the
-    // visible response. Older models (2.0, 1.5) ignore this field.
-    const isThinking = /^gemini-2\.5/.test(model || "");
     const r = await fetch(url, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: systemText }] },
         contents: [{ role:"user", parts: [{ text: userText }] }],
-        generationConfig: {
-          maxOutputTokens: maxTokens, temperature: 0.7,
-          responseMimeType: "application/json",
-          ...(isThinking ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
-        },
+        generationConfig: geminiGenerationConfig(model, maxTokens),
       }),
     });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error?.message || `Gemini error ${r.status}`);
     const cand = d.candidates?.[0] || {};
     return {
-      text: cand.content?.parts?.[0]?.text ?? "",
+      text: geminiText(cand),
       // Gemini uses MAX_TOKENS / STOP / SAFETY / RECITATION in finishReason.
       // Normalize to lowercase for consistent caller logic.
       finishReason: (cand.finishReason || "unknown").toLowerCase(),
@@ -3633,13 +3655,13 @@
 
     // Per-provider max_tokens caps. Callers ask for an upper bound (e.g. 16384
     // for deck builds), but each provider has its own ceiling on the FREE tier:
-    //   - Groq Llama 3.3 70B free tier: 12 000 TPM (tokens per minute, total
-    //     for input + reserved output). With ~4-5 K input we cap at 7 000 so
-    //     a single request fits comfortably (input + 7 000 ≈ 11-12 K). NOTE:
-    //     two attempts within the same minute will still blow TPM, so
+    //   - Groq GPT-OSS: 8 000 TPM on the base plan (input + reserved output),
+    //     down from 12 000 for the retired Llama 3.3 70B, so a full deck build
+    //     with ~4-5 K input may be rejected. 7 000 keeps smaller calls working;
     //     buildDeck skips its focused-prompt retry on Groq (see comment there).
-    //   - Gemini 2.5 Flash: up to 65 536 output, comfortably handles 16 384.
-    const PROVIDER_MAX_TOKENS = { groq: 7000, gemini: 16384 };
+    //   - Gemini 3.x Flash: 65 536 max output. Reasoning can't be disabled on
+    //     3.x and counts against the budget, so allow 24 576 (billed by use).
+    const PROVIDER_MAX_TOKENS = { groq: 7000, gemini: 24576 };
 
     // Run a prompt on a single, specific provider. Throws on API failure.
     // In freeAIMode the only allowed provider is Gemini-via-shared (own keys
@@ -4144,12 +4166,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           throw new Error(msg);
         }
 
-        // Gemini 2.5 Flash supports up to 65536 output tokens; Llama 3.3 70B on
-        // Groq supports 32768. A 99-card deck with concise reasons fits in
-        // ~6-10K tokens, but verbose models (especially Gemini in non-thinking
-        // mode) sometimes burn through 8K writing long reasons and truncate
-        // mid-output. 16K gives generous headroom; both providers handle it.
-        const DECK_MAX_TOKENS = 16384;
+        // A 99-card deck with concise reasons fits in ~6-10K tokens, but verbose
+        // models sometimes burn through 8K writing long reasons and truncate
+        // mid-output, and Gemini 3.x spends part of the budget on (low-level)
+        // reasoning first. 24K gives headroom; callAIOn clamps it per provider.
+        const DECK_MAX_TOKENS = 24576;
 
         for (const p of aiOrder) {
           // ── Attempt 1: full prompt ──
@@ -4177,7 +4198,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               ? "model stopped early or returned bad JSON"
               : `finish_reason=${reason1}`;
 
-          // Groq has a 12 000 TPM (tokens per minute) cap on the free tier.
+          // Groq has an 8 000 TPM (tokens per minute) cap on the base plan.
           // A single full-prompt + max_tokens request consumes nearly all of
           // it — a second request in the same minute is guaranteed to be
           // 429-rejected. Skip the focused retry on Groq and rotate
@@ -4229,9 +4250,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           } else if (hasGroq && !hasGemini) {
             suggestion = "Groq's free tier rejects large deck-build requests. Add a free Gemini key in Settings (aistudio.google.com) — it has a much larger per-request budget and reliably handles 99-card decks.";
           } else if (hasGemini && !hasGroq) {
-            suggestion = "Try switching the Gemini model in Settings to gemini-2.5-pro (slower but emits longer JSON reliably), or add a Groq key as fallback.";
+            suggestion = "Try switching the Gemini model in Settings (Gemini 3.8 Flash is the most reliable for long deck JSON), or add a Groq key as fallback.";
           } else {
-            suggestion = "Try switching to gemini-2.5-pro in Settings, or retry — this is usually transient.";
+            suggestion = "Try Gemini 3.8 Flash in Settings, or retry — this is usually transient.";
           }
 
           if (allApiErrors) {

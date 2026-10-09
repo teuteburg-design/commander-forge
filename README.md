@@ -65,5 +65,5 @@ wrangler dev
 - Synergy ranking: [EDHRec](https://edhrec.com) public JSON endpoints (with CORS proxy fallback)
 - Combo discovery: [Commander Spellbook](https://commanderspellbook.com) `/find-my-combos/` API
 - AI providers (BYO key, with automatic fallback if both configured):
-  - **Groq** — Llama 3.3 70B
-  - **Gemini** — Gemini 2.5 Flash
+  - **Groq** — GPT-OSS 120B
+  - **Gemini** — Gemini 3.8 Flash

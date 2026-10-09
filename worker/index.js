@@ -641,7 +641,7 @@ async function handleProxy(request, prefix, target) {
 // per user per UTC day. Quota keys live in the same STATE namespace, with a
 // 25-hour TTL so yesterday's keys self-clean.
 const SHARED_GEMINI_DAILY_CAP = 20;
-const SHARED_GEMINI_DEFAULT_MODEL = "gemini-2.5-flash";
+const SHARED_GEMINI_DEFAULT_MODEL = "gemini-3.8-flash";
 const QUOTA_KEY_PREFIX = "quota:";
 
 function quotaKey(email) {
@@ -678,6 +678,22 @@ async function handleQuota(request, env) {
   });
 }
 
+// Mirrors geminiGenerationConfig() in public/commander-forge.html — see the
+// comment there. 2.5 Flash: thinking off + temperature 0.7 (2.5 Pro rejects a
+// 0 budget, so it keeps its default). 3.x: thinking can't be disabled, so use
+// the lowest level the model accepts and leave temperature at its default
+// (Google warns lower values cause looping on 3.x).
+function geminiGenerationConfig(model, maxTokens) {
+  const cfg = { maxOutputTokens: maxTokens, responseMimeType: "application/json" };
+  if (/^gemini-3/.test(model)) {
+    cfg.thinkingConfig = { thinkingLevel: /flash-lite/.test(model) ? "minimal" : "low" };
+  } else {
+    cfg.temperature = 0.7;
+    if (/^gemini-2\.5-flash/.test(model)) cfg.thinkingConfig = { thinkingBudget: 0 };
+  }
+  return cfg;
+}
+
 async function handleSharedGemini(request, env) {
   const email = authenticatedEmail(request);
   if (!email) return jsonResponse({ error: "not authenticated" }, 401);
@@ -705,13 +721,12 @@ async function handleSharedGemini(request, env) {
 
   const system     = (body.system || "").toString();
   const user       = (body.user   || "").toString();
-  const max_tokens = Math.min(parseInt(body.max_tokens) || 4096, 16384);
+  const max_tokens = Math.min(parseInt(body.max_tokens) || 4096, 24576);
   const model      = (body.model || SHARED_GEMINI_DEFAULT_MODEL).toString();
 
   if (!user) return jsonResponse({ error: "missing 'user' field" }, 400);
 
   // Forward to Gemini using the host's key.
-  const isThinking = /^gemini-2\.5/.test(model);
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${env.GEMINI_API_KEY}`;
   let r;
   try {
@@ -721,11 +736,7 @@ async function handleSharedGemini(request, env) {
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: system }] },
         contents: [{ role: "user", parts: [{ text: user }] }],
-        generationConfig: {
-          maxOutputTokens: max_tokens, temperature: 0.7,
-          responseMimeType: "application/json",
-          ...(isThinking ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
-        },
+        generationConfig: geminiGenerationConfig(model, max_tokens),
       }),
     });
   } catch (e) {
@@ -751,7 +762,7 @@ async function handleSharedGemini(request, env) {
 
   const cand = data.candidates?.[0] || {};
   return jsonResponse({
-    text:             cand.content?.parts?.[0]?.text ?? "",
+    text:             (cand.content?.parts || []).filter(p => !p.thought && p.text).map(p => p.text).join(""),
     finishReason:     (cand.finishReason || "unknown").toLowerCase(),
     completionTokens: data.usageMetadata?.candidatesTokenCount || null,
     promptTokens:     data.usageMetadata?.promptTokenCount     || null,
