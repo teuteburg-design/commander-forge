@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.09-a";
+  const APP_VERSION = "v2026.10.09-b";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -345,6 +345,7 @@
   const LS_ARCH_TOKEN = "cmdr_forge_archidekt_token";  // bearer token from /api/users/login/
   const LS_USE_SHARED = "cmdr_forge_use_shared_gemini"; // "1" = route Gemini calls through host's key
   const LS_THEME      = "cmdr_forge_theme";
+  const LS_SYNC_BASE  = "cmdr_forge_sync_base";    // { lastModified, hashes } of the last state known to match the cloud
 
   const THEMES = [
     { id: "parchment", label: "Parchment", desc: "Warm cream — the original Commander Forge look." },
@@ -367,15 +368,19 @@
 
   // ── Cloud sync ──────────────────────────────────────────────────────────────
   // localStorage keys to push to the cloud KV store. Deliberately excludes
-  // LS_SF_CACHE (huge, per-browser, regenerable) and LS_COMMANDERS (rebuilt
-  // per-collection by Load Commanders). Everything else makes the user
-  // experience portable across devices.
+  // LS_SF_CACHE (huge, per-browser, regenerable), LS_COMMANDERS (rebuilt
+  // per-collection by Load Commanders) and LS_ARCH_CREDS (the Archidekt
+  // password stays on this device; the token is enough to stay signed in).
+  // Everything else makes the user experience portable across devices.
   const SYNC_KEYS = [
     LS_KEY_GROQ, LS_KEY_GEMINI, LS_PROVIDER, LS_MODELS,
     LS_CARDS, LS_BINDERS, LS_PREFS, LS_LIBRARY,
-    LS_ARCH_CREDS, LS_ARCH_TOKEN,
+    LS_ARCH_TOKEN,
     LS_USE_SHARED,
   ];
+  // fetch keepalive bodies are capped at 64 KiB in browsers; bigger pushes
+  // must go out as normal requests.
+  const KEEPALIVE_MAX_BYTES = 60 * 1024;
   // Push interval — debounce window for batching rapid changes (typing in
   // Settings, scrolling through preferences). 5 s gives a responsive feel
   // without spamming KV writes when only one thing changed.
@@ -389,6 +394,69 @@
     }
     return out;
   }
+  // ── Merge on load ──────────────────────────────────────────────────────
+  // LS_SYNC_BASE records a hash per key of the last state this device knows
+  // matched the cloud. Comparing local and server values against it tells us
+  // which side changed since then, so edits made offline (or whose push never
+  // landed) survive a reload instead of being overwritten by the cloud copy.
+  function strHash(str) {
+    if (str == null) return "";
+    let h = 0x811c9dc5;                       // FNV-1a, 32-bit
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return `${str.length}:${(h >>> 0).toString(16)}`;
+  }
+  function snapshotHashes(snapshot) {
+    const out = {};
+    for (const k of SYNC_KEYS) out[k] = strHash(snapshot?.[k]);
+    return out;
+  }
+  function readSyncBase() {
+    try { return JSON.parse(localStorage.getItem(LS_SYNC_BASE) || "null"); } catch { return null; }
+  }
+  function writeSyncBase(snapshot, lastModified) {
+    try { localStorage.setItem(LS_SYNC_BASE, JSON.stringify({ lastModified, hashes: snapshotHashes(snapshot) })); } catch {}
+  }
+  // Union of two saved-deck libraries by id; the server's copy wins for an id
+  // present on both. Resurrecting a deck deleted elsewhere beats losing one.
+  function mergeLibraries(serverRaw, localRaw) {
+    try {
+      const server = JSON.parse(serverRaw || "[]");
+      const local  = JSON.parse(localRaw  || "[]");
+      const ids = new Set(server.map(d => d.id));
+      return JSON.stringify([...server, ...local.filter(d => !ids.has(d.id))]);
+    } catch {
+      return serverRaw;
+    }
+  }
+  // Returns { merged, conflicts } where conflicts lists keys changed on both
+  // sides that couldn't be merged (the server value is kept for those).
+  function mergeSnapshots(local, server, base) {
+    const merged = {}, conflicts = [];
+    for (const k of SYNC_KEYS) {
+      const l = local[k], sv = server?.[k];
+      let v;
+      if (!base) {
+        // First sync on this device: no record of what's shared, so take the
+        // cloud value where there is one and keep local-only keys.
+        v = sv !== undefined && sv !== null ? sv : l;
+        if (k === LS_LIBRARY && l && sv && l !== sv) v = mergeLibraries(sv, l);
+      } else {
+        const b = base.hashes?.[k] ?? "";
+        const localChanged  = strHash(l)  !== b;
+        const serverChanged = strHash(sv) !== b;
+        if (!localChanged)                 v = sv;
+        else if (!serverChanged || l === sv) v = l;
+        else if (k === LS_LIBRARY)         v = mergeLibraries(sv, l);
+        else { v = sv; conflicts.push(k); }
+      }
+      if (v !== undefined && v !== null) merged[k] = v;
+    }
+    return { merged, conflicts };
+  }
+
   function applySyncSnapshot(snapshot) {
     if (!snapshot || typeof snapshot !== "object") return 0;
     let changed = 0;
@@ -1429,9 +1497,10 @@
   }
 
   async function callGemini(apiKey, model, userText, systemText, maxTokens = 4096) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+    // Key in a header rather than the query string, so it stays out of URL logs.
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
     const r = await fetch(url, {
-      method: "POST", headers: { "Content-Type": "application/json" },
+      method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: systemText }] },
         contents: [{ role:"user", parts: [{ text: userText }] }],
@@ -3255,8 +3324,10 @@
     const [sharedQuota, setSharedQuota] = useState({
       hasHostKey: false, used: 0, cap: 20, remaining: 20, loaded: false,
     });
-    // Persist preference whenever it changes (also picked up by sync).
+    // Persist preference whenever it changes (also picked up by sync). Skipped
+    // until init has read the synced value, for the same reason as LS_PREFS.
     useEffect(() => {
+      if (!didInitRef.current) return;
       localStorage.setItem(LS_USE_SHARED, useSharedGemini ? "1" : "0");
     }, [useSharedGemini]);
     const tooltipTimer = useRef(null);
@@ -3335,16 +3406,25 @@
             return;
           }
           const data = await r.json();
+          let syncNote = null;
           if (data?.state) {
-            const changed = applySyncSnapshot(data.state);
-            if (changed > 0) {
-              // Existing localStorage has been overwritten — but the local-init
-              // effect below hasn't run yet because it's gated on cloudSync.status.
-            }
+            // Merge rather than overwrite — runs before the local-init effect
+            // below reads localStorage (it's gated on cloudSync.status).
+            const { merged, conflicts } = mergeSnapshots(readSyncSnapshot(), data.state, readSyncBase());
+            applySyncSnapshot(merged);
             syncRef.current.lastModified = data.lastModified || 0;
+            // The server copy is now the shared baseline; anything in `merged`
+            // that differs from it is a local change the push loop will send.
+            writeSyncBase(data.state, data.lastModified || 0);
+            syncRef.current.lastPushedHash = snapshotHash(data.state);
+            if (conflicts.length) {
+              syncNote = `Changed on this device and another one: ${conflicts.map(k => k.replace("cmdr_forge_", "")).join(", ")}. Kept the cloud version.`;
+            }
+          } else {
+            // Nothing in the cloud yet — the push loop uploads local data.
+            syncRef.current.lastPushedHash = "";
           }
-          syncRef.current.lastPushedHash = snapshotHash(readSyncSnapshot());
-          if (!cancelled) setCloudSync({ status: "ready", email: meResp.email, lastSync: Date.now(), error: null, pending: false });
+          if (!cancelled) setCloudSync({ status: "ready", email: meResp.email, lastSync: Date.now(), error: syncNote, pending: false });
 
           // Fetch quota info — tells us whether a host Gemini key is available
           // and how many shared builds the user has left for the day.
@@ -3424,9 +3504,9 @@
       setApiKeys(keys);
       setAKI(keys);
       setModels(mods);
-
-      // First-run: force the Settings panel until at least one key is saved.
-      if (!keys.groq && !keys.gemini) { setPhase("setup"); return; }
+      const savedShared = localStorage.getItem(LS_USE_SHARED);
+      const useShared   = savedShared === null ? true : savedShared === "1";
+      setUseSharedGemini(useShared);
 
       const savedCards   = localStorage.getItem(LS_CARDS);
       const savedBinders = localStorage.getItem(LS_BINDERS);
@@ -3443,12 +3523,16 @@
         } catch {}
       }
 
+      // A corrupt value (e.g. a bad synced blob) must not stop the app loading.
       if (savedBinders) {
-        const bg = JSON.parse(savedBinders);
-        setGroups(bg.groups); setDeckInc(bg.deckInc); setBinInc(bg.binInc);
+        try {
+          const bg = JSON.parse(savedBinders);
+          setGroups(bg.groups); setDeckInc(bg.deckInc); setBinInc(bg.binInc);
+        } catch {}
       }
-      if (savedCards)  setUsable(JSON.parse(savedCards));
-      if (savedCmdrs) {
+      let cardsOK = false;
+      if (savedCards) { try { setUsable(JSON.parse(savedCards)); cardsOK = true; } catch {} }
+      if (savedCmdrs) try {
         const c = JSON.parse(savedCmdrs);
         // Re-apply isCommander to the cached list — this scrubs tokens and any
         // other entries that older versions of the filter let through.
@@ -3458,7 +3542,7 @@
           // Persist the cleaned list so we don't filter again on next load.
           lsSetItemSafe(LS_COMMANDERS, JSON.stringify({ fp: c.fp, commanders: cleaned }));
         }
-      }
+      } catch {}
       const savedLib = localStorage.getItem(LS_LIBRARY);
       if (savedLib) { try { setLibrary(JSON.parse(savedLib)); } catch {} }
 
@@ -3474,7 +3558,14 @@
       const savedTok = localStorage.getItem(LS_ARCH_TOKEN);
       if (savedTok) setArchToken(savedTok);
 
-      if (savedCards) setPhase("ready"); else setPhase("import");
+      // First-run: force the Settings panel until the user has an AI source —
+      // their own key, or the shared host key (needs a signed-in user). Done
+      // AFTER loading everything above: returning early used to leave the
+      // library empty in memory, and the next save wiped the stored one.
+      const sharedPossible = useShared && !!cloudSync.email;
+      if (!keys.groq && !keys.gemini && !sharedPossible) { setPhase("setup"); return; }
+
+      setPhase(cardsOK ? "ready" : "import");
     }, [cloudSync.status]);   // re-runs once cloud-sync finishes (or fails)
 
     // ── Cloud sync: periodic push (debounced) ──────────────────────────────
@@ -3488,27 +3579,37 @@
       let cancelled = false;
 
       const pushNow = async (opts = {}) => {
+        // After a 409 every further push would conflict too; wait for reload.
+        if (syncRef.current.blocked) return;
         const snap = readSyncSnapshot();
         const hash = snapshotHash(snap);
         if (hash === syncRef.current.lastPushedHash && !opts.force) return;
+
+        const body = JSON.stringify({
+          state: snap,
+          expectedLastModified: syncRef.current.lastModified,
+        });
+        // A keepalive request over the browser's 64 KiB limit is rejected
+        // outright, so only use it when the payload fits; otherwise send a
+        // normal request and rely on the 5 s interval having caught most edits.
+        const keepalive = !!opts.keepalive && body.length <= KEEPALIVE_MAX_BYTES;
+        if (opts.keepalive && !keepalive) return;
 
         if (!cancelled) setCloudSync(s => ({ ...s, pending: true }));
         try {
           const r = await fetch("/api/state", {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              state: snap,
-              expectedLastModified: syncRef.current.lastModified,
-            }),
-            keepalive: !!opts.keepalive,
+            body,
+            keepalive,
           });
           if (r.status === 409) {
-            // Server has newer data. The cleanest recovery is to reload so the
-            // init effect re-pulls. Show an explanatory error in the meantime.
+            // Server has newer data. Stop pushing and reload to merge: local
+            // edits stay in localStorage and the load-time merge keeps them.
+            syncRef.current.blocked = true;
             if (!cancelled) setCloudSync(s => ({
               ...s, pending: false,
-              error: "Another device saved newer data — reload to merge.",
+              error: "Another device saved newer data — reload to merge (your changes here are kept).",
             }));
             return;
           }
@@ -3523,6 +3624,7 @@
           const data = await r.json();
           syncRef.current.lastModified   = data.lastModified || Date.now();
           syncRef.current.lastPushedHash = hash;
+          writeSyncBase(snap, syncRef.current.lastModified);
           if (!cancelled) setCloudSync(s => ({
             ...s, status: "active", lastSync: Date.now(),
             pending: false, error: null,
@@ -3535,12 +3637,14 @@
       const intervalId = setInterval(pushNow, SYNC_PUSH_INTERVAL_MS);
 
       // Best-effort flush on tab close. fetch with keepalive survives unload
-      // (where sendBeacon would, but sendBeacon only supports POST not PUT).
+      // (where sendBeacon would, but sendBeacon only supports POST not PUT);
+      // pushNow skips it when the payload is over the keepalive size limit.
       const flushOnExit = () => pushNow({ keepalive: true });
       window.addEventListener("beforeunload", flushOnExit);
       // Also flush when the tab becomes hidden — covers mobile background
-      // and tab-switch cases where beforeunload doesn't always fire.
-      const onVis = () => { if (document.visibilityState === "hidden") flushOnExit(); };
+      // and tab-switch cases where beforeunload doesn't always fire. The page
+      // is still alive here, so a normal request works at any size.
+      const onVis = () => { if (document.visibilityState === "hidden") pushNow(); };
       document.addEventListener("visibilitychange", onVis);
 
       return () => {
@@ -3551,9 +3655,12 @@
       };
     }, [cloudSync.status]);
 
-    // Persist build preferences whenever they change.
+    // Persist build preferences whenever they change. Skipped until the init
+    // effect has loaded the saved prefs — otherwise the mount-time run writes
+    // the defaults over them (and sync would push those defaults).
     useEffect(() => {
-      localStorage.setItem(LS_PREFS, JSON.stringify({ bracket, archetypes, budget, mech }));
+      if (!didInitRef.current) return;
+      lsSetItemSafe(LS_PREFS, JSON.stringify({ bracket, archetypes, budget, mech }));
     }, [bracket, archetypes, budget, mech]);
 
     // Reset scroll position when entering any top-level view. Opening a deck
@@ -3627,8 +3734,9 @@
         if (newKeys[other]) setProvider(other);
       }
       setError("");
-      const saved = localStorage.getItem(LS_CARDS);
-      if (saved) { setUsable(JSON.parse(saved)); setPhase("ready"); }
+      let saved = null;
+      try { saved = JSON.parse(localStorage.getItem(LS_CARDS) || "null"); } catch {}
+      if (saved) { setUsable(saved); setPhase("ready"); }
       else setPhase("import");
     };
 

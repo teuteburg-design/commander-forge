@@ -14,6 +14,16 @@ name = "commander-forge"
 main = "worker/index.js"
 compatibility_date = "2025-04-01"
 workers_dev = true
+# No per-version preview URLs: Cloudflare Access only protects the main
+# workers.dev hostname, so preview hostnames would be reachable without login.
+preview_urls = false
+
+# Cloudflare Access settings used to verify the login JWT in worker/index.js.
+# Not secrets: the team domain is public and the AUD tag only identifies the
+# Access application. Find both under Zero Trust → Access → Applications.
+[vars]
+ACCESS_TEAM_DOMAIN = "teuteburg.cloudflareaccess.com"
+ACCESS_AUD = "63358045d3d04354a0da9ec2fc6317340495671a73b8de5bbc6722f5b6d98442"
 
 [assets]
 directory = "./public"

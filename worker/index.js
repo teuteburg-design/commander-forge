@@ -13,11 +13,12 @@
 //   anything else        → fall through to ASSETS (static files in ./public)
 //
 // Auth:
-//   When Cloudflare Access is configured for this Worker's hostname, every
-//   request arrives with `Cf-Access-Authenticated-User-Email` and a verified
-//   JWT in `Cf-Access-Jwt-Assertion`. We trust the email header (Access has
-//   already verified the JWT at the edge) and use it as the KV key prefix.
-//   Until Access is configured, /api/me returns {authenticated:false} and the
+//   Cloudflare Access puts a signed JWT in `Cf-Access-Jwt-Assertion`. We
+//   verify its signature against the team's public keys and check `aud`,
+//   `iss` and expiry (ACCESS_TEAM_DOMAIN / ACCESS_AUD in wrangler.toml), then
+//   use the token's email claim as the KV key prefix. Headers alone are never
+//   trusted — a hostname Access doesn't cover would let anyone forge them.
+//   Without a valid token, /api/me returns {authenticated:false} and the
 //   client falls back to localStorage-only behaviour — the app keeps working.
 //
 // The proxy routes mirror what proxy.py does for local development. They exist
@@ -60,7 +61,7 @@ export default {
 
     // ── Identity + cloud-sync endpoints ─────────────────────────────────
     if (url.pathname === "/api/me") {
-      return handleMe(request);
+      return handleMe(request, env);
     }
     if (url.pathname === "/api/state") {
       if (request.method === "GET") return handleStateGet(request, env);
@@ -461,7 +462,7 @@ async function handlePreconRefresh(request, env, ctx) {
   if (!env.STATE) return jsonResponse({ error: "precon cache not configured" }, 503);
   // Anyone signed in can trigger a refresh. Anonymous callers get a 401 so we
   // don't expose an open trigger for an upstream-traffic-generator.
-  const email = authenticatedEmail(request);
+  const email = await authenticatedEmail(request, env);
   if (!email) return jsonResponse({ error: "not authenticated" }, 401);
   try {
     const report = await refreshPrecons(env, { reason: `manual:${email}`, force: true });
@@ -472,19 +473,74 @@ async function handlePreconRefresh(request, env, ctx) {
 }
 
 // ── Auth / identity ─────────────────────────────────────────────────────
-// We trust the email header iff there's ALSO a JWT assertion present —
-// the JWT is set by Cloudflare Access at the edge and can't be spoofed by
-// upstream proxies. If neither is set, the user simply isn't signed in
-// (or Access isn't configured yet).
-function authenticatedEmail(request) {
-  const jwt   = request.headers.get("Cf-Access-Jwt-Assertion");
-  const email = request.headers.get("Cf-Access-Authenticated-User-Email");
-  if (jwt && email) return email.toLowerCase();
-  return null;
+// Returns the signed-in user's email from a verified Cloudflare Access JWT,
+// or null. The Access headers are plain request headers: on any hostname
+// Access doesn't sit in front of (preview URLs, a custom domain) a client can
+// set them to anything, so only a valid signature from our Access team, for
+// our application (`aud`), counts. Fails closed if the vars aren't set.
+async function authenticatedEmail(request, env) {
+  const token = request.headers.get("Cf-Access-Jwt-Assertion");
+  if (!token || !env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUD) return null;
+  try {
+    const payload = await verifyAccessJwt(token, env);
+    return typeof payload?.email === "string" ? payload.email.toLowerCase() : null;
+  } catch {
+    return null;
+  }
 }
 
-function handleMe(request) {
-  const email = authenticatedEmail(request);
+// Access signing keys, cached per isolate. Access rotates keys every few
+// weeks and publishes the next one in advance; an unknown `kid` triggers a
+// refetch (rate-limited) so rotation never locks users out.
+const ACCESS_CERTS_TTL_MS = 60 * 60 * 1000;
+let accessCerts = { keys: [], fetchedAt: 0 };
+
+async function accessSigningKey(env, kid) {
+  const stale = Date.now() - accessCerts.fetchedAt > ACCESS_CERTS_TTL_MS;
+  let jwk = accessCerts.keys.find(k => k.kid === kid);
+  if (!jwk && (stale || Date.now() - accessCerts.fetchedAt > 60 * 1000)) {
+    const r = await fetch(`https://${env.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/certs`);
+    if (!r.ok) throw new Error(`Access certs HTTP ${r.status}`);
+    const data = await r.json();
+    accessCerts = { keys: data.keys || [], fetchedAt: Date.now() };
+    jwk = accessCerts.keys.find(k => k.kid === kid);
+  }
+  if (!jwk) throw new Error("unknown signing key");
+  return crypto.subtle.importKey(
+    "jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"],
+  );
+}
+
+function base64UrlToBytes(str) {
+  const b64 = str.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(str.length / 4) * 4, "=");
+  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+}
+
+async function verifyAccessJwt(token, env) {
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Error("malformed JWT");
+  const [h, p, sig] = parts;
+  const header  = JSON.parse(new TextDecoder().decode(base64UrlToBytes(h)));
+  const payload = JSON.parse(new TextDecoder().decode(base64UrlToBytes(p)));
+  if (header.alg !== "RS256") throw new Error("unexpected alg");
+
+  const key = await accessSigningKey(env, header.kid);
+  const ok = await crypto.subtle.verify(
+    "RSASSA-PKCS1-v1_5", key, base64UrlToBytes(sig), new TextEncoder().encode(`${h}.${p}`),
+  );
+  if (!ok) throw new Error("bad signature");
+
+  const now = Math.floor(Date.now() / 1000);
+  const aud = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+  if (!aud.includes(env.ACCESS_AUD))                            throw new Error("wrong aud");
+  if (payload.iss !== `https://${env.ACCESS_TEAM_DOMAIN}`)      throw new Error("wrong iss");
+  if (typeof payload.exp !== "number" || payload.exp < now - 60) throw new Error("expired");
+  if (typeof payload.nbf === "number" && payload.nbf > now + 60) throw new Error("not yet valid");
+  return payload;
+}
+
+async function handleMe(request, env) {
+  const email = await authenticatedEmail(request, env);
   if (!email) return jsonResponse({ authenticated: false });
   return jsonResponse({ authenticated: true, email });
 }
@@ -505,8 +561,19 @@ const KV_USER_PREFIX = "user:";
 // per-section KV entries is the next move.
 const MAX_STATE_BYTES = 10 * 1024 * 1024;   // 10 MiB hard cap per user
 
+// Keys that must never live in KV. Older clients synced the Archidekt
+// username + plaintext password; strip it on read and on write so existing
+// blobs are cleaned up by the next push.
+const UNSYNCED_STATE_KEYS = ["cmdr_forge_archidekt_creds"];
+function stripUnsyncedKeys(state) {
+  if (!state || typeof state !== "object") return state;
+  const out = { ...state };
+  for (const k of UNSYNCED_STATE_KEYS) delete out[k];
+  return out;
+}
+
 async function handleStateGet(request, env) {
-  const email = authenticatedEmail(request);
+  const email = await authenticatedEmail(request, env);
   if (!email) return jsonResponse({ error: "not authenticated" }, 401);
   if (!env.STATE) return jsonResponse({ error: "sync not configured (no KV binding)" }, 503);
 
@@ -517,7 +584,7 @@ async function handleStateGet(request, env) {
   try {
     const parsed = JSON.parse(raw);
     return jsonResponse({
-      state:        parsed.state || null,
+      state:        stripUnsyncedKeys(parsed.state) || null,
       lastModified: parsed.lastModified || 0,
     });
   } catch {
@@ -526,7 +593,7 @@ async function handleStateGet(request, env) {
 }
 
 async function handleStatePut(request, env) {
-  const email = authenticatedEmail(request);
+  const email = await authenticatedEmail(request, env);
   if (!email) return jsonResponse({ error: "not authenticated" }, 401);
   if (!env.STATE) return jsonResponse({ error: "sync not configured (no KV binding)" }, 503);
 
@@ -534,7 +601,7 @@ async function handleStatePut(request, env) {
   try { body = await request.json(); }
   catch { return jsonResponse({ error: "request body must be JSON" }, 400); }
 
-  const state = body?.state;
+  const state = stripUnsyncedKeys(body?.state);
   if (!state || typeof state !== "object") {
     return jsonResponse({ error: "missing or invalid `state` object" }, 400);
   }
@@ -642,6 +709,12 @@ async function handleProxy(request, prefix, target) {
 // 25-hour TTL so yesterday's keys self-clean.
 const SHARED_GEMINI_DAILY_CAP = 20;
 const SHARED_GEMINI_DEFAULT_MODEL = "gemini-3.8-flash";
+// The host pays for these calls, so only Flash-class models are allowed;
+// anything else (e.g. a Pro model picked in Settings) uses the default.
+const SHARED_GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"];
+// Deck-build prompts are ~20-30K chars; this leaves headroom while stopping
+// someone from pushing huge inputs through the host's key.
+const SHARED_GEMINI_MAX_INPUT_CHARS = 120000;
 const QUOTA_KEY_PREFIX = "quota:";
 
 function quotaKey(email) {
@@ -666,7 +739,7 @@ async function bumpUsage(env, email, current) {
 }
 
 async function handleQuota(request, env) {
-  const email = authenticatedEmail(request);
+  const email = await authenticatedEmail(request, env);
   if (!email) return jsonResponse({ error: "not authenticated" }, 401);
   const used = await readUsage(env, email);
   return jsonResponse({
@@ -695,7 +768,7 @@ function geminiGenerationConfig(model, maxTokens) {
 }
 
 async function handleSharedGemini(request, env) {
-  const email = authenticatedEmail(request);
+  const email = await authenticatedEmail(request, env);
   if (!email) return jsonResponse({ error: "not authenticated" }, 401);
   if (!env.GEMINI_API_KEY) {
     return jsonResponse({ error: "Host Gemini key not configured. Paste your own key in Settings." }, 503);
@@ -711,7 +784,7 @@ async function handleSharedGemini(request, env) {
     return jsonResponse({
       error: "Daily shared-key cap reached",
       used, cap: SHARED_GEMINI_DAILY_CAP, remaining: 0,
-      resetAtUTC: new Date(Date.now() + 25 * 60 * 60 * 1000).toISOString().slice(0, 10),
+      resetAtUTC: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10),   // next UTC day
     }, 429);
   }
 
@@ -722,17 +795,29 @@ async function handleSharedGemini(request, env) {
   const system     = (body.system || "").toString();
   const user       = (body.user   || "").toString();
   const max_tokens = Math.min(parseInt(body.max_tokens) || 4096, 24576);
-  const model      = (body.model || SHARED_GEMINI_DEFAULT_MODEL).toString();
+  const requested  = (body.model || "").toString();
+  const model      = SHARED_GEMINI_MODELS.includes(requested) ? requested : SHARED_GEMINI_DEFAULT_MODEL;
 
   if (!user) return jsonResponse({ error: "missing 'user' field" }, 400);
+  if (system.length + user.length > SHARED_GEMINI_MAX_INPUT_CHARS) {
+    return jsonResponse({ error: "Prompt too large for the shared key." }, 413);
+  }
+
+  // Count the request BEFORE calling upstream and refund it on failure. KV has
+  // no atomic increment, so parallel requests can still slip a few past the
+  // cap, but this closes the window to the KV round-trip instead of the whole
+  // (multi-second) Gemini call.
+  await bumpUsage(env, email, used);
+  const refund = () => env.STATE.put(quotaKey(email), String(used), { expirationTtl: 25 * 60 * 60 });
 
   // Forward to Gemini using the host's key.
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${env.GEMINI_API_KEY}`;
+  // Key goes in a header, not the query string, so it can't end up in URL logs.
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
   let r;
   try {
     r = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: system }] },
         contents: [{ role: "user", parts: [{ text: user }] }],
@@ -740,6 +825,7 @@ async function handleSharedGemini(request, env) {
       }),
     });
   } catch (e) {
+    await refund();
     return jsonResponse({
       error: `Gemini fetch failed: ${(e?.message || String(e)).slice(0, 200)}`,
     }, 502);
@@ -747,18 +833,18 @@ async function handleSharedGemini(request, env) {
 
   let data;
   try { data = await r.json(); }
-  catch { return jsonResponse({ error: "Gemini returned non-JSON" }, 502); }
+  catch { await refund(); return jsonResponse({ error: "Gemini returned non-JSON" }, 502); }
 
   if (!r.ok) {
-    // Don't increment usage — the user didn't actually consume a successful build.
+    // Refund — the user didn't actually consume a successful build.
+    await refund();
     return jsonResponse({
       error: data.error?.message || `Gemini error ${r.status}`,
     }, r.status);
   }
 
-  // Success — increment counter and shape response to match client's expected
-  // contract (matches the shape callGemini() returns when called directly).
-  await bumpUsage(env, email, used);
+  // Success — shape response to match client's expected contract (matches the
+  // shape callGemini() returns when called directly). Usage was counted above.
 
   const cand = data.candidates?.[0] || {};
   return jsonResponse({
