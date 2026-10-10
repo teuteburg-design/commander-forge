@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.10-f";
+  const APP_VERSION = "v2026.10.10-g";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -3152,6 +3152,10 @@
     const [deckDeleteAsk,  setDeckDeleteAsk]  = useState(null);   // name of the Collection deck pending deletion
     const [showAlmostCombos, setShowAlmostCombos] = useState(false);
     const [swapState,      setSwapState]      = useState(null);   // { key, status, swaps, ownedElsewhere, error }
+    const [edhOpen,        setEdhOpen]        = useState(false);  // EDHRec top-cards panel (collapsed by default)
+    const [edhExpanded,    setEdhExpanded]    = useState({});     // EDHRec group id → show all instead of the top 10
+    const [edhLive,        setEdhLive]        = useState(null);   // { cmdr, status, list, error }
+    const edhCacheRef = useRef({});   // commander name → fetchEDHRec promise, shared by swaps + top cards
     const [pickChecked,    setPickChecked]    = useState(() => new Set());
     const [pickHideDone,   setPickHideDone]   = useState(false);
     const [addToDeckQuery, setAddToDeckQuery] = useState("");
@@ -4915,11 +4919,35 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // card in the deck that fills the same role. Respects the deck's colour
     // identity, EDH legality, the per-card budget limit used at build time,
     // and never cuts the commander or pieces of a combo the deck already has.
+    // One EDHRec fetch per commander per session; a failed fetch is retried.
+    const getEdhrec = (sel) => {
+      const k = sel.card.name;
+      if (!edhCacheRef.current[k]) {
+        edhCacheRef.current[k] = fetchEDHRec(sel.card.scryfall || sel.card.name)
+          .then(r => { if (r.status !== "ok") delete edhCacheRef.current[k]; return r; })
+          .catch(e => { delete edhCacheRef.current[k]; throw e; });
+      }
+      return edhCacheRef.current[k];
+    };
+
+    const loadEdhTop = async () => {
+      const cmdr = selCmd.card.name;
+      if (edhLive?.cmdr === cmdr && (edhLive.status === "done" || edhLive.status === "loading")) return;
+      setEdhLive({ cmdr, status: "loading" });
+      try {
+        const res = await getEdhrec(selCmd);
+        if (res.status !== "ok") throw new Error(res.status === "network" ? "EDHRec couldn't be reached" : "EDHRec has no data for this commander");
+        setEdhLive({ cmdr, status: "done", list: res.suggestions });
+      } catch (e) {
+        setEdhLive({ cmdr, status: "error", error: e.message || String(e) });
+      }
+    };
+
     const findSwaps = async () => {
       const key = `${selCmd.card.name}|${deck.theme}`;
       setSwapState({ key, status: "loading" });
       try {
-        const res = await fetchEDHRec(selCmd.card.scryfall || selCmd.card.name);
+        const res = await getEdhrec(selCmd);
         if (res.status !== "ok") throw new Error(res.status === "network" ? "EDHRec couldn't be reached" : "EDHRec has no data for this commander");
         const edh   = new Map(res.suggestions.map(e => [normCardName(e.name), e]));
         const score = n => { const e = edh.get(normCardName(n)); return e ? (e.pct || 0) + (e.synergy || 0) / 2 : 0; };
@@ -10918,61 +10946,103 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 </div>
               `}
 
-              ${showInsights && deck.edhrecSuggestions && deck.edhrecSuggestions.length > 0 && html`
-                <div style=${{ background:"var(--info-bg)", border:"1px solid var(--info-border)", borderRadius:10,
-                  padding:"14px 18px", marginBottom:18 }}>
-                  <div style=${{ display:"flex", alignItems:"baseline", gap:10, marginBottom:8, flexWrap:"wrap" }}>
-                    <div style=${{ fontSize:11, letterSpacing:3, color:"var(--info)", textTransform:"uppercase", fontWeight:700 }}>
-                      🌐 EDHRec — Cards to Acquire
+              ${showInsights && !previewingPrecon && (() => {
+                // EDHRec's most-played cards for this commander, split by what
+                // the user can do about them. Uses the live EDHRec list once
+                // opened; until then (or if EDHRec fails) the list saved at
+                // build time, which only holds cards outside the build pool.
+                const cmdrShort = selCmd.card.name.split(",")[0];
+                const live = edhLive?.cmdr === selCmd.card.name && edhLive.status === "done" ? edhLive.list : null;
+                const source = live || deck.edhrecSuggestions || [];
+                const own = deckOwnership();
+                const inDeck = new Set([selCmd.card.name, ...deck.categories.flatMap(c => c.cards.map(x => x.name))].map(normCardName));
+                const rank = e => (e.pct || 0) + (e.synergy || 0) / 2;
+                const top = [...source]
+                  .filter(e => !BASIC_NAMES.has(e.name) && !inDeck.has(normCardName(e.name)))
+                  .sort((a, b) => rank(b) - rank(a))
+                  .slice(0, 45);
+                const groupsOf = { available: [], elsewhere: [], missing: [] };
+                for (const e of top) {
+                  const rec = own.get(normCardName(e.name));
+                  if (!rec) groupsOf.missing.push({ e });
+                  else if (rec.available) groupsOf.available.push({ e, rec });
+                  else groupsOf.elsewhere.push({ e, rec });
+                }
+                const stat = e => [
+                  e.pct ? `${Math.round(e.pct * 100)}%` : (e.inclusion ? `${e.inclusion} decks` : null),
+                  e.synergy ? `★${e.synergy > 0 ? "+" : ""}${Math.round(e.synergy * 100)}%` : null,
+                ].filter(Boolean).join(" · ");
+                const chip = (item, note) => html`
+                  <a key=${item.e.name} href=${"https://scryfall.com/search?q=" + encodeURIComponent('!"' + item.e.name + '"')}
+                    target="_blank" rel="noopener"
+                    title=${note || ""}
+                    style=${{ display:"inline-flex", alignItems:"center", gap:5, padding:"4px 10px", borderRadius:14,
+                      background:"var(--bg-surface)", border:"1px solid var(--info-border)", color:"var(--info)",
+                      fontSize:11, fontWeight:600, textDecoration:"none" }}>
+                    <span>${item.e.name}</span>
+                    ${stat(item.e) && html`<span style=${{ fontSize:9, fontWeight:700, opacity:0.8 }}>${stat(item.e)}</span>`}
+                    ${note && html`<span style=${{ fontSize:9, fontWeight:400, color:"var(--fg-text-muted)" }}>${note}</span>`}
+                  </a>`;
+                const EDH_GROUP_LIMIT = 10;
+                const group = (id, title, hint, items, noteOf) => {
+                  const limit = edhExpanded[id] ? Infinity : EDH_GROUP_LIMIT;
+                  const onMore = () => setEdhExpanded(x => ({ ...x, [id]: true }));
+                  return items.length > 0 && html`
+                  <div style=${{ marginTop:12 }}>
+                    <div style=${{ fontSize:12, fontWeight:700, color:"var(--fg-text-heading)", marginBottom:2 }}>${title} · ${items.length}</div>
+                    <div style=${{ fontSize:11, color:"var(--fg-text-muted)", marginBottom:6 }}>${hint}</div>
+                    <div style=${{ display:"flex", gap:6, flexWrap:"wrap", alignItems:"center" }}>
+                      ${items.slice(0, limit).map(it => chip(it, noteOf && noteOf(it)))}
+                      ${items.length > limit && html`<button onClick=${onMore}
+                        title=${`Show all ${items.length}`}
+                        style=${{ all:"unset", cursor:"pointer", fontSize:11, fontWeight:600, color:"var(--info)", textDecoration:"underline" }}>
+                        +${items.length - limit} more</button>`}
                     </div>
-                    <div style=${{ fontSize:11, color:"var(--info)" }}>
-                      Top synergy cards for ${selCmd.card.name} not yet in your collection
-                    </div>
+                  </div>`;
+                };
+                const elsewhereNote = it => {
+                  const d = it.rec.where.find(w => w.kind === "deck" && !w.included);
+                  if (d) return `in "${d.name}"`;
+                  const b = it.rec.where.find(w => w.kind === "binder");
+                  return b ? `binder "${b.name}" excluded` : "";
+                };
+                const total = top.length;
+                return html`
+                  <div style=${{ background:"var(--info-bg)", border:"1px solid var(--info-border)", borderRadius:10,
+                    padding:"12px 18px", marginBottom:18 }}>
+                    <button onClick=${() => { const next = !edhOpen; setEdhOpen(next); if (next) loadEdhTop(); }}
+                      aria-expanded=${edhOpen}
+                      style=${{ all:"unset", cursor:"pointer", display:"flex", alignItems:"center", gap:8, width:"100%" }}>
+                      <span style=${{ color:"var(--info)" }}>${edhOpen ? "▾" : "▸"}</span>
+                      <span style=${{ fontSize:11, letterSpacing:3, color:"var(--info)", textTransform:"uppercase", fontWeight:700 }}>
+                        🌐 EDHRec — popular ${cmdrShort} cards not in this deck
+                      </span>
+                      <span style=${{ marginLeft:"auto", fontSize:11, color:"var(--info)" }}>
+                        ${edhOpen ? "hide" : live ? `${total} cards · show` : "show"}
+                      </span>
+                    </button>
+                    ${edhOpen && html`
+                      ${edhLive?.cmdr === selCmd.card.name && edhLive.status === "loading" && html`
+                        <div style=${{ fontSize:12, color:"var(--info)", marginTop:10 }}>Loading EDHRec data…</div>`}
+                      ${edhLive?.cmdr === selCmd.card.name && edhLive.status === "error" && html`
+                        <div style=${{ fontSize:12, color:"var(--danger-text)", marginTop:10 }}>
+                          ${edhLive.error}.${source.length ? " Showing the list saved when the deck was built." : ""}
+                        </div>`}
+                      ${group("available", "✅ You own these — available, not in this deck",
+                        "Good candidates to swap in — see Swap suggestions above.", groupsOf.available)}
+                      ${group("elsewhere", "📦 You own these — already in use",
+                        "In another built deck or an excluded binder.", groupsOf.elsewhere, elsewhereNote)}
+                      ${group("missing", "🛒 You don't own these",
+                        "Worth picking up for this deck.", groupsOf.missing)}
+                      ${total === 0 && !(edhLive?.status === "loading") && html`
+                        <div style=${{ fontSize:12, color:"var(--fg-text-body)", marginTop:10 }}>Nothing to show — the deck already runs EDHRec's top cards.</div>`}
+                      <div style=${{ fontSize:11, color:"var(--info)", fontStyle:"italic", marginTop:12 }}>
+                        Top ${total} by how often EDHRec decks with ${cmdrShort} play them (%) and synergy (★ = how much more than in other decks). Click a card to view it on Scryfall.
+                      </div>
+                    `}
                   </div>
-                  ${(() => {
-                    // Built against the build pool only, so cards sitting in a
-                    // reserved deck or excluded binder slipped in. Split them out.
-                    const own = deckOwnership();
-                    const owned = deck.edhrecSuggestions.filter(c => own.has(normCardName(c.name)));
-                    if (!owned.length) return null;
-                    return html`<div style=${{ fontSize:11, color:"var(--info)", marginBottom:8, lineHeight:1.6 }}>
-                      Already in your collection: ${owned.map((c, i) => html`${i ? " · " : ""}<strong>${c.name}</strong> (${ownedWhere(own.get(normCardName(c.name)))})`)}
-                    </div>`;
-                  })()}
-                  <div style=${{ display:"flex", gap:6, flexWrap:"wrap" }}>
-                    ${(() => { const own = deckOwnership(); return deck.edhrecSuggestions.filter(c => !own.has(normCardName(c.name))); })().map((c, i) => html`
-                      <a key=${i}
-                        href=${"https://scryfall.com/search?q=" + encodeURIComponent(c.name)}
-                        target="_blank" rel="noopener"
-                        style=${{
-                          display:"inline-flex", alignItems:"center", gap:5,
-                          padding:"5px 11px", borderRadius:16,
-                          background:"var(--bg-surface)", border:"1px solid var(--info-border)",
-                          color:"var(--info)", fontSize:11, fontWeight:600,
-                          textDecoration:"none", transition:"all .15s",
-                          boxShadow:"0 1px 3px rgba(26,80,128,0.08)",
-                        }}
-                        onMouseOver=${e => { e.currentTarget.style.background="var(--info-bg)"; e.currentTarget.style.borderColor="var(--info)"; }}
-                        onMouseOut=${e  => { e.currentTarget.style.background="var(--bg-surface)";    e.currentTarget.style.borderColor="var(--info-border)"; }}>
-                        <span>${c.name}</span>
-                        ${c.synergy !== 0 && html`
-                          <span style=${{ fontSize:9, color:"var(--info)", letterSpacing:0.3, fontWeight:700 }}>
-                            ★${(c.synergy * 100).toFixed(0)}%
-                          </span>
-                        `}
-                        ${c.inclusion > 0 && html`
-                          <span style=${{ fontSize:9, color:"var(--info-border)" }} title="Number of public EDHRec decks running this card with this commander">
-                            in ${c.inclusion.toLocaleString()} decks
-                          </span>
-                        `}
-                      </a>
-                    `)}
-                  </div>
-                  <div style=${{ fontSize:10, color:"var(--info)", fontStyle:"italic", marginTop:10 }}>
-                    ★ = synergy score vs average decks · "in N decks" = how many EDHRec decks with this commander run the card. Click any card to view on Scryfall.
-                  </div>
-                </div>
-              `}
+                `;
+              })()}
 
               ${showInsights && deck.combosHave && deck.combosHave.length > 0 && html`
                 <div style=${{ background:"var(--bg-surface-soft)", border:"1px solid #d8a060", borderRadius:10,
