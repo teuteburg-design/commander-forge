@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.10-i";
+  const APP_VERSION = "v2026.10.10-j";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -2769,6 +2769,52 @@
     return hits.filter((h, i) => !hits.slice(0, i).some(l => normCardName(l.name).includes(normCardName(h.name))));
   }
 
+  // In-app dialog used by appConfirm / appAlert / appPrompt. `dialog` is
+  // { kind: "confirm"|"alert"|"prompt", title, body, label, value, okLabel,
+  //   cancelLabel, danger }; onClose receives true/false, or the text for prompts.
+  function AppDialog({ dialog, onClose }) {
+    const [value, setValue] = useState(dialog.value || "");
+    const inputRef = useRef(null);
+    const okRef = useRef(null);
+    useEffect(() => {
+      (dialog.kind === "prompt" ? inputRef.current : okRef.current)?.focus();
+      if (dialog.kind === "prompt") inputRef.current?.select();
+    }, []);
+    const cancel = () => onClose(dialog.kind === "prompt" ? null : false);
+    const ok = () => onClose(dialog.kind === "prompt" ? value : true);
+    const onKey = e => {
+      if (e.key === "Escape") { e.preventDefault(); dialog.kind === "alert" ? ok() : cancel(); }
+      if (e.key === "Enter" && dialog.kind === "prompt") { e.preventDefault(); ok(); }
+    };
+    return html`
+      <div onClick=${dialog.kind === "alert" ? ok : cancel} onKeyDown=${onKey}
+        style=${{ position:"fixed", inset:0, background:"rgba(20,10,0,0.45)", display:"flex",
+          alignItems:"flex-start", justifyContent:"center", paddingTop:"14vh", zIndex:10000 }}>
+        <div onClick=${e => e.stopPropagation()} role=${dialog.kind === "alert" ? "alertdialog" : "dialog"}
+          aria-modal="true" aria-label=${dialog.title || "Message"}
+          style=${{ background:"var(--bg-surface-softer)", border:"1px solid var(--border)", borderRadius:12,
+            width:"min(480px, 94vw)", padding:"18px 20px", boxShadow:"0 8px 32px rgba(0,0,0,0.35)" }}>
+          ${dialog.title && html`<div style=${{ fontSize:16, fontWeight:700, color:"var(--fg-text-heading)", marginBottom:10 }}>${dialog.title}</div>`}
+          ${dialog.body && html`<div style=${{ fontSize:13, color:"var(--fg-text-body)", lineHeight:1.6, marginBottom:14 }}>${dialog.body}</div>`}
+          ${dialog.kind === "prompt" && html`
+            <label style=${{ display:"block", marginBottom:14 }}>
+              ${dialog.label && html`<span style=${{ ...label, marginBottom:6 }}>${dialog.label}</span>`}
+              <input ref=${inputRef} value=${value} onInput=${e => setValue(e.target.value)} style=${inp} />
+            </label>`}
+          <div style=${{ display:"flex", gap:8, justifyContent:"flex-end", flexWrap:"wrap" }}>
+            ${dialog.kind !== "alert" && html`<button onClick=${cancel}
+              style=${{ ...btnSec, padding:"8px 16px", fontSize:13 }}>${dialog.cancelLabel || "Cancel"}</button>`}
+            <button ref=${okRef} onClick=${ok}
+              style=${dialog.danger
+                ? { ...btnSec, padding:"8px 16px", fontSize:13, color:"var(--danger-text)", borderColor:"var(--danger-border)" }
+                : { ...btn, padding:"8px 18px", fontSize:13 }}>
+              ${dialog.okLabel || "OK"}
+            </button>
+          </div>
+        </div>
+      </div>`;
+  }
+
   // Card-condition scale — mirrors Cardmarket's 7-tier ladder
   // (M, NM, EX, GD, LP, PL, PO). The colors are our own green→red gradient
   // used to stand in for an icon set; not a copy of any third-party glyphs.
@@ -3150,6 +3196,16 @@
     const [addToDeckOpen,  setAddToDeckOpen]  = useState(false);
     const [pickListOpen,   setPickListOpen]   = useState(false);
     const [deckDeleteAsk,  setDeckDeleteAsk]  = useState(null);   // name of the Collection deck pending deletion
+    // In-app replacement for window.confirm / alert / prompt, so dialogs
+    // match the app instead of showing the browser's "<site> says" box.
+    // Each helper returns a Promise: confirm → boolean, prompt → string|null.
+    const [appDialog,      setAppDialog]      = useState(null);
+    const dialogSeq = useRef(0);
+    const openDialog = opts => new Promise(resolve => setAppDialog({ ...opts, resolve, id: ++dialogSeq.current }));
+    const appConfirm = opts => openDialog({ kind: "confirm", ...opts });
+    const appAlert   = opts => openDialog({ kind: "alert", ...(typeof opts === "string" ? { body: opts } : opts) });
+    const appPrompt  = opts => openDialog({ kind: "prompt", ...opts });
+    const closeDialog = result => { appDialog?.resolve(result); setAppDialog(null); };
     const [showAlmostCombos, setShowAlmostCombos] = useState(false);
     const [swapOpen,       setSwapOpen]       = useState(false);  // swap suggestions panel (collapsed by default)
     const [gapsOpen,       setGapsOpen]       = useState(false);  // collection gaps panel (collapsed by default)
@@ -5416,7 +5472,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     //   - Sets deckInc[title]=false so the deck is excluded from the eligible
     //     pool by default (the cards are reserved). User can toggle ON later
     //     to release them.
-    const saveDeckToCollection = () => {
+    const saveDeckToCollection = async () => {
       const basics    = new Set([...Object.values(BASIC_LAND), "Wastes"]);
       const cmdrName  = selCmd?.card?.name || "Commander";
       const themePart = (deck?.theme || "").trim();
@@ -5475,17 +5531,19 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         bin.cards = bin.cards.filter(c => (c.qty || 0) > 0);   // trim emptied rows
       }
 
-      const ownedNote = notOwned.length
-        ? `\n\n${notOwned.length} card${notOwned.length > 1 ? "s aren't" : " isn't"} in your binders, so nothing is removed for ${notOwned.length > 1 ? "them" : "it"}: ${notOwned.slice(0, 8).join(", ")}${notOwned.length > 8 ? ", …" : ""}.`
-        : "";
-      if (!window.confirm(
-        `Mark this deck as built?\n\n` +
-        `${reserved} card${reserved === 1 ? "" : "s"} (commander included) will be taken out of your binders, ` +
-        `so they won't be suggested for other decks. Basic lands aren't counted.\n\n` +
-        `The deck moves to Collection → Decks as "${title}"` +
-        `${libSaved && libEntryId != null ? " and out of the Library" : ""}. ` +
-        `Deleting it later lets you put the cards back into your binders.` + ownedNote
-      )) return;
+      const fromLibrary = libSaved && libEntryId != null;
+      const ok = await appConfirm({
+        title: "Mark this deck as built?",
+        body: html`
+          <p style=${{ margin:"0 0 10px" }}><strong>${reserved} card${reserved === 1 ? "" : "s"}</strong> (commander included) will be taken out of your binders, so they won't be suggested for other decks. Basic lands aren't counted.</p>
+          <p style=${{ margin:"0 0 10px" }}>The deck moves to <strong>Collection → Decks</strong> as "${title}"${fromLibrary ? " and out of the Library" : ""}.</p>
+          ${notOwned.length > 0 && html`<p style=${{ margin:"0 0 10px" }}>
+            ${notOwned.length} card${notOwned.length > 1 ? "s aren't" : " isn't"} in your binders, so nothing is taken out for ${notOwned.length > 1 ? "them" : "it"}:
+            <span style=${{ color:"var(--fg-text-muted)" }}> ${notOwned.slice(0, 8).join(", ")}${notOwned.length > 8 ? ", …" : ""}</span></p>`}
+          <p style=${{ margin:0, fontSize:12, color:"var(--fg-text-muted)" }}>Deleting the deck later lets you put the cards back into your binders.</p>`,
+        okLabel: "📦 Mark as built",
+      });
+      if (!ok) return;
 
       // The deck's theme doubles as its Collection key everywhere (add /
       // remove / swap cards, rename, delete), so it must match the entry name.
@@ -6158,7 +6216,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       const raw = (deckCreateName || "").trim();
       if (!raw) return;
       if (deckCreateFormat === "commander" && !deckCmdrPicked) {
-        alert("Pick a commander, or change the format.");
+        appAlert("Pick a commander, or change the format.");
         return;
       }
       const name = uniqueName(raw, (groups.decks || []).map(d => d.name));
@@ -6196,7 +6254,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       const trimmed = (rawNewName || "").trim();
       if (!trimmed || trimmed === oldName) return false;
       if ((groups.binders || []).some(b => b.name === trimmed)) {
-        alert(`A binder named "${trimmed}" already exists.`);
+        appAlert({ title: "Name already taken", body: `A binder named "${trimmed}" already exists.` });
         return false;
       }
       const nextBinders = (groups.binders || []).map(b => b.name === oldName ? { ...b, name: trimmed } : b);
@@ -6221,9 +6279,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // Legacy entry point — still used by any Collection-view callers; routes
     // through inline rename when the binder is currently open, falls back to
     // a prompt otherwise.
-    const renameBinder = (oldName) => {
+    const renameBinder = async (oldName) => {
       if (viewingBinder === oldName) { startBinderRename(); return; }
-      const raw = window.prompt("New name for this binder:", oldName);
+      const raw = await appPrompt({ title: "Rename binder", label: "New name", value: oldName, okLabel: "Rename" });
       if (raw) applyBinderRename(oldName, raw);
     };
 
@@ -6235,7 +6293,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       const trimmed = (rawNewName || "").trim();
       if (!trimmed || trimmed === oldName) return false;
       if ((groups.decks || []).some(d => d.name === trimmed)) {
-        alert(`A deck named "${trimmed}" already exists.`);
+        appAlert({ title: "Name already taken", body: `A deck named "${trimmed}" already exists.` });
         return false;
       }
       const nextDecks = (groups.decks || []).map(d =>
@@ -6250,8 +6308,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       return true;
     };
 
-    const renameDeck = (oldName) => {
-      const raw = window.prompt("New name for this deck:", oldName);
+    const renameDeck = async (oldName) => {
+      const raw = await appPrompt({ title: "Rename deck", label: "New name", value: oldName, okLabel: "Rename" });
       if (raw) applyDeckRename(oldName, raw);
     };
 
@@ -6260,12 +6318,12 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // selected by the user is treated as a normal merge target.
     const UNCATEGORISED = "Uncategorised";
 
-    const deleteBinder = (name) => {
+    const deleteBinder = async (name) => {
       const binder = (groups.binders || []).find(b => b.name === name);
       if (!binder) return;
       const cardCount = (binder.cards || []).reduce((s, c) => s + (c.qty || 1), 0);
       if (cardCount === 0) {
-        if (!window.confirm(`Delete empty binder "${name}"?`)) return;
+        if (!(await appConfirm({ title: `Delete empty binder "${name}"?`, okLabel: "🗑 Delete", danger: true }))) return;
         const nextBinders = (groups.binders || []).filter(b => b.name !== name);
         const nextGroups = { ...groups, binders: nextBinders };
         const nextBinInc = { ...binInc }; delete nextBinInc[name];
@@ -6703,7 +6761,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         return openLeanDeck(d, "collection");
       }
       if (!(d.cards || []).length && !d.deckData) {
-        alert(`"${d.name}" is empty — add cards via the Build flow or import a CSV first.`);
+        appAlert({ title: "This deck is empty", body: `"${d.name}" has no cards yet — add cards via the Build flow or import a CSV first.` });
         return;
       }
       // Everything else — including already-enriched imported decks — routes
@@ -12246,6 +12304,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       })()}
 
       <!-- ── Add card from collection to the open deck ────────────────────── -->
+      ${appDialog && html`<${AppDialog} key=${appDialog.id} dialog=${appDialog} onClose=${closeDialog} />`}
       ${deckDeleteAsk && (() => {
         const target = (groups.decks || []).find(d => d.name === deckDeleteAsk);
         if (!target) return null;
@@ -12303,8 +12362,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           setPickChecked(next);
           writePickChecks(key, next);
         };
-        const reset = () => {
-          if (!confirm("Untick all cards in this pick list?")) return;
+        const reset = async () => {
+          if (!(await appConfirm({ title: "Untick all cards?", body: "Clears every tick in this pick list.", okLabel: "↺ Reset", danger: true }))) return;
           setPickChecked(new Set());
           writePickChecks(key, new Set());
         };
