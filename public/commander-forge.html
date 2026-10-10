@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.10-e";
+  const APP_VERSION = "v2026.10.10-f";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -4987,6 +4987,106 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       } catch (e) {
         setSwapState({ key, status: "error", error: e.message || String(e) });
       }
+    };
+
+    // Apply one swap suggestion in a single state update.
+    //  • Collection deck: the cut card goes back to the binder it came from
+    //    (Uncategorised if unknown; basics / unowned cards of Forge decks were
+    //    never taken out, so they just leave the deck) and one copy of the
+    //    added card is taken out of its binder.
+    //  • Library / unsaved deck: only the deck list changes — its cards
+    //    aren't reserved from the binders yet.
+    // The new card lands in the cut card's category (ramp for ramp, …).
+    const applySwap = (sw) => {
+      const key = s => (s || "").toLowerCase();
+      const sf = sw.add.sf || {};
+      const addCard = {
+        name: sw.add.name, reason: "Swap suggestion (EDHRec)",
+        id: sf.id || null,
+        img: sf.image_uris?.small || sf.card_faces?.[0]?.image_uris?.small || null,
+        mana_cost: sf.mana_cost || sf.card_faces?.[0]?.mana_cost || "",
+        cmc: typeof sf.cmc === "number" ? sf.cmc : 0,
+        type_line: sf.type_line || "",
+        color_identity: sf.color_identity || [],
+        isLand: /\bLand\b/.test((sf.type_line || "").split("//")[0]),
+        set: sf.set || null, collector_number: sf.collector_number || null,
+      };
+      // Swap inside deckData.categories: replace the first copy of the cut card.
+      let replaced = false;
+      const nextDeck = { ...deck, categories: deck.categories.map(cat => ({
+        ...cat, cards: cat.cards.map(c => {
+          if (!replaced && key(c.name) === key(sw.cut.name)) { replaced = true; return { ...addCard, category: c.category }; }
+          return c;
+        }),
+      })) };
+      if (!replaced) { setError(`Couldn't find ${sw.cut.name} in the deck any more.`); return false; }
+
+      const colDeck = (groups.decks || []).find(d => d.name === deck.theme);
+      if (!colDeck) {
+        setDeck(nextDeck);
+        if (fromSaved) {
+          const updated = library.map(e => (libEntryId != null ? e.id === libEntryId : e.deck?.theme === deck.theme)
+            ? { ...e, deck: nextDeck } : e);
+          setLibrary(updated);
+          lsSetItemSafe(LS_LIBRARY, JSON.stringify(updated));
+        }
+        return true;
+      }
+
+      // Collection deck: move physical cards between deck and binders.
+      let nextBinders = (groups.binders || []).map(b => ({ ...b, cards: [...(b.cards || [])] }));
+      let nextBinInc = binInc;
+      const touched = new Set();
+      let rows = [...(colDeck.cards || [])];
+
+      // 1) cut: one copy out of the deck rows, back to its binder if it was reserved.
+      const cutIdx = rows.findIndex(r => key(r.name) === key(sw.cut.name));
+      if (cutIdx >= 0) {
+        const r = rows[cutIdx];
+        rows = r.qty > 1 ? rows.map((x, i) => i === cutIdx ? { ...x, qty: x.qty - 1 } : x) : rows.filter((_, i) => i !== cutIdx);
+        const wasReserved = colDeck.source !== "generated"
+          || !(BASIC_NAMES.has(r.name) || r.notOwned || (!colDeck.reservedV && r.name === colDeck.commanderName));
+        if (wasReserved) {
+          const dest = r.from && nextBinders.some(b => b.name === r.from) ? r.from : UNCATEGORISED;
+          if (!nextBinders.some(b => b.name === dest)) {
+            nextBinders.push({ name: dest, type: "binder", cards: [], commanderName: null, source: "manual" });
+            nextBinInc = { ...nextBinInc, [dest]: true };
+          }
+          const bin = nextBinders.find(b => b.name === dest);
+          const same = c => (c.id || "") === (r.id || "") && key(c.name) === key(r.name)
+            && (c.condition || "NM") === (r.condition || "NM") && (c.finish || "normal") === (r.finish || "normal")
+            && (c.lang || "en") === (r.lang || "en") && !!c.misprint === !!r.misprint;
+          const bi = bin.cards.findIndex(same);
+          if (bi >= 0) bin.cards[bi] = { ...bin.cards[bi], qty: (bin.cards[bi].qty || 1) + 1 };
+          else bin.cards.push({ name: r.name, qty: 1, id: r.id || "", condition: r.condition || "NM",
+            finish: r.finish || "normal", lang: r.lang || "en", ...(r.misprint ? { misprint: true } : {}) });
+          touched.add(dest);
+        }
+      }
+
+      // 2) add: one copy out of an included binder holding it.
+      const srcName = [sw.add.from, ...nextBinders.map(b => b.name)].find(n => n && binInc[n]
+        && nextBinders.find(b => b.name === n)?.cards.some(c => key(c.name) === key(sw.add.name) && (c.qty || 0) > 0));
+      if (!srcName) { setError(`${sw.add.name} is no longer in an included binder.`); return false; }
+      const src = nextBinders.find(b => b.name === srcName);
+      const si = src.cards.findIndex(c => key(c.name) === key(sw.add.name) && (c.qty || 0) > 0);
+      const taken = src.cards[si];
+      src.cards = taken.qty > 1 ? src.cards.map((c, i) => i === si ? { ...c, qty: c.qty - 1 } : c) : src.cards.filter((_, i) => i !== si);
+      touched.add(srcName);
+      rows.push({ name: taken.name, qty: 1, id: taken.id || "", condition: taken.condition || "NM",
+        finish: taken.finish || "normal", lang: taken.lang || "en", ...(taken.misprint ? { misprint: true } : {}),
+        from: srcName });
+
+      const nextDecks = (groups.decks || []).map(d => d.name === colDeck.name ? { ...d, cards: rows, deckData: nextDeck } : d);
+      const nextGroups = { ...groups, decks: nextDecks, binders: nextBinders };
+      setBinInc(nextBinInc);
+      persistGroups(nextGroups, deckInc, nextBinInc);
+      const nextUsable = computeUsable(nextGroups, deckInc, nextBinInc);
+      setUsable(nextUsable);
+      lsSetItemSafe(LS_CARDS, JSON.stringify(nextUsable));
+      setBinderEnriched(m => { const next = { ...m }; touched.forEach(b => delete next[b]); return next; });
+      setDeck(nextDeck);
+      return true;
     };
 
     const exportDeck = () => {
@@ -10737,7 +10837,21 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         ? html`<div style=${{ fontSize:12, color:"var(--fg-text-body)", marginTop:6 }}>No clear upgrades found — the deck already runs your best available cards for ${selCmd.card.name}.</div>`
                         : html`<ol style=${{ margin:"10px 0 0", paddingLeft:20, display:"flex", flexDirection:"column", gap:8 }}>
                             ${st.swaps.map((sw, i) => html`
-                              <li key=${i} style=${{ fontSize:13, color:"var(--fg-text)", lineHeight:1.5 }}>
+                              <li key=${i} style=${{ fontSize:13, color:"var(--fg-text)", lineHeight:1.5, opacity: sw.applied ? 0.6 : 1 }}>
+                                <div style=${{ float:"right", marginLeft:10 }}>
+                                  ${sw.applied
+                                    ? html`<span style=${{ fontSize:11, color:"var(--success-text)", fontWeight:700 }}>✓ Applied</span>`
+                                    : html`<button
+                                        onClick=${() => {
+                                          if (!applySwap(sw)) return;
+                                          setSwapState(prev => prev && prev.key === st.key
+                                            ? { ...prev, swaps: prev.swaps.map((x, j) => j === i ? { ...x, applied: true } : x) } : prev);
+                                        }}
+                                        title=${(groups.decks || []).some(d => d.name === deck.theme)
+                                          ? `Put ${sw.cut.name} back in its binder and take ${sw.add.name} out of "${sw.add.from || "your binder"}"`
+                                          : `Replace ${sw.cut.name} with ${sw.add.name} in this deck list`}
+                                        style=${{ ...btnSec, padding:"3px 10px", fontSize:11 }}>⇄ Apply swap</button>`}
+                                </div>
                                 <div><span style=${{ color:"var(--success-text)", fontWeight:700 }}>＋ ${sw.add.name}</span>
                                   <span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}> · ${ROLE_LABEL[sw.add.role]} · ${pctText(sw.add.edh)}${sw.add.edh?.synergy ? ` · synergy ${sw.add.edh.synergy > 0 ? "+" : ""}${Math.round(sw.add.edh.synergy * 100)}%` : ""}${sw.add.price ? ` · $${sw.add.price.toFixed(2)}` : ""}${sw.add.from ? ` · in "${sw.add.from}"` : ""}</span></div>
                                 <div><span style=${{ color:"var(--danger-text)", fontWeight:700 }}>− ${sw.cut.name}</span>
@@ -10748,6 +10862,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         Also strong here, but tied up elsewhere: ${st.ownedElsewhere.map((o, i) => html`${i ? " · " : ""}<strong>${o.name}</strong> (${ownedWhere({ available:false, where:o.where })})`)}
                       </div>`}
                       <div style=${{ fontSize:11, color:"var(--fg-text-muted)", fontStyle:"italic", marginTop:8 }}>
+                        ${(groups.decks || []).some(d => d.name === deck.theme)
+                          ? "Apply swap moves the cut card back to the binder it came from and takes the new card out of its binder. "
+                          : "Apply swap only edits this deck list — mark the deck as built to reserve its cards. "}
                         Each swap replaces a card doing the same job (ramp for ramp, removal for removal…). Combo pieces and the commander are never cut.${Number.isFinite(st.cardCap) ? ` Cards over $${st.cardCap.toFixed(0)} (25% of your budget) are left out.` : ""}
                       </div>
                     `}
