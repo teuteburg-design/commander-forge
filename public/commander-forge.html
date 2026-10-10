@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.10-h";
+  const APP_VERSION = "v2026.10.10-i";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -3151,6 +3151,8 @@
     const [pickListOpen,   setPickListOpen]   = useState(false);
     const [deckDeleteAsk,  setDeckDeleteAsk]  = useState(null);   // name of the Collection deck pending deletion
     const [showAlmostCombos, setShowAlmostCombos] = useState(false);
+    const [swapOpen,       setSwapOpen]       = useState(false);  // swap suggestions panel (collapsed by default)
+    const [gapsOpen,       setGapsOpen]       = useState(false);  // collection gaps panel (collapsed by default)
     const [swapState,      setSwapState]      = useState(null);   // { key, status, swaps, ownedElsewhere, error }
     const [edhOpen,        setEdhOpen]        = useState(false);  // EDHRec top-cards panel (collapsed by default)
     const [edhExpanded,    setEdhExpanded]    = useState({});     // EDHRec group id → show all instead of the top 10
@@ -10849,14 +10851,22 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   <div style=${{ background:"var(--success-soft)", border:"1px solid var(--border)", borderRadius:10,
                     padding:"14px 18px", marginBottom:18 }}>
                     <div style=${{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
-                      <div style=${{ fontSize:11, letterSpacing:3, color:"var(--success-text)", textTransform:"uppercase", fontWeight:700 }}>
-                        🔁 Swap suggestions from your collection
-                      </div>
-                      <button onClick=${findSwaps} disabled=${st?.status === "loading"}
+                      <button onClick=${() => { const next = !swapOpen; setSwapOpen(next); if (next && !st) findSwaps(); }}
+                        aria-expanded=${swapOpen}
+                        style=${{ all:"unset", cursor:"pointer", display:"flex", alignItems:"center", gap:8, flex:1 }}>
+                        <span style=${{ color:"var(--success-text)" }}>${swapOpen ? "▾" : "▸"}</span>
+                        <span style=${{ fontSize:11, letterSpacing:3, color:"var(--success-text)", textTransform:"uppercase", fontWeight:700 }}>
+                          🔁 Swap suggestions from your collection
+                        </span>
+                        ${!swapOpen && html`<span style=${{ marginLeft:"auto", fontSize:11, color:"var(--success-text)" }}>
+                          ${st?.status === "done" ? `${st.swaps.filter(x => !x.applied).length} open · show` : "show"}</span>`}
+                      </button>
+                      ${swapOpen && html`<button onClick=${findSwaps} disabled=${st?.status === "loading"}
                         style=${{ ...btnSec, padding:"4px 12px", fontSize:11, marginLeft:"auto" }}>
                         ${st?.status === "loading" ? "Checking EDHRec…" : st ? "↻ Refresh" : "Find swaps"}
-                      </button>
+                      </button>`}
                     </div>
+                    ${swapOpen && html`
                     ${!st && html`<div style=${{ fontSize:12, color:"var(--fg-text-body)", marginTop:6 }}>
                       Compares your available cards with what EDHRec players run with ${selCmd.card.name} and suggests up to 5 swaps — only cards you own, in colour, and within your per-card budget.
                     </div>`}
@@ -10899,6 +10909,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         Each swap replaces a card doing the same job (ramp for ramp, removal for removal…). Combo pieces and the commander are never cut.${Number.isFinite(st.cardCap) ? ` Cards over $${st.cardCap.toFixed(0)} (25% of your budget) are left out.` : ""}
                       </div>
                     `}
+                    `}
                   </div>
                 `;
               })()}
@@ -10906,11 +10917,16 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               ${showInsights && deck.warnings && deck.warnings.length > 0 && html`
                 <div style=${{ background:"var(--bg-surface-soft)", border:"1px solid var(--border-input)", borderRadius:10,
                   padding:"14px 18px", marginBottom:18 }}>
-                  <div style=${{ fontSize:11, letterSpacing:3, color:"var(--warning)", textTransform:"uppercase",
-                    fontWeight:700, marginBottom:8 }}>
-                    ⚠️ Collection Gaps · ${deck.warnings.length}
-                  </div>
-                  ${(() => {
+                  <button onClick=${() => setGapsOpen(v => !v)} aria-expanded=${gapsOpen}
+                    style=${{ all:"unset", cursor:"pointer", display:"flex", alignItems:"center", gap:8, width:"100%",
+                      marginBottom: gapsOpen ? 8 : 0 }}>
+                    <span style=${{ color:"var(--warning)" }}>${gapsOpen ? "▾" : "▸"}</span>
+                    <span style=${{ fontSize:11, letterSpacing:3, color:"var(--warning)", textTransform:"uppercase", fontWeight:700 }}>
+                      ⚠️ Collection Gaps · ${deck.warnings.length}
+                    </span>
+                    <span style=${{ marginLeft:"auto", fontSize:11, color:"var(--warning)" }}>${gapsOpen ? "hide" : "show"}</span>
+                  </button>
+                  ${gapsOpen && (() => {
                     // The AI writes these from general knowledge and only saw
                     // the cards sent to it, so it can recommend cards the user
                     // already owns. Tag those, with why they aren't in the deck.
