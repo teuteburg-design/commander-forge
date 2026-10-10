@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.10-a";
+  const APP_VERSION = "v2026.10.10-b";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -345,6 +345,7 @@
   const LS_ARCH_TOKEN = "cmdr_forge_archidekt_token";  // bearer token from /api/users/login/
   const LS_USE_SHARED = "cmdr_forge_use_shared_gemini"; // "1" = route Gemini calls through host's key
   const LS_THEME      = "cmdr_forge_theme";
+  const LS_PICKLISTS  = "cmdr_forge_picklists";    // { [commander name]: { checked: [card names], updatedAt } }
   const LS_SYNC_BASE  = "cmdr_forge_sync_base";    // { lastModified, hashes } of the last state known to match the cloud
 
   const THEMES = [
@@ -377,6 +378,7 @@
     LS_CARDS, LS_BINDERS, LS_PREFS, LS_LIBRARY,
     LS_ARCH_TOKEN,
     LS_USE_SHARED,
+    LS_PICKLISTS,   // tick cards off on the phone at the drawers, see it on desktop
   ];
   // fetch keepalive bodies are capped at 64 KiB in browsers; bigger pushes
   // must go out as normal requests.
@@ -2614,6 +2616,73 @@
       }} />`;
   }
 
+  // ── Pick list (physical card pulling, grouped like colour-sorted drawers) ──
+  // Groups by PRINTED colour from the mana cost, not colour identity: a Sol
+  // Ring sits in the colourless drawer even when it goes into a green deck.
+  // Lands get their own group; for split/MDFC cards only the front face counts.
+  const PICK_GROUPS = [
+    { id:"W", label:"White",      pip:"W" },
+    { id:"U", label:"Blue",       pip:"U" },
+    { id:"B", label:"Black",      pip:"B" },
+    { id:"R", label:"Red",        pip:"R" },
+    { id:"G", label:"Green",      pip:"G" },
+    { id:"M", label:"Multicolor", pip:null },
+    { id:"C", label:"Colorless",  pip:"C" },
+    { id:"L", label:"Lands",      pip:null },
+  ];
+  const BASIC_NAMES = new Set(["Plains","Island","Swamp","Mountain","Forest","Wastes",
+    "Snow-Covered Plains","Snow-Covered Island","Snow-Covered Swamp","Snow-Covered Mountain","Snow-Covered Forest"]);
+
+  function pickGroupOf(card) {
+    const front = (card.type_line || "").split("//")[0];
+    if (card.isLand && !card.mana_cost || /\bLand\b/.test(front)) return "L";
+    const cost = (card.mana_cost || "").split("//")[0];
+    const cols = new Set();
+    for (const t of cost.match(/\{[^}]+\}/g) || []) {
+      for (const c of "WUBRG") if (t.includes(c)) cols.add(c);
+    }
+    // No mana cost at all (e.g. Ancestral Vision): fall back to identity.
+    if (!cost.trim()) (card.color_identity || []).forEach(c => cols.add(c));
+    if (cols.size > 1) return "M";
+    if (cols.size === 1) return [...cols][0];
+    return "C";
+  }
+
+  // Commander(s) + main deck → [{ ...group, cards:[{ name, qty, mana_cost, isCommander }] }],
+  // duplicates (basics) merged into one row with a quantity.
+  function buildPickList(deck, cmdrCards) {
+    const rows = new Map();
+    const add = (c, isCommander) => {
+      const row = rows.get(c.name);
+      if (row) { row.qty++; return; }
+      rows.set(c.name, { name: c.name, qty: 1, mana_cost: c.mana_cost || "", isCommander,
+        group: pickGroupOf(c) });
+    };
+    cmdrCards.forEach(c => add(c, true));
+    deck.categories.forEach(cat => cat.cards.forEach(c => add(c, false)));
+    return PICK_GROUPS
+      .map(g => ({
+        ...g,
+        cards: [...rows.values()].filter(r => r.group === g.id).sort((a, b) =>
+          (b.isCommander - a.isCommander)
+          || (BASIC_NAMES.has(a.name) - BASIC_NAMES.has(b.name))   // basics last among lands
+          || a.name.localeCompare(b.name)),
+      }))
+      .filter(g => g.cards.length);
+  }
+
+  function readPickChecks(key) {
+    try { return new Set(JSON.parse(localStorage.getItem(LS_PICKLISTS) || "{}")[key]?.checked || []); }
+    catch { return new Set(); }
+  }
+  function writePickChecks(key, checked) {
+    let all = {};
+    try { all = JSON.parse(localStorage.getItem(LS_PICKLISTS) || "{}"); } catch {}
+    if (checked.size) all[key] = { checked: [...checked], updatedAt: Date.now() };
+    else delete all[key];
+    lsSetItemSafe(LS_PICKLISTS, JSON.stringify(all));
+  }
+
   // Card-condition scale — mirrors Cardmarket's 7-tier ladder
   // (M, NM, EX, GD, LP, PL, PO). The colors are our own green→red gradient
   // used to stand in for an icon set; not a copy of any third-party glyphs.
@@ -2993,6 +3062,9 @@
     // "Add from collection" modal — when open, lists binder rows filtered
     // by query so the user can pick a card to move into the open deck.
     const [addToDeckOpen,  setAddToDeckOpen]  = useState(false);
+    const [pickListOpen,   setPickListOpen]   = useState(false);
+    const [pickChecked,    setPickChecked]    = useState(() => new Set());
+    const [pickHideDone,   setPickHideDone]   = useState(false);
     const [addToDeckQuery, setAddToDeckQuery] = useState("");
     // "Pick a partner commander" modal: open when the user clicks
     // "+ Add partner" on the deck-view sidebar. Lists legal partners
@@ -10138,6 +10210,14 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     <button onClick=${exportDeck} style=${{ ...btnSec, padding:"6px 14px", fontSize:11 }}>
                       ⬇ Export .txt
                     </button>
+                    <button onClick=${() => {
+                        setPickChecked(readPickChecks(selCmd.card.name));
+                        setPickListOpen(true);
+                      }}
+                      title="Checklist sorted by colour, for pulling the cards from your drawers"
+                      style=${{ ...btnSec, padding:"6px 14px", fontSize:11 }}>
+                      🗂 Pick list
+                    </button>
                     ${!libSaved && !fromCollection && html`<button onClick=${saveDeckToLibrary}
                       style=${{ ...btn, padding:"6px 14px", fontSize:11,
                         background:"linear-gradient(135deg,var(--success),#2e8a44)" }}>
@@ -11587,6 +11667,121 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       })()}
 
       <!-- ── Add card from collection to the open deck ────────────────────── -->
+      ${pickListOpen && deck && selCmd && (() => {
+        const key = selCmd.card.name;
+        const cmdrCards = [selCmd.card, deck.partner?.card].filter(Boolean).map(c => ({
+          name: c.name,
+          mana_cost: c.scryfall?.mana_cost || c.scryfall?.card_faces?.[0]?.mana_cost || "",
+          type_line: c.scryfall?.type_line || "",
+          color_identity: c.scryfall?.color_identity || [],
+        }));
+        const groupsList = buildPickList(deck, cmdrCards);
+        const totalQty = groupsList.reduce((n, g) => n + g.cards.reduce((m, c) => m + c.qty, 0), 0);
+        const doneQty  = groupsList.reduce((n, g) => n + g.cards.reduce((m, c) => m + (pickChecked.has(c.name) ? c.qty : 0), 0), 0);
+        const toggle = (name) => {
+          const next = new Set(pickChecked);
+          next.has(name) ? next.delete(name) : next.add(name);
+          setPickChecked(next);
+          writePickChecks(key, next);
+        };
+        const reset = () => {
+          if (!confirm("Untick all cards in this pick list?")) return;
+          setPickChecked(new Set());
+          writePickChecks(key, new Set());
+        };
+        const close = () => setPickListOpen(false);
+        const allDone = totalQty > 0 && doneQty === totalQty;
+        return html`
+          <div onClick=${close}
+            style=${{
+              position:"fixed", inset:0, background:"rgba(20,10,0,0.45)",
+              display:"flex", alignItems:"flex-start", justifyContent:"center",
+              paddingTop:"4vh", zIndex:9999,
+            }}>
+            <div onClick=${e => e.stopPropagation()} role="dialog" aria-label=${`Pick list for ${key}`}
+              style=${{
+                background:"var(--bg-surface-softer)", border:"1px solid var(--border)", borderRadius:12,
+                width:"min(640px, 96vw)", maxHeight:"90vh", overflow:"hidden",
+                boxShadow:"0 8px 32px rgba(0,0,0,0.35)",
+                display:"flex", flexDirection:"column",
+              }}>
+              <div style=${{ padding:"12px 16px", borderBottom:"1px solid var(--border-soft)" }}>
+                <div style=${{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:10 }}>
+                  <div>
+                    <div style=${{ fontSize:14, fontWeight:700, color:"var(--fg-text-heading)" }}>🗂 Pick list</div>
+                    <div style=${{ fontSize:12, color:"var(--fg-text-muted)" }}>${key}</div>
+                  </div>
+                  <button onClick=${close} aria-label="Close pick list"
+                    style=${{ ...btnSec, padding:"4px 12px", fontSize:12 }}>✕</button>
+                </div>
+                <div style=${{ display:"flex", alignItems:"center", gap:10, marginTop:10 }}>
+                  <div style=${{ flex:1, height:8, borderRadius:4, background:"var(--border-soft)", overflow:"hidden" }}>
+                    <div style=${{ width:`${totalQty ? (doneQty / totalQty) * 100 : 0}%`, height:"100%",
+                      background: allDone ? "var(--success)" : "var(--accent)", transition:"width .2s" }}></div>
+                  </div>
+                  <span style=${{ fontSize:12, fontWeight:700, color: allDone ? "var(--success-text)" : "var(--fg-text-body)", whiteSpace:"nowrap" }}>
+                    ${allDone ? "✓ All picked" : `${doneQty}/${totalQty} picked`}
+                  </span>
+                </div>
+                <div style=${{ display:"flex", gap:12, marginTop:8, fontSize:12, alignItems:"center", flexWrap:"wrap" }}>
+                  <label style=${{ display:"flex", alignItems:"center", gap:6, cursor:"pointer", color:"var(--fg-text-body)" }}>
+                    <input type="checkbox" checked=${pickHideDone} onChange=${() => setPickHideDone(v => !v)} />
+                    Hide picked cards
+                  </label>
+                  <button onClick=${reset} disabled=${doneQty === 0}
+                    style=${{ ...btnSec, padding:"3px 10px", fontSize:11, marginLeft:"auto",
+                      opacity: doneQty === 0 ? 0.5 : 1 }}>↺ Reset</button>
+                </div>
+              </div>
+              <div style=${{ overflowY:"auto", padding:"4px 16px 16px" }}>
+                ${groupsList.map(g => {
+                  const gTotal = g.cards.reduce((m, c) => m + c.qty, 0);
+                  const gDone  = g.cards.reduce((m, c) => m + (pickChecked.has(c.name) ? c.qty : 0), 0);
+                  const shown  = pickHideDone ? g.cards.filter(c => !pickChecked.has(c.name)) : g.cards;
+                  return html`
+                    <section key=${g.id} style=${{ marginTop:14 }}>
+                      <div style=${{ display:"flex", alignItems:"center", gap:6, padding:"4px 0",
+                        borderBottom:"1px solid var(--border-soft)", position:"sticky", top:0,
+                        background:"var(--bg-surface-softer)" }}>
+                        ${g.pip ? html`<${Pip} c=${g.pip} size=${16} />`
+                          : g.id === "M" ? html`<span style=${{ width:16, height:16, borderRadius:"50%", display:"inline-block",
+                              background:"conic-gradient(#f7e7b0 0 20%, #4a8fd0 0 40%, #3a3a3a 0 60%, #d05030 0 80%, #5a9050 0)" }}></span>`
+                          : html`<span aria-hidden="true">🏔</span>`}
+                        <span style=${{ fontSize:13, fontWeight:700, color:"var(--fg-text-heading)" }}>${g.label}</span>
+                        <span style=${{ fontSize:11, marginLeft:"auto",
+                          color: gDone === gTotal ? "var(--success-text)" : "var(--fg-text-muted)" }}>
+                          ${gDone === gTotal ? "✓ " : ""}${gDone}/${gTotal}
+                        </span>
+                      </div>
+                      ${shown.map(c => {
+                        const done = pickChecked.has(c.name);
+                        return html`
+                          <label key=${c.name} style=${{
+                            display:"flex", alignItems:"center", gap:10, padding:"8px 2px",
+                            borderBottom:"1px dashed var(--border-soft)", cursor:"pointer",
+                            opacity: done ? 0.5 : 1,
+                          }}>
+                            <input type="checkbox" checked=${done} onChange=${() => toggle(c.name)}
+                              style=${{ width:18, height:18, flexShrink:0, accentColor:"var(--accent)" }} />
+                            <span style=${{ flex:1, fontSize:14, color:"var(--fg-text)",
+                              textDecoration: done ? "line-through" : "none" }}>
+                              ${c.qty > 1 ? html`<strong>${c.qty}× </strong>` : ""}${c.name}
+                              ${c.isCommander ? html`<span title="Commander" style=${{ marginLeft:6, fontSize:11, color:"var(--accent-text)" }}>👑 Commander</span>` : ""}
+                            </span>
+                            <${ManaCost} cost=${c.mana_cost.split("//")[0].trim()} size=${13} />
+                          </label>
+                        `;
+                      })}
+                      ${pickHideDone && shown.length === 0 && html`
+                        <div style=${{ fontSize:12, color:"var(--fg-text-muted)", padding:"6px 2px", fontStyle:"italic" }}>All picked.</div>`}
+                    </section>
+                  `;
+                })}
+              </div>
+            </div>
+          </div>
+        `;
+      })()}
       ${addToDeckOpen && deck && (groups.decks || []).some(d => d.name === deck.theme) && (() => {
         const deckName = deck.theme;
         // Flatten all binder rows into pickable entries. Each row knows
