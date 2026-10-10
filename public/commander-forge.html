@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.10-j";
+  const APP_VERSION = "v2026.10.10-k";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -2706,6 +2706,14 @@
     lsSetItemSafe(LS_PICKLISTS, JSON.stringify(all));
   }
 
+  // Identity of a built deck for de-duplication: commander + the exact
+  // multiset of card names. Theme / name are ignored on purpose — "Mark as
+  // built" renames the deck to "Forge: …" but the cards stay the same.
+  function deckFingerprint(cmdrName, deck) {
+    const names = (deck?.categories || []).flatMap(c => (c.cards || []).map(x => normCardName(x.name))).sort();
+    return names.length ? `${normCardName(cmdrName)}|${names.join("\u0001")}` : null;
+  }
+
   // ── Deck insights: ownership + swap suggestions ─────────────────────────
   // Name key that survives accents, case and double-faced names, so
   // "Arwen Undómiel" from EDHRec matches "Arwen Undomiel" in a CSV import.
@@ -3853,7 +3861,26 @@
         }
       } catch {}
       const savedLib = localStorage.getItem(LS_LIBRARY);
-      if (savedLib) { try { setLibrary(JSON.parse(savedLib)); } catch {} }
+      if (savedLib) { try {
+        let lib = JSON.parse(savedLib);
+        // Library copies of decks already marked as built (same commander +
+        // same cards as a Forge deck in Collection) are leftovers from before
+        // "Mark as built" reliably removed them — drop them.
+        let built = new Set();
+        try {
+          const bg = JSON.parse(savedBinders || "{}");
+          built = new Set((bg.groups?.decks || [])
+            .filter(d => d.source === "generated" && d.deckData)
+            .map(d => deckFingerprint(d.selCmd?.card?.name || d.commanderName, d.deckData))
+            .filter(Boolean));
+        } catch {}
+        const deduped = lib.filter(e => !built.has(deckFingerprint(e.selCmd?.card?.name, e.deck)));
+        if (deduped.length !== lib.length) {
+          lib = deduped;
+          lsSetItemSafe(LS_LIBRARY, JSON.stringify(lib));
+        }
+        setLibrary(lib);
+      } catch {} }
 
       // ── Archidekt credentials + cached token ──
       try {
@@ -5577,15 +5604,20 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       }));
       lsSetItemSafe(LS_CARDS, JSON.stringify(nextUsable));
 
-      // Issue 8: if this deck was in the Library, remove it now that it lives in Collection.
-      if (libSaved && libEntryId != null) {
-        const nextLibrary = library.filter(e => e.id !== libEntryId);
+      // The deck now lives in Collection: drop its Library copy — the entry
+      // it was opened from, plus any other copy with the same commander and
+      // cards (e.g. saved to the Library straight after forging).
+      const fp = deckFingerprint(cmdrName, deck);
+      const nextLibrary = library.filter(e =>
+        !(libEntryId != null && e.id === libEntryId)
+        && !(fp && deckFingerprint(e.selCmd?.card?.name, e.deck) === fp));
+      if (nextLibrary.length !== library.length) {
         setLibrary(nextLibrary);
         lsSetItemSafe(LS_LIBRARY, JSON.stringify(nextLibrary));
-        setLibEntryId(null);
-        setLibSaved(false);
-        setFromSaved(false);
       }
+      setLibEntryId(null);
+      setLibSaved(false);
+      setFromSaved(false);
 
       setDeckSvd(true);
     };
@@ -5601,6 +5633,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setLibrary(updated);
       lsSetItemSafe(LS_LIBRARY, JSON.stringify(updated));
       setLibSaved(true);
+      setLibEntryId(entry.id);   // so "Mark as built" can move it out of the Library
     };
 
     const deleteFromLibrary = id => {
