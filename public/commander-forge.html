@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.10-l";
+  const APP_VERSION = "v2026.10.11-a";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -1533,13 +1533,17 @@
   // provided their own Gemini key but is signed-in via Cloudflare Access.
   // Returns the same { text, finishReason, completionTokens, … } shape as
   // callGemini, plus { quotaUsed, quotaCap, quotaRemaining }.
-  async function callSharedGemini(_unusedApiKey, model, userText, systemText, maxTokens = 4096) {
+  // `prelude` marks a small preparatory call (commander research) that the
+  // Worker doesn't count against the daily build cap — research + build
+  // together still cost one request.
+  async function callSharedGemini(_unusedApiKey, model, userText, systemText, maxTokens = 4096, opts = {}) {
     const r = await fetch("/api/ai/gemini", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         system: systemText, user: userText,
         max_tokens: maxTokens, model,
+        ...(opts.prelude ? { prelude: true } : {}),
       }),
     });
     let d = null;
@@ -2765,6 +2769,194 @@
     return { decks: nextDecks, binders, shortfalls, reserved, builtDecks };
   }
 
+  // ── Commander research: strategy packages ───────────────────────────────
+  // Building blocks the research step picks from. Each package lists the
+  // roles a deck of that strategy needs and how to recognise a card filling
+  // the role from its rules text (lower-cased, reminder text removed) or type
+  // line. The AI chooses packages + targets for a commander; the matching is
+  // deterministic so every available card is considered, not just the top 150.
+  const STRATEGY_PACKAGES = [
+    { id: "aristocrats", label: "Sacrifice / death triggers", roles: [
+      { id: "sac_outlet",   label: "Sacrifice outlets",      re: ["sacrifice (a|another|an?) (other )?(creature|artifact or creature|creature or artifact|nontoken creature)[^.]*:", "sacrifice (a|another) creature: ", "as an additional cost to cast this spell, sacrifice (a|an) (creature|artifact or creature)", "kicker—sacrifice (a|an) (creature|artifact or creature)"] },
+      { id: "fodder",       label: "Creatures to sacrifice", re: ["create (a|an|two|three|four|x|\\w+) [^.]*creature tokens?", "when (this creature|[^.]*) dies, (create|return)", "amass", "fabricate"] },
+      { id: "death_payoff", key: true, label: "Death payoffs",          re: ["whenever (a|another|one or more) (other )?(nontoken )?creatures? (you control )?(dies|die)", "whenever [^.]*creature[^.]* (is put|are put) into a graveyard from the battlefield", "whenever a creature dies", "creature dying causes a triggered ability"] },
+      { id: "recursion",    label: "Recursion",              re: ["return (target|a|up to (one|two|three)|another) [^.]*creature cards? from your graveyard to (the battlefield|your hand)", "(cast|return) this card from your graveyard", "you may cast this card from your graveyard", "escape—"] },
+      { id: "mass_death",   label: "Edicts & board wipes",   re: ["each (other )?(player|opponent) sacrifices", "destroy all (other )?creatures", "all (other )?creatures get -(\\d+|x)/-(\\d+|x)", "each creature gets -", "creatures your opponents control get -", "deals (\\d+|x) damage to each creature"] },
+    ]},
+    { id: "tokens", label: "Go-wide tokens", roles: [
+      { id: "token_maker",  label: "Token makers",           re: ["create (a|an|two|three|four|five|x|\\w+) [^.]*tokens?"] },
+      { id: "anthem",       label: "Anthems",                re: ["creatures you control get \\+\\d+/\\+\\d+", "creature tokens you control get \\+"] },
+      { id: "token_payoff", key: true, label: "Token payoffs / doublers", re: ["whenever (a|one or more) [^.]*tokens? [^.]*enters?", "twice that many", "create (that many|an additional)"] },
+    ]},
+    { id: "counters", label: "+1/+1 counters", roles: [
+      { id: "counter_source", label: "Counter sources",      re: ["put (a|an|two|three|x|\\w+) \\+1/\\+1 counters? on", "enters with (a|an|two|three|x|\\w+) \\+1/\\+1 counters?"] },
+      { id: "proliferate",  label: "Proliferate / doublers", re: ["proliferate", "twice that many [^.]*counters", "additional \\+1/\\+1 counter"] },
+      { id: "counter_payoff", key: true, label: "Counter payoffs",      re: ["with (a|one or more) \\+1/\\+1 counters? on (it|them)", "for each \\+1/\\+1 counter"] },
+    ]},
+    { id: "spellslinger", label: "Instants & sorceries", roles: [
+      { id: "cheap_spell",  label: "Cheap instants/sorceries", types: ["Instant", "Sorcery"], maxCmc: 3 },
+      { id: "spell_payoff", key: true, label: "Spell payoffs",          re: ["whenever you cast (an|a) (instant|sorcery|noncreature)", "instant (and|or) sorcery spells you cast", "magecraft"] },
+      { id: "spell_copy",   label: "Copy / recast",          re: ["copy target (instant|sorcery)", "copy (it|that spell)", "flashback"] },
+    ]},
+    { id: "artifacts", label: "Artifacts", roles: [
+      { id: "artifact_card", label: "Artifacts",             types: ["Artifact"] },
+      { id: "artifact_payoff", key: true, label: "Artifact payoffs",    re: ["whenever (an|another|one or more) (other )?(nontoken )?artifacts? [^.]*(enters|you control)", "for each artifact you control", "artifacts you control (get|have)"] },
+      { id: "treasure",     label: "Treasure / tokens",      re: ["treasure token", "clue token", "food token"] },
+    ]},
+    { id: "enchantments", label: "Enchantments", roles: [
+      { id: "enchantment_card", label: "Enchantments",       types: ["Enchantment"] },
+      { id: "enchantress", key: true,  label: "Enchantress payoffs",    re: ["whenever you cast an (aura|enchantment)", "whenever (an|another) enchantment [^.]*enters", "constellation"] },
+    ]},
+    { id: "voltron", label: "Equipment / auras on one creature", roles: [
+      { id: "equipment",    label: "Equipment & auras",      types: ["Equipment", "Aura"] },
+      { id: "protection",   label: "Protection",             re: ["(gains?|has) (hexproof|indestructible|protection from|shroud)", "ward"] },
+      { id: "evasion",      label: "Evasion",                re: ["(gains?|has) (flying|trample|menace|can't be blocked)", "can't be blocked"] },
+    ]},
+    { id: "landfall", label: "Lands matter", roles: [
+      { id: "landfall_payoff", key: true, label: "Landfall payoffs",    re: ["landfall", "whenever a land (you control )?enters"] },
+      { id: "land_ramp",    label: "Extra land drops / fetch", re: ["put (a|up to (one|two)) [^.]*land cards? onto the battlefield", "play an additional land", "you may play lands from"] },
+    ]},
+    { id: "graveyard", label: "Graveyard / reanimator", roles: [
+      { id: "self_mill",    label: "Self-mill / discard",    re: ["mill (one|two|three|four|five|x|\\w+) cards?", "surveil", "put the top [^.]* into your graveyard", "discard (a|two|that|\\w+) cards?"] },
+      { id: "reanimate",    label: "Reanimation",            re: ["return target creature card from (a|your) graveyard to the battlefield", "put target creature card from a graveyard onto the battlefield"] },
+      { id: "gy_payoff", key: true,    label: "Graveyard payoffs",      re: ["cards? in your graveyard", "from your graveyard"] },
+    ]},
+    { id: "lifegain", label: "Lifegain", roles: [
+      { id: "life_source",  label: "Lifegain sources",       re: ["you gain \\d+ life", "lifelink", "you gain (x|that much) life"] },
+      { id: "life_payoff", key: true,  label: "Lifegain payoffs",       re: ["whenever you gain life", "if you would gain life"] },
+    ]},
+    { id: "blink", label: "Blink / enter-the-battlefield", roles: [
+      { id: "blink", key: true,        label: "Blink effects",          re: ["exile [^.]*, then return (it|that card|them) to the battlefield", "exile (target|another) [^.]*return (it|that card) to the battlefield"] },
+      { id: "etb_value",    label: "Enter-the-battlefield value", re: ["when (this creature|[^.]*) enters,"] },
+    ]},
+    { id: "draw", label: "Card draw matters", roles: [
+      { id: "draw_engine",  label: "Draw engines",           re: ["draw (a|two|three|\\w+) cards?", "draws? a card"] },
+      { id: "draw_payoff", key: true,  label: "Draw payoffs",           re: ["whenever you draw", "whenever an opponent draws"] },
+    ]},
+    { id: "attack", label: "Combat / attack triggers", roles: [
+      { id: "attack_payoff", key: true, label: "Attack triggers",       re: ["whenever [^.]* attacks", "whenever you attack", "whenever one or more creatures you control attack"] },
+      { id: "haste_extra",  label: "Haste / extra combats",  re: ["(gains?|has) haste", "additional combat phase"] },
+    ]},
+    { id: "drain", label: "Drain / life loss", roles: [
+      { id: "drain", key: true,        label: "Drain effects",          re: ["each opponent loses \\d+ life", "target opponent loses \\d+ life", "deals \\d+ damage to each opponent"] },
+    ]},
+    { id: "theft", label: "Steal & copy opponents' things", roles: [
+      { id: "theft", key: true,        label: "Theft effects",          re: ["gain control of", "you may cast [^.]* spells? [^.]*(an opponent|they) (own|exiled)", "exile the top card of (each|target) (player|opponent)"] },
+    ]},
+  ];
+
+  // Lower-cased rules text of all faces without reminder text, for matching.
+  function rulesText(sf) {
+    if (!sf) return "";
+    const parts = [sf.oracle_text, ...(sf.card_faces || []).map(f => f.oracle_text)].filter(Boolean);
+    return parts.join("\n").replace(/\([^)]*\)/g, "").toLowerCase();
+  }
+  // Short one-line rules text for prompts.
+  function oracleSnippet(sf, max = 140) {
+    const t = rulesText(sf).replace(/\s+/g, " ").trim();
+    return t.length > max ? t.slice(0, max - 1) + "…" : t;
+  }
+
+  // Compile roles once: { id, label, test(sf) }. Custom roles from the AI
+  // carry their own regex strings; invalid patterns are ignored.
+  function compileRoles(roles) {
+    return roles.map(r => {
+      const res = (r.re || []).map(p => { try { return new RegExp(p, "i"); } catch { return null; } }).filter(Boolean);
+      const types = r.types || [];
+      return { ...r, test: sf => {
+        if (!sf) return false;
+        const front = (sf.type_line || "").split("//")[0];
+        if (types.length && types.some(t => new RegExp(`\\b${t}\\b`).test(front))) return r.maxCmc == null || (sf.cmc || 0) <= r.maxCmc;
+        if (!res.length) return false;
+        const t = rulesText(sf);
+        return res.some(re => re.test(t));
+      } };
+    });
+  }
+
+  // Lands and colour-specific cards that can't work in this colour identity.
+  // Returns a short reason when the card should be dropped, else null.
+  const BASIC_TYPE_COLOR = { plains: "W", island: "U", swamp: "B", mountain: "R", forest: "G" };
+  const COLOR_WORD = { white: "W", blue: "U", black: "B", red: "R", green: "G" };
+  function offPlanReason(sf, ci) {
+    if (!sf) return null;
+    const front = (sf.type_line || "").split("//")[0];
+    const t = rulesText(sf);
+    if (/\bLand\b/.test(front)) {
+      // Lands with a matching basic land type always work.
+      const types = Object.keys(BASIC_TYPE_COLOR).filter(b => new RegExp(`\\b${b}\\b`, "i").test(front));
+      if (types.some(b => ci.includes(BASIC_TYPE_COLOR[b]))) return null;
+      // Fetches: does the search find something this deck can use?
+      const fetch = t.match(/search your library for (?:an? |up to \w+ )?([^.]*?) cards?/);
+      if (fetch && !/\badd\b/.test(t)) {
+        const what = fetch[1];
+        if (/basic land|land card|\bland\b/.test(what) && !Object.keys(BASIC_TYPE_COLOR).some(b => what.includes(b))) return null;
+        const named = Object.keys(BASIC_TYPE_COLOR).filter(b => what.includes(b));
+        if (named.length && !named.some(b => ci.includes(BASIC_TYPE_COLOR[b]))) return "fetches only land types this deck doesn't run";
+      }
+      return null;
+    }
+    // "Blue spells and red spells you cast cost {1} less" in a deck without those colours.
+    const reducer = t.match(/((?:white|blue|black|red|green)(?: spells)?(?: (?:and|or) (?:white|blue|black|red|green))?) spells you cast cost/);
+    if (reducer) {
+      const cols = (reducer[1].match(/white|blue|black|red|green/g) || []).map(w => COLOR_WORD[w]);
+      if (cols.length && !cols.some(c => ci.includes(c))) return "only helps colours this deck doesn't run";
+    }
+    return null;
+  }
+  // Colourless-only utility lands crowd out coloured sources; cap them by
+  // how many colours the deck needs (colourless commanders aren't capped).
+  function colorlessLandCap(ci) {
+    return ci.length === 0 ? Infinity : ci.length === 1 ? 3 : ci.length === 2 ? 2 : 1;
+  }
+  function isColorlessOnlyLand(sf, ci) {
+    const front = (sf?.type_line || "").split("//")[0];
+    if (!/\bLand\b/.test(front)) return false;
+    if (Object.keys(BASIC_TYPE_COLOR).some(b => new RegExp(`\\b${b}\\b`, "i").test(front))) return false;
+    const t = rulesText(sf);
+    if (/any colou?r|any one colou?r|mana of any|any type/.test(t)) return false;
+    if (/search your library/.test(t)) return false;
+    const adds = [...t.matchAll(/add ([^.]*)/g)].map(m => m[1]).join(" ");
+    return !ci.some(c => adds.includes(`{${c.toLowerCase()}}`));
+  }
+
+  // Deterministic fallback when the research AI call fails: pick packages
+  // whose role patterns the commander's own text hits most.
+  function guessPackages(cmdrSfs) {
+    // A commander that IS a payoff (e.g. "whenever you cast an instant or
+    // sorcery") says far more about the deck than one that merely creates a
+    // token, so payoff ("key") roles weigh 3×.
+    const hits = STRATEGY_PACKAGES.map(p => {
+      // "Creates a creature token" is token-maker evidence, not sacrifice evidence.
+      const roles = compileRoles(p.roles.filter(r => r.re && r.id !== "fodder"));
+      const n = cmdrSfs.reduce((s, sf) => s + roles.filter(r => r.test(sf)).reduce((w, r) => w + (r.key ? 3 : 1), 0), 0);
+      return { id: p.id, n };
+    }).filter(x => x.n > 0).sort((a, b) => b.n - a.n);
+    return hits.slice(0, 3).map(x => x.id);
+  }
+
+  // Turn a research result into concrete roles with targets.
+  //   research: { packages:[ids], roles:[{ id, label?, target, why?, re? }] }
+  function researchRoles(research) {
+    const out = [];
+    const byId = new Map(STRATEGY_PACKAGES.flatMap(p => p.roles.map(r => [r.id, r])));
+    for (const r of research?.roles || []) {
+      const base = byId.get(r.id);
+      const re = Array.isArray(r.re) ? r.re.filter(p => typeof p === "string" && p.length < 160).slice(0, 6) : [];
+      if (!base && !re.length) continue;
+      out.push({ ...(base || {}), id: r.id, label: r.label || base?.label || r.id,
+        target: Math.max(0, Math.min(20, parseInt(r.target) || 0)), why: r.why || "",
+        re: base ? [...(base.re || []), ...re] : re, types: base?.types });
+    }
+    // Packages chosen without explicit roles: add all their roles with a default target.
+    for (const pid of research?.packages || []) {
+      const p = STRATEGY_PACKAGES.find(x => x.id === pid);
+      if (!p) continue;
+      for (const r of p.roles) if (!out.some(o => o.id === r.id)) out.push({ ...r, target: 4, why: "" });
+    }
+    return out;
+  }
+
   // ── Deck insights: ownership + swap suggestions ─────────────────────────
   // Name key that survives accents, case and double-faced names, so
   // "Arwen Undómiel" from EDHRec matches "Arwen Undomiel" in a CSV import.
@@ -3268,6 +3460,8 @@
     const [showAlmostCombos, setShowAlmostCombos] = useState(false);
     const [swapOpen,       setSwapOpen]       = useState(false);  // swap suggestions panel (collapsed by default)
     const [gapsOpen,       setGapsOpen]       = useState(false);  // collection gaps panel (collapsed by default)
+    const [planOpen,       setPlanOpen]       = useState(false);  // 🧭 commander plan panel (collapsed by default)
+    const [researchBusy,   setResearchBusy]   = useState(false);
     const [swapState,      setSwapState]      = useState(null);   // { key, status, swaps, ownedElsewhere, error }
     const [edhOpen,        setEdhOpen]        = useState(false);  // EDHRec top-cards panel (collapsed by default)
     const [edhExpanded,    setEdhExpanded]    = useState({});     // EDHRec group id → show all instead of the top 10
@@ -4161,13 +4355,13 @@
     // Run a prompt on a single, specific provider. Throws on API failure.
     // In freeAIMode the only allowed provider is Gemini-via-shared (own keys
     // are ignored). In ownKeysMode the user's own key is used directly.
-    const callAIOn = async (p, userText, systemText, maxTokens) => {
+    const callAIOn = async (p, userText, systemText, maxTokens, opts = {}) => {
       const cap = PROVIDER_MAX_TOKENS[p] || maxTokens;
       const max = Math.min(maxTokens, cap);
       const mdl = models[p] || PROVIDERS[p].models[0].id;
 
       if (freeAIMode && p === "gemini") {
-        const result = await callSharedGemini("", mdl, userText, systemText, max);
+        const result = await callSharedGemini("", mdl, userText, systemText, max, opts);
         // Mirror server quota into local state so the UI updates immediately.
         if (typeof result.quotaRemaining === "number") {
           setSharedQuota(s => ({
@@ -4191,13 +4385,13 @@
     // rotates on parse failure too (some small models return valid HTTP 200 with
     // unparseable garbage; only the caller knows what "valid output" looks like).
     // Returns { text, finishReason, completionTokens, promptTokens, provider }.
-    const callAI = async (userText, systemText, maxTokens = 4096, exclude = []) => {
+    const callAI = async (userText, systemText, maxTokens = 4096, exclude = [], opts = {}) => {
       const usable = aiUsableProviders(exclude);
       let lastErr = null;
       for (let i = 0; i < usable.length; i++) {
         const p = usable[i];
         try {
-          const result = await callAIOn(p, userText, systemText, maxTokens);
+          const result = await callAIOn(p, userText, systemText, maxTokens, opts);
           if (i > 0) addLog(`✅ Fallback to ${PROVIDERS[p].label} succeeded.`);
           return result;
         } catch (e) {
@@ -4209,6 +4403,58 @@
         }
       }
       throw lastErr || new Error("No AI provider configured. Open Settings.");
+    };
+
+    // ── Commander research ───────────────────────────────────────────────
+    // One small AI call before the build: reads the commander's rules text
+    // (and partner's) plus EDHRec's most-played cards for it, and returns the
+    // plan, which strategy packages apply, role targets and what to avoid.
+    // Card matching against the collection is deterministic afterwards. If
+    // the call fails, packages are guessed from the commander's own text.
+    const researchCommander = async (cmdrCards, edhTop = [], hints = {}, log = () => {}) => {
+      const sfs = cmdrCards.map(c => c?.scryfall).filter(Boolean);
+      const names = cmdrCards.map(c => c?.name).filter(Boolean);
+      const ci = [...new Set(sfs.flatMap(sf => sf.color_identity || []))];
+      const text = sfs.map(sf => {
+        const faces = sf.card_faces?.length ? sf.card_faces : [sf];
+        return faces.map(f => `${f.name} ${f.mana_cost || ""} — ${f.type_line || ""}${f.power != null ? ` (${f.power}/${f.toughness})` : ""}\n${f.oracle_text || ""}`).join("\n// back face:\n");
+      }).join("\n\n");
+      const catalog = STRATEGY_PACKAGES.map(p => `- ${p.id} (${p.label}): ${p.roles.map(r => r.id).join(", ")}`).join("\n");
+      const user =
+`Commander: ${names.join(" + ")}
+Colour identity: [${ci.join(", ") || "colourless"}]
+${hints.theme ? `Chosen theme: ${hints.theme}\n` : ""}${hints.strategy ? `Earlier strategy notes: ${hints.strategy}\n` : ""}
+Rules text:
+${text}
+
+${edhTop.length ? `Cards EDHRec players run most with this commander: ${edhTop.slice(0, 30).map(e => e.name).join(", ")}\n\n` : ""}Strategy packages (package id: role ids):
+${catalog}
+
+Work out how this commander's abilities win games and what the other 99 cards must contain to use them well.
+Return JSON only:
+{"plan":"2-3 sentences: the game plan built around the commander's abilities",
+ "packages":["1-3 package ids from the list"],
+ "roles":[{"id":"a role id from the packages, or a new snake_case id","label":"short name","target":<number of cards, 1-15>,"why":"≤ 90 chars: how it uses the commander","re":["only for NEW role ids: 1-4 lowercase JS regexes matched against card rules text"]}],
+ "avoid":["≤ 4 short notes on card types/effects that work against this commander"]}
+Use 3-7 roles that directly enable or pay off the commander's abilities; targets should add up to about 25-35 cards. Don't include generic ramp/draw/removal roles — those are handled separately.`;
+      const sys = "You are an expert Magic: The Gathering Commander deckbuilder analysing one commander. Base the analysis on the rules text given, not on memory. Respond with valid JSON only — no prose, no markdown.";
+      try {
+        const r = await callAI(user, sys, 2500, [], { prelude: true });
+        const parsed = safeParse(r.text);
+        if (!parsed?.roles?.length) throw new Error("no roles in research response");
+        const research = {
+          plan: String(parsed.plan || "").slice(0, 600),
+          packages: (parsed.packages || []).filter(id => STRATEGY_PACKAGES.some(p => p.id === id)).slice(0, 3),
+          roles: [], avoid: (parsed.avoid || []).map(String).slice(0, 4), source: "ai", at: Date.now(),
+        };
+        research.roles = researchRoles({ roles: parsed.roles }).slice(0, 8).map(({ test, ...r }) => r);
+        if (!research.roles.length) throw new Error("no usable roles");
+        return research;
+      } catch (e) {
+        log(`ℹ️ Commander research by AI failed (${(e.message || e).toString().slice(0, 90)}) — guessing the strategy from the rules text.`);
+        const packages = guessPackages(sfs);
+        return { plan: "", packages, roles: researchRoles({ packages }).map(({ test, ...r }) => r), avoid: [], source: "fallback", at: Date.now() };
+      }
     };
 
     const importCSV = () => {
@@ -4499,18 +4745,32 @@
           }
         }
 
+        // Off-plan filter: lands that can't make or find this deck's colours
+        // (e.g. a Plains/Island fetch in mono-black) and cards that only help
+        // colours the deck doesn't run. Colour identity alone lets them through.
+        {
+          const dropped = [];
+          eligible = eligible.filter(c => {
+            const why = offPlanReason(c.scryfall, ci);
+            if (why) dropped.push(c.name);
+            return !why;
+          });
+          if (dropped.length) addLog(`🚫 Left out ${dropped.length} card(s) that can't work in [${ci.join(",") || "C"}]: ${dropped.slice(0, 6).join(", ")}${dropped.length > 6 ? ", …" : ""}.`);
+        }
+
         const basics = ci.map(col => BASIC_LAND[col]).filter(Boolean);
         const basicNamesSet = new Set(basics.concat(["Wastes"]));
 
         // ── EDHRec synergy data ───────────────────────────────────────────────
         addLog("🌐 Fetching EDHRec synergy data…");
-        let synergyMap = {}, edhrecSuggestions = [];
+        let synergyMap = {}, edhrecSuggestions = [], edhrecAll = [];
         try {
           // Pass the Scryfall object so fetchEDHRec uses Scryfall's canonical
           // related_uris.edhrec slug — handles diacritics, DFCs, punctuation.
           const result = await fetchEDHRec(chosenCmd.card.scryfall || chosenCmd.card.name);
           const { suggestions, status, slug, http, via } = result;
           if (status === "ok" && suggestions.length > 0) {
+            edhrecAll = suggestions;
             suggestions.forEach(c => { synergyMap[c.name.toLowerCase()] = c; });
             const viaNote = via && via !== "direct" ? ` via ${via}` : "";
             addLog(`✅ EDHRec [${slug}${viaNote}]: ${suggestions.length} synergy cards loaded.`);
@@ -4532,14 +4792,49 @@
           addLog(`ℹ️ EDHRec fetch threw: ${e.message || e}.`);
         }
 
-        // Sort eligible cards by EDHRec synergy (highest first), then CMC ascending.
-        // This ensures the top 150 cards sent to the AI are the most synergistic.
-        eligible.sort((a, b) => {
-          const synA = synergyMap[a.name.toLowerCase()]?.synergy ?? -99;
-          const synB = synergyMap[b.name.toLowerCase()]?.synergy ?? -99;
-          if (synB !== synA) return synB - synA;
-          return (a.scryfall?.cmc || 0) - (b.scryfall?.cmc || 0);
-        });
+        // ── Commander research: what do this commander's abilities need? ──
+        addLog(`🧭 Researching how ${chosenCmd.card.name} works…`);
+        const edhTop = [...edhrecAll].sort((a, b) => ((b.pct || 0) + (b.synergy || 0) / 2) - ((a.pct || 0) + (a.synergy || 0) / 2));
+        const research = await researchCommander([chosenCmd.card], edhTop,
+          { theme: chosenCmd.theme, strategy: chosenCmd.strategy || chosenCmd.reason }, addLog);
+        const roles = compileRoles(research.roles);
+        if (research.plan) addLog(`🧭 Plan: ${research.plan}`);
+        addLog(`🧭 Needs: ${research.roles.map(r => `${r.label} ×${r.target}`).join(" · ")}${research.source === "fallback" ? " (guessed)" : ""}.`);
+
+        // Score every eligible card: EDHRec play rate + synergy, plus a bonus
+        // per commander role it fills. Unlike the old top-150-by-synergy list,
+        // role cards are always offered to the AI even if EDHRec has no data.
+        const edhScore = c => { const e = synergyMap[c.name.toLowerCase()]; return e ? (e.pct || 0) + (e.synergy || 0) / 2 : -0.1; };
+        for (const c of eligible) {
+          c._roles = roles.filter(r => r.test(c.scryfall)).map(r => r.id);
+          c._core  = cardRole(c.scryfall);
+          c._score = edhScore(c) + c._roles.length * 0.4;
+        }
+        eligible.sort((a, b) => b._score - a._score || (a.scryfall?.cmc || 0) - (b.scryfall?.cmc || 0));
+
+        // Cap colourless-only utility lands so they don't crowd out coloured sources.
+        {
+          const cap = colorlessLandCap(ci);
+          let n = 0; const cut = [];
+          eligible = eligible.filter(c => {
+            if (!isColorlessOnlyLand(c.scryfall, ci)) return true;
+            if (n < cap) { n++; return true; }
+            cut.push(c.name); return false;
+          });
+          if (cut.length) addLog(`🚫 Kept the best ${cap} colourless-only land(s); left out ${cut.slice(0, 5).join(", ")}${cut.length > 5 ? ", …" : ""}.`);
+        }
+
+        // Candidate list for the AI: role cards first, then core staples,
+        // lands, then the best of the rest.
+        const MAX_CANDIDATES = 240;
+        const cand = new Map();
+        const take = (list, n) => { for (const c of list.slice(0, n)) cand.set(c.name, c); };
+        for (const r of research.roles) take(eligible.filter(c => c._roles.includes(r.id)), Math.max(6, r.target * 3));
+        for (const [role, n] of [["ramp", 16], ["draw", 16], ["removal", 16], ["wipe", 6]]) take(eligible.filter(c => c._core === role), n);
+        take(eligible.filter(c => c._core === "land"), 30);
+        for (const c of eligible) { if (cand.size >= MAX_CANDIDATES) break; cand.set(c.name, c); }
+        const candidates = [...cand.values()].sort((a, b) => b._score - a._score);
+        addLog(`📋 Offering the AI ${candidates.length} of ${eligible.length} eligible cards (${candidates.filter(c => c._roles.length).length} fill a commander role).`);
 
         // ── Commander Spellbook: combo discovery ─────────────────────────────
         addLog("💥 Querying Commander Spellbook for combos…");
@@ -4559,14 +4854,32 @@
           addLog(`ℹ️ Spellbook fetch threw: ${(e.message || e).toString().slice(0, 80)}.`);
         }
 
-        const cardList = eligible.slice(0, 150)
-          .map(c => {
-            const price   = c.scryfall?.prices?.usd ? `$${c.scryfall.prices.usd}` : "—";
-            const syn     = synergyMap[c.name.toLowerCase()];
-            const synHint = syn ? ` ★${(syn.synergy * 100).toFixed(0)}%` : "";
-            return `${c.name}${synHint} | ${(c.scryfall.type_line||"").split("—")[0].trim()} | CMC:${c.scryfall.cmc||0} | ${price}`;
-          })
-          .join("\n");
+        const roleLabel = Object.fromEntries(research.roles.map(r => [r.id, r.label]));
+        const cardLine = (c, withText) => {
+          const price   = c.scryfall?.prices?.usd ? `$${c.scryfall.prices.usd}` : "—";
+          const syn     = synergyMap[c.name.toLowerCase()];
+          const synHint = syn ? ` ★${(syn.synergy * 100).toFixed(0)}%` : "";
+          const base = `${c.name}${synHint} | ${(c.scryfall.type_line||"").split("—")[0].trim()} | CMC:${c.scryfall.cmc||0} | ${price}`;
+          if (!withText) return base;
+          const rl = c._roles.length ? ` | ROLE: ${c._roles.map(id => roleLabel[id] || id).join(", ")}` : "";
+          return `${base}${rl} | ${oracleSnippet(c.scryfall, 130)}`;
+        };
+        // Groq's per-minute token limit can't take rules text for 240 cards.
+        const cardList        = candidates.map(c => cardLine(c, true)).join("\n");
+        const cardListCompact = candidates.slice(0, 150).map(c => cardLine(c, false)).join("\n");
+        const cmdrRules = (() => {
+          const sf = chosenCmd.card.scryfall || {};
+          const faces = sf.card_faces?.length ? sf.card_faces : [sf];
+          return faces.map(f => `${f.name}: ${(f.oracle_text || "").replace(/\n/g, " / ")}`).join("\n");
+        })();
+        const planBlock =
+`COMMANDER RULES TEXT:
+${cmdrRules}
+
+COMMANDER PLAN (from research): ${research.plan || "build around the commander's abilities above"}
+ROLE TARGETS — these come before generic synergy filler. Cards tagged "ROLE:" in the list fill them; meet each target if the list has enough:
+${research.roles.map(r => `  - ${r.label}: ${r.target}${r.why ? ` — ${r.why}` : ""}`).join("\n")}
+${research.avoid.length ? `AVOID: ${research.avoid.join("; ")}\n` : ""}`;
         addLog("🤖 Asking AI to build the 99-card deck…");
         setProg(42);
         const sel = BRACKETS.find(b => b.n === bracket) || BRACKETS[2];
@@ -4598,10 +4911,11 @@ ${mechBlock}
 
 Unlimited basic lands available: ${basics.join(", ")||"Wastes"}
 
+${planBlock}
 ${cspbHave.length > 0 ? `Available infinite/synergy combos in this collection (from Commander Spellbook — INCLUDE all combo pieces in the deck and treat them as primary win conditions):
 ${cspbHave.slice(0, 8).map((c, i) => `  ${i+1}. [${c.cards.join(" + ")}] → ${c.produces.join(", ") || "synergy"}`).join("\n")}
 
-` : ""}Eligible non-basic cards from collection (name | type | CMC | est. USD — cards marked ★% have EDHRec synergy scores; prioritise higher ★% values):
+` : ""}Eligible non-basic cards from collection (name | type | CMC | est. USD | ROLE it fills | rules text — ★% = EDHRec synergy with this commander):
 ${cardList}
 
 Build a 99-card Commander deck (the commander is NOT in the 99). Honor the construction targets above as the primary guidance. Adapt the breakdown to the chosen archetypes (e.g. Aggro = lower curve and more creatures; Combo = more tutors and protection; Tokens = anthems & sac outlets). Use this category breakdown:
@@ -4609,6 +4923,7 @@ Build a 99-card Commander deck (the commander is NOT in the 99). Honor the const
   - Card Draw: ~${mech.draw} cards
   - Single-target Removal: ~${mech.removal} cards
   - Board Wipes: ~${mech.wipes} cards
+  - One category per commander role above, named after the role (e.g. "${research.roles[0]?.label || "Synergy"}"), meeting its target
   - Utility / Plan B: 3-5 cards
   - Win Conditions / Synergy / Theme: remaining slots
   - Lands: EXACTLY ${mech.lands} cards target, HARD MAXIMUM ${mech.lands} — count every land (basic AND non-basic AND utility lands). NEVER place land cards in any non-Lands category.
@@ -4620,6 +4935,7 @@ HARD RULES:
   4. Basic lands (${basics.join(", ")||"Wastes"}) are unlimited — REPEAT entries as needed. e.g. Plains may appear many times, each as its own entry.
   5. If 99 - ${mech.lands} gives more non-land slots than fitting cards in your collection, fill the extra slots with ANY remaining synergistic cards from the eligible list (place them under "Synergy" or "Utility"). Do NOT exceed ${mech.lands} lands. Do NOT put land cards in Utility or any non-Lands category.
   6. Each card entry has its own line in the JSON (singletons for non-basics; basics may repeat as many times as needed).
+  7. Every non-land card's "reason" must say how it supports the commander plan or which role it fills — read the rules text, don't guess from the name.
 
 WHEN THE COLLECTION IS SHORT in a category (e.g. fewer than 10 ramp cards, fewer than 5 board wipes):
   - Use whatever fitting cards exist in that category — do not invent cards that aren't in the list.
@@ -4655,6 +4971,8 @@ Total cards across all "cards" arrays MUST equal 99.`;
         // crucial fix vs callAI's API-only fallback: small models (Llama 3.1 8B
         // on Workers AI) routinely return HTTP 200 with garbage like 17 Mountain
         // entries in a row, which API-level fallback can't catch.
+        // Groq gets the same prompt without per-card rules text (token limit).
+        const promptFor = p => p === "groq" ? userPrompt.split(cardList).join(cardListCompact) : userPrompt;
         const retrySys  = sysPrompt + " Respond with the categories array ONLY. Skip theme/description/warnings entirely on this retry.";
         const retryUser = userPrompt + `
 
@@ -4686,7 +5004,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         for (const p of aiOrder) {
           // ── Attempt 1: full prompt ──
           let r1;
-          try { r1 = await callAIOn(p, userPrompt, sysPrompt, DECK_MAX_TOKENS); }
+          try { r1 = await callAIOn(p, promptFor(p), sysPrompt, DECK_MAX_TOKENS); }
           catch (e) {
             addLog(`⚠️ ${PROVIDERS[p].label} failed (${(e.message || "").slice(0,110)}). Trying next provider…`);
             tried.push({ provider: p, error: e.message });
@@ -4725,7 +5043,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           addLog(`⚠️ ${PROVIDERS[p].label}: ${raw0.length} chars (${r1.completionTokens ?? "?"} tokens), ${why}. Retrying focused prompt on same provider…`);
 
           let r2;
-          try { r2 = await callAIOn(p, retryUser, retrySys, DECK_MAX_TOKENS); }
+          try { r2 = await callAIOn(p, retryUser.split(userPrompt).join(promptFor(p)), retrySys, DECK_MAX_TOKENS); }
           catch (e) {
             addLog(`⚠️ ${PROVIDERS[p].label} focused retry failed (${(e.message || "").slice(0,110)}). Trying next provider…`);
             tried.push({ provider: p, replyObj: r1, error: e.message });
@@ -4819,6 +5137,24 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           if (removedCommander > 0) addLog(`🛡️ Removed ${removedCommander} stray commander entr${removedCommander===1?"y":"ies"} from the mainboard.`);
         }
 
+        // Only cards from the eligible pool may stay: the AI sometimes names
+        // cards it wasn't offered (off-colour, not owned, or invented). They're
+        // dropped here and the gap is refilled from the pool below.
+        {
+          const allowed = new Set(eligible.map(c => c.name.toLowerCase()));
+          const basicLower = new Set(["plains","island","swamp","mountain","forest","wastes"]);
+          const outside = [];
+          deckData.categories.forEach(cat => {
+            cat.cards = cat.cards.filter(c => {
+              const nm = (c.name || "").toLowerCase();
+              if (basicLower.has(nm) || allowed.has(nm)) return true;
+              outside.push(c.name); return false;
+            });
+          });
+          deckData.categories = deckData.categories.filter(c => c.cards.length > 0);
+          if (outside.length) addLog(`🛡️ Removed ${outside.length} card(s) that weren't in your eligible pool: ${outside.slice(0, 6).join(", ")}${outside.length > 6 ? ", …" : ""}.`);
+        }
+
         // Post-process: ensure exactly 99 cards, with ≤ mech.lands lands.
         const MAX_LANDS = mech.lands;   // respect the user's construction target exactly
         const basicSet  = new Set(basics.concat(["Wastes"]));
@@ -4890,15 +5226,16 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           const fillBasic = basics[0] || "Wastes";
           const used = new Set(flatNames());
 
-          // Extra NON-LAND cards not yet in the deck, sorted by CMC ascending.
-          // Lands MUST NOT enter the synergy/utility filler — they belong in the
-          // Lands category and would inflate the land count past the user's cap.
+          // Extra NON-LAND cards not yet in the deck, best fit first (commander
+          // roles + EDHRec score). Lands MUST NOT enter the synergy/utility
+          // filler — they belong in the Lands category and would inflate the
+          // land count past the user's cap.
           const extras = eligible
             .filter(c =>
               !used.has(c.name.toLowerCase()) &&
               !basicSet.has(c.name) &&
               !/land/i.test(c.scryfall?.type_line || ""))
-            .sort((a, b) => (a.scryfall?.cmc || 0) - (b.scryfall?.cmc || 0));
+            .sort((a, b) => (b._score || 0) - (a._score || 0));
 
           let synergyCat = deckData.categories.find(c => /synergy|utility|theme/i.test(c.name));
           if (!synergyCat) {
@@ -4916,7 +5253,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           // Pass 1: add non-basic extras (no land-cap concerns).
           while (need > 0 && extras.length > 0) {
             const c = extras.shift();
-            synergyCat.cards.push({ name: c.name, reason: "Auto-added — synergy filler from collection" });
+            synergyCat.cards.push({ name: c.name, reason: c._roles?.length
+              ? `Auto-added — fills: ${c._roles.map(id => roleLabel[id] || id).join(", ")}`
+              : "Auto-added — synergy filler from collection" });
             need--; addedExtras++;
           }
           // Pass 2: fill remaining slots with basics, strictly up to the cap.
@@ -5042,11 +5381,65 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         addLog(`✅ ${finalTotal} cards · ${finalLands} lands${finalTotal === 99 ? " (Commander legal)" : ` — ⚠️ expected 99`}.`);
         deckData.edhrecSuggestions = edhrecSuggestions;   // cards to acquire
         deckData.buildPrefs = { budget: budgetNum, bracket, archetypes };   // swap suggestions honour these
+        deckData.research   = research;                                      // shown in the 🧭 Commander plan panel
         deckData.combosHave        = cspbHave;            // combos achievable now
         deckData.combosAlmost      = cspbAlmost;          // combos one card away
         setDeck(deckData); setProg(100); setPhase("deck");
       } catch(e) { setError(e.message); setPhase("error"); }
     }, [enriched, usable, apiKeys, provider, models, bracket, archetypes, budget, mech]);
+
+    // Save an updated version of the open deck wherever it lives (Collection
+    // deck and/or Library entry) and show it.
+    const persistOpenDeck = (nextDeck) => {
+      setDeck(nextDeck);
+      if ((groups.decks || []).some(d => d.name === deck.theme)) {
+        persistGroups({ ...groups, decks: groups.decks.map(d => d.name === deck.theme ? { ...d, deckData: nextDeck } : d) });
+      }
+      const libMatch = e => libEntryId != null ? e.id === libEntryId : e.deck?.theme === deck.theme;
+      if (library.some(libMatch)) {
+        const updated = library.map(e => libMatch(e) ? { ...e, deck: nextDeck } : e);
+        setLibrary(updated);
+        lsSetItemSafe(LS_LIBRARY, JSON.stringify(updated));
+      }
+    };
+
+    // Run (or re-run) the commander research for the open deck — decks built
+    // before research existed get their plan this way.
+    const researchOpenDeck = async () => {
+      if (researchBusy) return;
+      setResearchBusy(true);
+      try {
+        let edhTop = [];
+        try { const r = await getEdhrec(selCmd); if (r.status === "ok") edhTop = [...r.suggestions].sort((a, b) => ((b.pct || 0) + (b.synergy || 0) / 2) - ((a.pct || 0) + (a.synergy || 0) / 2)); } catch {}
+        const research = await researchCommander([selCmd.card, deck.partner?.card].filter(Boolean), edhTop, {}, () => {});
+        persistOpenDeck({ ...deck, research });
+        if (research.source === "fallback") appAlert({ title: "AI research unavailable", body: "The AI call didn't work, so the plan was guessed from the commander's rules text. Try again later for a full analysis." });
+      } finally {
+        setResearchBusy(false);
+      }
+    };
+
+    // How well the open deck covers each researched role, plus owned and
+    // available cards (in colour, legal, not off-plan) that would fill it.
+    const roleCoverage = () => {
+      const research = deck?.research;
+      if (!research?.roles?.length) return [];
+      const roles = compileRoles(research.roles);
+      const cache = getSFCache();
+      const sfOf = n => cache[(n || "").toLowerCase()]?.d || cache[normCardName(n)]?.d || null;
+      const ci = selCmd?.card?.scryfall?.color_identity || [];
+      const deckCards = [...new Map(deck.categories.flatMap(c => c.cards).map(c => [c.name, c])).values()];
+      const inDeck = new Set([selCmd.card.name, ...deckCards.map(c => c.name)].map(normCardName));
+      const pool = [...new Map((usable || []).map(c => [normCardName(c.name), c])).values()]
+        .filter(c => !inDeck.has(normCardName(c.name)) && !BASIC_NAMES.has(c.name))
+        .map(c => ({ name: c.name, sf: sfOf(c.name) }))
+        .filter(x => x.sf && isEDHLegalCard(x.sf) && (x.sf.color_identity || []).every(col => ci.includes(col)) && !offPlanReason(x.sf, ci));
+      return roles.map(r => {
+        const have = deckCards.filter(c => r.test(sfOf(c.name) || null));
+        const options = pool.filter(x => r.test(x.sf)).sort((a, b) => (a.sf.cmc || 0) - (b.sf.cmc || 0));
+        return { ...r, have, options };
+      });
+    };
 
     // Ownership of the open deck's suggested cards, against the WHOLE
     // collection (not just the build pool), for the insights panels.
@@ -5130,6 +5523,15 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           candidates.push({ name: rec.name, sf, edh: e, score: sc, role: cardRole(sf), price,
             from: rec.where.find(w => w.included)?.name });
         }
+        // Commander plan: favour cards that fill a role the deck is short on,
+        // and avoid cutting the only cards filling a role.
+        const coverage = roleCoverage();
+        const shortRoles = coverage.filter(r => r.target && r.have.length < r.target);
+        const thinRoles  = coverage.filter(r => r.target && r.have.length <= r.target);
+        for (const c of candidates) {
+          const fills = shortRoles.filter(r => r.test(c.sf));
+          if (fills.length) { c.score += 0.3 * fills.length; c.fills = fills.map(r => r.label); }
+        }
         candidates.sort((a, b) => b.score - a.score);
 
         // Cut pool: deck cards minus commanders and combo pieces.
@@ -5143,8 +5545,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             // EDHRec lists basics as near-universal, but one basic is the
             // cheapest slot to give up for a better land, so they rank lowest.
             const basic = BASIC_NAMES.has(c.name);
+            const protectedBy = basic ? 0 : thinRoles.filter(r => r.test(sf)).length;
             return { name: c.name, sf, edh: basic ? null : edh.get(normCardName(c.name)),
-              score: basic ? -1 : score(c.name), role, basic,
+              score: basic ? -1 : score(c.name) + protectedBy * 0.3, role, basic,
               mana_cost: c.mana_cost || sf?.mana_cost || sf?.card_faces?.[0]?.mana_cost || "" };
           });
         const qtyInDeck = n => deckRows.filter(c => c.name === n).length;
@@ -11025,6 +11428,67 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               `}
 
               ${showInsights && !previewingPrecon && (() => {
+                const research = deck.research;
+                const coverage = planOpen ? roleCoverage() : [];
+                const short = research ? roleCoverage().filter(r => r.target && r.have.length < r.target).length : 0;
+                const cmdrShort = selCmd.card.name.split(",")[0];
+                return html`
+                  <div style=${{ background:"var(--bg-surface-soft)", border:"1px solid var(--border-strong)", borderRadius:10,
+                    padding:"12px 18px", marginBottom:18 }}>
+                    <button onClick=${() => setPlanOpen(v => !v)} aria-expanded=${planOpen}
+                      style=${{ all:"unset", cursor:"pointer", display:"flex", alignItems:"center", gap:8, width:"100%" }}>
+                      <span style=${{ color:"var(--accent-dark)" }}>${planOpen ? "▾" : "▸"}</span>
+                      <span style=${{ fontSize:11, letterSpacing:3, color:"var(--accent-dark)", textTransform:"uppercase", fontWeight:700 }}>
+                        🧭 Commander plan
+                      </span>
+                      <span style=${{ marginLeft:"auto", fontSize:11, color:"var(--accent-dark)" }}>
+                        ${!research ? "not researched yet · show" : planOpen ? "hide" : short ? `${short} role${short === 1 ? "" : "s"} short · show` : "all roles covered · show"}
+                      </span>
+                    </button>
+                    ${planOpen && !research && html`
+                      <div style=${{ fontSize:12, color:"var(--fg-text-body)", marginTop:8, lineHeight:1.6 }}>
+                        This deck was built before commander research existed. Research reads ${cmdrShort}'s rules text, works out what the deck needs, and checks which of your cards fill each role.
+                        <div style=${{ marginTop:8 }}>
+                          <button onClick=${researchOpenDeck} disabled=${researchBusy}
+                            style=${{ ...btn, padding:"6px 14px", fontSize:12 }}>${researchBusy ? "Researching…" : `🧭 Research ${cmdrShort}`}</button>
+                        </div>
+                      </div>`}
+                    ${planOpen && research && html`
+                      ${research.plan && html`<div style=${{ fontSize:13, color:"var(--fg-text)", marginTop:8, lineHeight:1.6 }}>${research.plan}</div>`}
+                      <div style=${{ display:"flex", flexDirection:"column", gap:10, marginTop:10 }}>
+                        ${coverage.map(r => {
+                          const ok = !r.target || r.have.length >= r.target;
+                          return html`
+                            <div key=${r.id} style=${{ fontSize:12, lineHeight:1.5 }}>
+                              <div style=${{ display:"flex", alignItems:"baseline", gap:8, flexWrap:"wrap" }}>
+                                <strong style=${{ color:"var(--fg-text-heading)" }}>${r.label}</strong>
+                                <span style=${{ fontWeight:700, color: ok ? "var(--success-text)" : "var(--warning)" }}>
+                                  ${ok ? "✓" : "⚠"} ${r.have.length}/${r.target || "–"}
+                                </span>
+                                ${r.why && html`<span style=${{ color:"var(--fg-text-muted)" }}>${r.why}</span>`}
+                              </div>
+                              ${r.have.length > 0 && html`<div style=${{ color:"var(--fg-text-body)" }}>In deck: ${r.have.map(c => c.name).join(", ")}</div>`}
+                              ${!ok && html`<div style=${{ color:"var(--info)" }}>
+                                ${r.options.length
+                                  ? html`Available in your collection: <strong>${r.options.slice(0, 6).map(x => x.name).join(", ")}</strong>${r.options.length > 6 ? ` +${r.options.length - 6} more` : ""}`
+                                  : "None available in your collection — see EDHRec cards below."}
+                              </div>`}
+                            </div>`;
+                        })}
+                      </div>
+                      ${research.avoid?.length > 0 && html`<div style=${{ fontSize:12, color:"var(--fg-text-muted)", marginTop:10 }}>
+                        <strong>Avoid:</strong> ${research.avoid.join(" · ")}</div>`}
+                      <div style=${{ display:"flex", alignItems:"center", gap:10, marginTop:10, flexWrap:"wrap" }}>
+                        <span style=${{ fontSize:11, color:"var(--fg-text-muted)", fontStyle:"italic" }}>
+                          ${research.source === "fallback" ? "Guessed from the rules text (AI research was unavailable)." : "Researched by AI from the commander's rules text."} Card roles are matched from each card's rules text.
+                        </span>
+                        <button onClick=${researchOpenDeck} disabled=${researchBusy}
+                          style=${{ ...btnSec, padding:"3px 10px", fontSize:11, marginLeft:"auto" }}>${researchBusy ? "Researching…" : "↻ Research again"}</button>
+                      </div>`}
+                  </div>`;
+              })()}
+
+              ${showInsights && !previewingPrecon && (() => {
                 const key = `${selCmd.card.name}|${deck.theme}`;
                 const st = swapState?.key === key ? swapState : null;
                 const pctText = e => e ? `in ${Math.round((e.pct || 0) * 100)}% of ${selCmd.card.name.split(",")[0]} decks` : "not on EDHRec's list for this commander";
@@ -11074,7 +11538,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 </div>
                                 <div><span style=${{ color:"var(--success-text)", fontWeight:700 }}>＋ ${sw.add.name}</span>
                                   ${" "}<${ManaCost} cost=${(sw.add.sf?.mana_cost || sw.add.sf?.card_faces?.[0]?.mana_cost || "").split("//")[0].trim()} size=${13} />
-                                  <span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}> · ${ROLE_LABEL[sw.add.role]} · ${pctText(sw.add.edh)}${sw.add.edh?.synergy ? ` · synergy ${sw.add.edh.synergy > 0 ? "+" : ""}${Math.round(sw.add.edh.synergy * 100)}%` : ""}${sw.add.price ? ` · $${sw.add.price.toFixed(2)}` : ""}${sw.add.from ? ` · in "${sw.add.from}"` : ""}</span></div>
+                                  <span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}> · ${sw.add.fills?.length ? html`<strong style=${{ color:"var(--success-text)" }}>fills ${sw.add.fills.join(", ")}</strong> · ` : ""}${ROLE_LABEL[sw.add.role]} · ${pctText(sw.add.edh)}${sw.add.edh?.synergy ? ` · synergy ${sw.add.edh.synergy > 0 ? "+" : ""}${Math.round(sw.add.edh.synergy * 100)}%` : ""}${sw.add.price ? ` · $${sw.add.price.toFixed(2)}` : ""}${sw.add.from ? ` · in "${sw.add.from}"` : ""}</span></div>
                                 <div><span style=${{ color:"var(--danger-text)", fontWeight:700 }}>− ${sw.cut.name}</span>
                                   ${" "}<${ManaCost} cost=${(sw.cut.mana_cost || "").split("//")[0].trim()} size=${13} />
                                   <span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}> · ${sw.cut.basic ? "one of your basic lands" : `${ROLE_LABEL[sw.cut.role]} · ${pctText(sw.cut.edh)}`}</span></div>

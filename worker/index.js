@@ -717,23 +717,32 @@ const SHARED_GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemi
 const SHARED_GEMINI_MAX_INPUT_CHARS = 120000;
 const QUOTA_KEY_PREFIX = "quota:";
 
-function quotaKey(email) {
+// Small preparatory calls (commander research before a deck build) are
+// flagged `prelude` by the client and counted separately, so research + build
+// still cost one request against the daily cap. They're limited in size and
+// to PRELUDE_PER_BUILD per allowed build, so they can't be used as a free
+// side channel.
+const PRELUDE_PER_BUILD = 2;
+const PRELUDE_MAX_INPUT_CHARS = 30000;
+const PRELUDE_MAX_TOKENS = 4096;
+
+function quotaKey(email, kind = "") {
   // UTC date as the bucket. Two friends in different timezones may see the
   // boundary at slightly different "local midnights" — acceptable trade-off.
   const today = new Date().toISOString().slice(0, 10);
-  return `${QUOTA_KEY_PREFIX}${today}:${email}`;
+  return `${QUOTA_KEY_PREFIX}${kind}${today}:${email}`;
 }
 
-async function readUsage(env, email) {
+async function readUsage(env, email, kind = "") {
   if (!env.STATE) return 0;
-  const raw = await env.STATE.get(quotaKey(email));
+  const raw = await env.STATE.get(quotaKey(email, kind));
   const n = parseInt(raw);
   return Number.isFinite(n) ? n : 0;
 }
 
-async function bumpUsage(env, email, current) {
+async function bumpUsage(env, email, current, kind = "") {
   if (!env.STATE) return;
-  await env.STATE.put(quotaKey(email), String(current + 1), {
+  await env.STATE.put(quotaKey(email, kind), String(current + 1), {
     expirationTtl: 25 * 60 * 60,   // 25h: bucket evaporates after the day ends
   });
 }
@@ -777,9 +786,18 @@ async function handleSharedGemini(request, env) {
     return jsonResponse({ error: "Per-user quota tracking requires KV — see docs/SYNC_SETUP.md." }, 503);
   }
 
+  let body;
+  try { body = await request.json(); }
+  catch { return jsonResponse({ error: "request body must be JSON" }, 400); }
+  const prelude = body.prelude === true;
+
   // Daily cap check (BEFORE the upstream call — no point in burning quota
-  // for a user who's already maxed out).
+  // for a user who's already maxed out). A prelude still needs a build left.
   const used = await readUsage(env, email);
+  const preUsed = prelude ? await readUsage(env, email, "pre:") : 0;
+  if (prelude && preUsed >= SHARED_GEMINI_DAILY_CAP * PRELUDE_PER_BUILD) {
+    return jsonResponse({ error: "Daily shared-key research limit reached", used, cap: SHARED_GEMINI_DAILY_CAP, remaining: Math.max(0, SHARED_GEMINI_DAILY_CAP - used) }, 429);
+  }
   if (used >= SHARED_GEMINI_DAILY_CAP) {
     return jsonResponse({
       error: "Daily shared-key cap reached",
@@ -788,18 +806,14 @@ async function handleSharedGemini(request, env) {
     }, 429);
   }
 
-  let body;
-  try { body = await request.json(); }
-  catch { return jsonResponse({ error: "request body must be JSON" }, 400); }
-
   const system     = (body.system || "").toString();
   const user       = (body.user   || "").toString();
-  const max_tokens = Math.min(parseInt(body.max_tokens) || 4096, 24576);
+  const max_tokens = Math.min(parseInt(body.max_tokens) || 4096, prelude ? PRELUDE_MAX_TOKENS : 24576);
   const requested  = (body.model || "").toString();
   const model      = SHARED_GEMINI_MODELS.includes(requested) ? requested : SHARED_GEMINI_DEFAULT_MODEL;
 
   if (!user) return jsonResponse({ error: "missing 'user' field" }, 400);
-  if (system.length + user.length > SHARED_GEMINI_MAX_INPUT_CHARS) {
+  if (system.length + user.length > (prelude ? PRELUDE_MAX_INPUT_CHARS : SHARED_GEMINI_MAX_INPUT_CHARS)) {
     return jsonResponse({ error: "Prompt too large for the shared key." }, 413);
   }
 
@@ -807,8 +821,10 @@ async function handleSharedGemini(request, env) {
   // no atomic increment, so parallel requests can still slip a few past the
   // cap, but this closes the window to the KV round-trip instead of the whole
   // (multi-second) Gemini call.
-  await bumpUsage(env, email, used);
-  const refund = () => env.STATE.put(quotaKey(email), String(used), { expirationTtl: 25 * 60 * 60 });
+  const kind = prelude ? "pre:" : "";
+  const before = prelude ? preUsed : used;
+  await bumpUsage(env, email, before, kind);
+  const refund = () => env.STATE.put(quotaKey(email, kind), String(before), { expirationTtl: 25 * 60 * 60 });
 
   // Forward to Gemini using the host's key.
   // Key goes in a header, not the query string, so it can't end up in URL logs.
@@ -853,9 +869,9 @@ async function handleSharedGemini(request, env) {
     completionTokens: data.usageMetadata?.candidatesTokenCount || null,
     promptTokens:     data.usageMetadata?.promptTokenCount     || null,
     thoughtsTokens:   data.usageMetadata?.thoughtsTokenCount   || null,
-    quotaUsed:        used + 1,
+    quotaUsed:        prelude ? used : used + 1,
     quotaCap:         SHARED_GEMINI_DAILY_CAP,
-    quotaRemaining:   SHARED_GEMINI_DAILY_CAP - (used + 1),
+    quotaRemaining:   SHARED_GEMINI_DAILY_CAP - (prelude ? used : used + 1),
   });
 }
 
