@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.10-k";
+  const APP_VERSION = "v2026.10.10-l";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -2714,6 +2714,57 @@
     return names.length ? `${normCardName(cmdrName)}|${names.join("\u0001")}` : null;
   }
 
+  // ── Re-import: keep built decks reserved ────────────────────────────────
+  // A Manabox / Moxfield export lists what the user OWNS; it doesn't know
+  // which cards Commander Forge has set aside for built ("Forge") decks. A
+  // re-import replaces the binders with fresh counts, which would make every
+  // built-deck card available again. This takes them out of the newly
+  // imported binders once more — same binder and printing as before where
+  // possible — and reports cards the export no longer has.
+  //   decks:          current groups.decks (only source "generated" are touched)
+  //   newCsvBinders:  binders from the new export (copied, not mutated)
+  //   csvBinderNames: names of binders that come from CSV (old ∪ new); deck
+  //                   rows taken from any other binder (e.g. Uncategorised,
+  //                   which the import keeps) are already subtracted there.
+  function reserveBuiltDecks(decks, newCsvBinders, csvBinderNames, binInc) {
+    const binders = newCsvBinders.map(b => ({ ...b, cards: (b.cards || []).map(c => ({ ...c })) }));
+    const shortfalls = [];
+    let reserved = 0, builtDecks = 0;
+    const k = normCardName;
+    const nextDecks = decks.map(d => {
+      if (d.source !== "generated") return d;
+      builtDecks++;
+      const rows = [];
+      for (const r of d.cards || []) {
+        const skip = BASIC_NAMES.has(r.name)
+          || (!d.reservedV && r.name === d.commanderName)           // older saves never reserved the commander
+          || (r.from && !csvBinderNames.has(r.from) && !r.notOwned); // lives in a kept, non-CSV binder
+        if (skip) { rows.push(r); continue; }
+        let need = r.qty || 1;
+        const cands = [];
+        for (const b of binders) for (const c of b.cards) {
+          if (k(c.name) !== k(r.name) || (c.qty || 0) <= 0) continue;
+          cands.push({ b, c, rank: (b.name === r.from ? 0 : 2) + (r.id && c.id === r.id ? 0 : 1) + (binInc[b.name] === false ? 4 : 0) });
+        }
+        cands.sort((a, b) => a.rank - b.rank);
+        for (const { b, c } of cands) {
+          if (need <= 0) break;
+          const take = Math.min(c.qty, need);
+          c.qty -= take; need -= take; reserved += take;
+          rows.push({ name: r.name, qty: take, id: c.id || "", condition: c.condition || "NM",
+            finish: c.finish || "normal", lang: c.lang || "en", ...(c.misprint ? { misprint: true } : {}), from: b.name });
+        }
+        if (need > 0) {
+          if (!r.notOwned) shortfalls.push({ name: r.name, deck: d.name, missing: need });
+          rows.push({ name: r.name, qty: need, id: r.id || "", notOwned: true });
+        }
+      }
+      return { ...d, cards: rows };
+    });
+    binders.forEach(b => { b.cards = b.cards.filter(c => (c.qty || 0) > 0); });
+    return { decks: nextDecks, binders, shortfalls, reserved, builtDecks };
+  }
+
   // ── Deck insights: ownership + swap suggestions ─────────────────────────
   // Name key that survives accents, case and double-faced names, so
   // "Arwen Undómiel" from EDHRec matches "Arwen Undomiel" in a CSV import.
@@ -4173,6 +4224,16 @@
         setError(`No cards found in the ${src} CSV. Make sure you exported the full collection.`); return;
       }
 
+      // Keep built Forge decks reserved: take their cards out of the new
+      // binders again (see reserveBuiltDecks) before applying or diffing, so
+      // the review only shows real changes.
+      const csvBinderNames = new Set([
+        ...(groups.binders || []).filter(isCsvSourced).map(b => b.name),
+        ...parsed.binders.map(b => b.name),
+      ]);
+      const reserve = reserveBuiltDecks(groups.decks || [], parsed.binders, csvBinderNames, binInc);
+      const builtByName = new Map(reserve.decks.filter(d => d.source === "generated").map(d => [d.name, d]));
+
       // First import or no CSV-sourced data present → apply directly (no
       // review needed because there's nothing to diff against).
       const hasExistingCsvData =
@@ -4183,25 +4244,29 @@
         const di = {}; parsed.decks.forEach(d => { di[d.name] = false; });
         const bi = {}; parsed.binders.forEach(b => { bi[b.name] = true; });
         // Preserve any non-CSV entries (generated decks, URL-imported decks).
-        const preservedDecks   = (groups.decks   || []).filter(d => !isCsvSourced(d));
+        const preservedDecks   = (groups.decks   || []).filter(d => !isCsvSourced(d)).map(d => builtByName.get(d.name) || d);
         const preservedBinders = (groups.binders || []).filter(b => !isCsvSourced(b));
         // Their existing inclusion settings should survive.
         preservedDecks.forEach(d => { if (!(d.name in di)) di[d.name] = !!deckInc[d.name]; });
         preservedBinders.forEach(b => { if (!(b.name in bi)) bi[b.name] = !!binInc[b.name]; });
         setGroups({
           decks:   [...preservedDecks, ...parsed.decks],
-          binders: [...preservedBinders, ...parsed.binders],
+          binders: [...preservedBinders, ...reserve.binders],
         });
         setDeckInc(di); setBinInc(bi);
-        setParseStats({ ...parsed.stats, format: parsed.format });
+        setParseStats({ ...parsed.stats, format: parsed.format,
+          reserved: reserve.reserved, shortfalls: reserve.shortfalls.length });
         setError(""); setCsv("");
         setPhase("select");
         return;
       }
 
-      // Existing CSV data — compute diff and let the user review before applying.
-      const diff = diffGroups(groups, { decks: parsed.decks, binders: parsed.binders });
-      setImportReview({ parsed, diff });
+      // Existing CSV data — compute diff and let the user review before
+      // applying. diffRaw is the opt-out ("my export already leaves out the
+      // cards in my built decks").
+      const diff    = diffGroups(groups, { decks: parsed.decks, binders: reserve.binders });
+      const diffRaw = diffGroups(groups, { decks: parsed.decks, binders: parsed.binders });
+      setImportReview({ parsed, diff, diffRaw, reserve, builtByName, useReserve: true });
       setError(""); setCsv("");
       setPhase("import_review");
     };
@@ -4212,10 +4277,12 @@
     // that survive, with sensible defaults for new ones.
     const applyImportChanges = () => {
       if (!importReview) return;
-      const { parsed, diff } = importReview;
+      const { parsed, reserve, builtByName } = importReview;
+      const useReserve = importReview.useReserve !== false && !!reserve;
+      const diff = useReserve ? importReview.diff : (importReview.diffRaw || importReview.diff);
 
-      const nextDecks   = [...diff.preservedDecks,   ...parsed.decks];
-      const nextBinders = [...diff.preservedBinders, ...parsed.binders];
+      const nextDecks   = [...diff.preservedDecks.map(d => (useReserve && builtByName?.get(d.name)) || d), ...parsed.decks];
+      const nextBinders = [...diff.preservedBinders, ...(useReserve ? reserve.binders : parsed.binders)];
 
       const di = {};
       const bi = {};
@@ -8280,7 +8347,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
           <!-- ── IMPORT REVIEW (Collection Check) ───────────────────────── -->
           ${phase === "import_review" && importReview && (() => {
-            const { parsed, diff } = importReview;
+            const { parsed, reserve } = importReview;
+            const useReserve = importReview.useReserve !== false && !!reserve;
+            const diff = useReserve ? importReview.diff : (importReview.diffRaw || importReview.diff);
             const fmtBadge = parsed.format === "moxfield"
               ? { txt:"MOXFIELD", bg:"var(--info-bg)", col:"var(--info)", brd:"var(--info-border)" }
               : { txt:"MANABOX",  bg:"var(--bg-surface-soft)", col:"var(--accent-dark)", brd:"var(--border-dashed)" };
@@ -8324,6 +8393,27 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   </button>
                 </div>
               </div>
+
+              ${reserve && reserve.builtDecks > 0 && html`
+                <div style=${{ marginBottom:14, padding:"12px 16px", borderRadius:10, background:"var(--info-bg)",
+                  border:"1px solid var(--info-border)", fontSize:13, color:"var(--fg-text-heading)", lineHeight:1.6 }}>
+                  <div style=${{ fontWeight:700, marginBottom:4 }}>📦 Your built decks stay reserved</div>
+                  <div style=${{ color:"var(--fg-text-body)" }}>
+                    ${useReserve
+                      ? html`<strong>${reserve.reserved}</strong> card${reserve.reserved === 1 ? "" : "s"} in your ${reserve.builtDecks} built deck${reserve.builtDecks === 1 ? "" : "s"} will be taken out of the imported binders again, so the new counts don't make them available twice.`
+                      : html`Built-deck cards are <strong>not</strong> taken out of the imported binders — use this only if your export already leaves them out.`}
+                  </div>
+                  ${useReserve && reserve.shortfalls.length > 0 && html`
+                    <div style=${{ marginTop:8, color:"var(--warning)" }}>
+                      ⚠️ ${reserve.shortfalls.length} built-deck card${reserve.shortfalls.length === 1 ? " isn't" : "s aren't"} in this export any more (sold, traded or moved?) and will show as not owned:
+                      <span style=${{ color:"var(--fg-text-body)" }}> ${reserve.shortfalls.slice(0, 10).map(x => `${x.name}${x.missing > 1 ? ` ×${x.missing}` : ""} (${x.deck.replace(/^Forge: /, "")})`).join(" · ")}${reserve.shortfalls.length > 10 ? ` · …and ${reserve.shortfalls.length - 10} more` : ""}</span>
+                    </div>`}
+                  <label style=${{ display:"flex", alignItems:"center", gap:6, marginTop:8, fontSize:12, color:"var(--fg-text-muted)", cursor:"pointer" }}>
+                    <input type="checkbox" checked=${!useReserve}
+                      onChange=${() => setImportReview(r => ({ ...r, useReserve: !(r.useReserve !== false) }))} />
+                    My export already leaves out the cards in my built decks (I moved them in Manabox)
+                  </label>
+                </div>`}
 
               <!-- Summary -->
               <div style=${{
