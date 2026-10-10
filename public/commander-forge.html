@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.10-c";
+  const APP_VERSION = "v2026.10.10-d";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -3082,6 +3082,7 @@
     // by query so the user can pick a card to move into the open deck.
     const [addToDeckOpen,  setAddToDeckOpen]  = useState(false);
     const [pickListOpen,   setPickListOpen]   = useState(false);
+    const [deckDeleteAsk,  setDeckDeleteAsk]  = useState(null);   // name of the Collection deck pending deletion
     const [pickChecked,    setPickChecked]    = useState(() => new Set());
     const [pickHideDone,   setPickHideDone]   = useState(false);
     const [addToDeckQuery, setAddToDeckQuery] = useState("");
@@ -5130,54 +5131,78 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         title = `${baseTitle} (${counter++})`;
       }
 
-      // Build the card list for this saved-deck entry (flatten categories).
-      const deckCards = deck.categories.flatMap(cat =>
-        cat.cards.map(c => ({ name: c.name, qty: 1, id: "" }))
-      );
-      // Merge duplicates (e.g. basic lands appearing multiple times).
-      const merged = new Map();
-      for (const c of deckCards) {
-        if (merged.has(c.name)) merged.get(c.name).qty += c.qty;
-        else merged.set(c.name, { ...c });
-      }
-      // Add commander itself (it's the 100th card; lives in the same deck row).
-      if (!merged.has(cmdrName)) merged.set(cmdrName, { name: cmdrName, qty: 1, id: "" });
+      // Count every card once (merging duplicates such as basic lands),
+      // commander(s) included — they come out of the drawer too.
+      const counts = new Map();
+      const addCount = (name) => counts.set(name, (counts.get(name) || 0) + 1);
+      const cmdrNames = new Set([cmdrName, deck.partner?.card?.name].filter(Boolean));
+      cmdrNames.forEach(addCount);
+      deck.categories.forEach(cat => cat.cards.forEach(c => { if (!cmdrNames.has(c.name)) addCount(c.name); }));
 
-      // Subtract non-basic cards from binders. We mutate copies of the binder
-      // entries to keep the original `groups` object untouched until we apply
-      // the new state at the end.
+      // Plan which binder rows each card comes from. Copies of the binders
+      // are mutated so `groups` stays untouched until the state update below.
       const nextDecks   = [...groups.decks];
       const nextBinders = groups.binders.map(b => ({
         ...b, cards: b.cards.map(c => ({ ...c })),   // deep-ish copy
       }));
-      for (const card of merged.values()) {
-        if (basics.has(card.name)) continue;   // unlimited
-        if (card.name === cmdrName) continue;  // commander not necessarily in binder
-        let needed = card.qty;
+      // Deck rows remember the printing and the binder each copy came from,
+      // so deleting the deck later can put the cards back where they were.
+      const deckRows = [];
+      let reserved = 0;
+      const notOwned = [];
+      for (const [name, qty] of counts) {
+        if (basics.has(name)) { deckRows.push({ name, qty, id: "" }); continue; }   // unlimited
+        let needed = qty;
         for (const bin of nextBinders) {
           if (needed <= 0) break;
-          const entry = bin.cards.find(c => c.name === card.name && (c.qty || 0) > 0);
+          const entry = bin.cards.find(c => c.name === name && (c.qty || 0) > 0);
           if (!entry) continue;
           const take = Math.min(entry.qty, needed);
           entry.qty -= take;
           needed    -= take;
+          reserved  += take;
+          deckRows.push({
+            name, qty: take, id: entry.id || "",
+            condition: entry.condition || "NM", finish: entry.finish || "normal", lang: entry.lang || "en",
+            ...(entry.misprint ? { misprint: true } : {}),
+            from: bin.name,
+          });
         }
-        // Trim zero-qty entries so the binder view stays clean.
+        if (needed > 0) {
+          notOwned.push(name);
+          deckRows.push({ name, qty: needed, id: "", notOwned: true });
+        }
       }
       for (const bin of nextBinders) {
-        bin.cards = bin.cards.filter(c => (c.qty || 0) > 0);
+        bin.cards = bin.cards.filter(c => (c.qty || 0) > 0);   // trim emptied rows
       }
 
+      const ownedNote = notOwned.length
+        ? `\n\n${notOwned.length} card${notOwned.length > 1 ? "s aren't" : " isn't"} in your binders, so nothing is removed for ${notOwned.length > 1 ? "them" : "it"}: ${notOwned.slice(0, 8).join(", ")}${notOwned.length > 8 ? ", …" : ""}.`
+        : "";
+      if (!window.confirm(
+        `Mark this deck as built?\n\n` +
+        `${reserved} card${reserved === 1 ? "" : "s"} (commander included) will be taken out of your binders, ` +
+        `so they won't be suggested for other decks. Basic lands aren't counted.\n\n` +
+        `The deck moves to Collection → Decks as "${title}"` +
+        `${libSaved && libEntryId != null ? " and out of the Library" : ""}. ` +
+        `Deleting it later lets you put the cards back into your binders.` + ownedNote
+      )) return;
+
+      // The deck's theme doubles as its Collection key everywhere (add /
+      // remove / swap cards, rename, delete), so it must match the entry name.
+      const savedDeck = { ...deck, theme: title };
       const newEntry = {
         name: title,
         type: "deck",
-        cards: [...merged.values()],
+        cards: deckRows,
         commanderName: cmdrName,
         source: "generated",
+        reservedV: 2,          // commander reserved + per-copy origin recorded
         savedAt: Date.now(),
         // Preserve the full deck object so the Collection preview can render
         // mana curve / categories / commander art identically to the Library.
-        deckData: deck,
+        deckData: savedDeck,
         selCmd: selCmd,
       };
       nextDecks.push(newEntry);
@@ -5188,6 +5213,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
       setGroups(nextGroups);
       setDeckInc(nextDeckInc);
+      setDeck(savedDeck);
+      setFromCollection(true);
       setUsable(nextUsable);
       lsSetItemSafe(LS_BINDERS, JSON.stringify({
         groups: nextGroups, deckInc: nextDeckInc, binInc,
@@ -6016,18 +6043,77 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setBinderDeleteTarget("__uncategorised__");
     };
 
+    // Which rows of a deck are physical cards that can go back into binders.
+    // Forge decks never took basics out of the binders, nor cards the user
+    // didn't own; ones saved before reservedV 2 didn't take the commander.
+    const returnableRows = (target) => (target.cards || []).filter(r => {
+      if (target.source !== "generated") return true;
+      if (BASIC_NAMES.has(r.name) || r.notOwned) return false;
+      if (!target.reservedV && r.name === target.commanderName) return false;
+      return true;
+    });
+
+    // Put a deck's cards back into binders: each copy goes to the binder it
+    // was taken from when that's known and still exists, otherwise to
+    // Uncategorised. Same-printing rows merge (id/condition/finish/lang/misprint).
+    const returnDeckCards = (target, binders, inc) => {
+      let nextBinders = binders.map(b => ({ ...b, cards: [...(b.cards || [])] }));
+      let nextInc = inc;
+      const touched = new Set();
+      let returned = 0;
+      for (const r of returnableRows(target)) {
+        const dest = r.from && nextBinders.some(b => b.name === r.from) ? r.from : UNCATEGORISED;
+        if (!nextBinders.some(b => b.name === dest)) {
+          nextBinders.push({ name: dest, type: "binder", cards: [], commanderName: null, source: "manual" });
+          nextInc = { ...nextInc, [dest]: true };
+        }
+        const bin = nextBinders.find(b => b.name === dest);
+        const same = c => (c.id || "") === (r.id || "")
+          && (c.name || "").toLowerCase() === (r.name || "").toLowerCase()
+          && (c.condition || "NM") === (r.condition || "NM")
+          && (c.finish || "normal") === (r.finish || "normal")
+          && (c.lang || "en") === (r.lang || "en")
+          && !!c.misprint === !!r.misprint;
+        const qty = r.qty || 1;
+        const idx = bin.cards.findIndex(same);
+        if (idx >= 0) bin.cards[idx] = { ...bin.cards[idx], qty: (bin.cards[idx].qty || 1) + qty };
+        else bin.cards.push({
+          name: r.name, qty, id: r.id || "",
+          condition: r.condition || "NM", finish: r.finish || "normal", lang: r.lang || "en",
+          ...(r.misprint ? { misprint: true } : {}),
+        });
+        touched.add(dest);
+        returned += qty;
+      }
+      return { binders: nextBinders, binInc: nextInc, touched, returned };
+    };
+
+    // Opens the delete dialog; finishDeleteDeck does the work.
     const deleteDeck = (name) => {
+      if ((groups.decks || []).some(d => d.name === name)) setDeckDeleteAsk(name);
+    };
+
+    const finishDeleteDeck = (name, returnCards) => {
+      setDeckDeleteAsk(null);
       const target = (groups.decks || []).find(d => d.name === name);
       if (!target) return;
-      const cardCount = (target.cards || []).reduce((s, c) => s + (c.qty || 1), 0);
-      const msg = cardCount > 0
-        ? `Delete deck "${name}"? This removes ${cardCount} cards from your collection. This cannot be undone.`
-        : `Delete empty deck "${name}"?`;
-      if (!window.confirm(msg)) return;
       const nextDecks = (groups.decks || []).filter(d => d.name !== name);
-      const nextGroups = { ...groups, decks: nextDecks };
+      let nextBinders = groups.binders || [];
+      let nextBinInc  = binInc;
+      if (returnCards) {
+        const res = returnDeckCards(target, nextBinders, binInc);
+        nextBinders = res.binders;
+        nextBinInc  = res.binInc;
+        setBinderEnriched(m => { const next = { ...m }; res.touched.forEach(b => delete next[b]); return next; });
+      }
+      const nextGroups = { ...groups, decks: nextDecks, binders: nextBinders };
       const nextDeckInc = { ...deckInc }; delete nextDeckInc[name];
       setDeckInc(nextDeckInc);
+      setBinInc(nextBinInc);
+      // Returned cards are available again for analysis.
+      const nextUsable = computeUsable(nextGroups, nextDeckInc, nextBinInc);
+      setUsable(nextUsable);
+      lsSetItemSafe(LS_CARDS, JSON.stringify(nextUsable));
       // If the user is currently viewing the deck we just removed, bail
       // back to the Collection so we don't render stale state.
       if (deck && deck.theme === name) {
@@ -6035,7 +6121,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         setFromCollection(false); setFromSaved(false);
         setPhase("select");
       }
-      persistGroups(nextGroups, nextDeckInc, binInc);
+      persistGroups(nextGroups, nextDeckInc, nextBinInc);
     };
 
     // Move every row of a printing (rows sharing the same Scryfall id) from
@@ -6145,6 +6231,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           finish: row.finish || "normal",
           lang: row.lang || "en",
           ...(row.misprint ? { misprint: true } : {}),
+          from: binderName,
         });
       }
 
@@ -6390,6 +6477,15 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
     const loadCollectionDeck = d => {
       if (d.source !== "generated" || !d.deckData || !d.selCmd) return;
+      // Decks saved before the theme-as-key fix kept their AI theme while the
+      // Collection entry is named "Forge: …", which broke add / remove / swap
+      // / rename / delete for them. Align the theme with the entry name up
+      // front so every step below (including the async re-heal) uses it.
+      if (d.deckData.theme !== d.name) {
+        d = { ...d, deckData: { ...d.deckData, theme: d.name } };
+        const fixed = d;
+        persistGroups({ ...groups, decks: (groups.decks || []).map(x => x.name === fixed.name ? fixed : x) });
+      }
       // Preserve any unsaved built deck the same way loadFromLibrary does.
       if (!fromSaved && !fromCollection && deck && selCmd && !previewingPrecon) {
         setUnsavedDeck({ deck, selCmd });
@@ -10220,12 +10316,13 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     `;
                   })()}
                   ${!previewingPrecon && html`
+                    ${(groups.decks || []).some(d => d.name === deck.theme) && html`
                     <button onClick=${() => { setAddToDeckQuery(""); setAddToDeckOpen(true); }}
-                      title="Pull a card from one of your binders into this deck"
+                      title="Move a card from one of your binders into this built deck"
                       style=${{ ...btn, padding:"6px 14px", fontSize:11,
                         background:"linear-gradient(135deg,#5a3a10,#a06030)" }}>
-                      ➕ Add from collection
-                    </button>
+                      ➕ Add card from binder
+                    </button>`}
                     <button onClick=${exportDeck} style=${{ ...btnSec, padding:"6px 14px", fontSize:11 }}>
                       ⬇ Export .txt
                     </button>
@@ -10238,15 +10335,16 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       🗂 Pick list
                     </button>
                     ${!libSaved && !fromCollection && html`<button onClick=${saveDeckToLibrary}
+                      title="Keep this deck idea for later. Doesn't change your collection."
                       style=${{ ...btn, padding:"6px 14px", fontSize:11,
                         background:"linear-gradient(135deg,var(--success),#2e8a44)" }}>
                       💾 Save to Library
                     </button>`}
                     ${!deckSaved && html`<button onClick=${saveDeckToCollection}
-                      title="Saves the deck under Collection → Decks and reserves its non-basic cards from the eligible pool."
+                      title="You've pulled the cards: takes them (and the commander) out of your binders so other decks don't use them, and moves the deck to Collection → Decks."
                       style=${{ ...btnSec, padding:"6px 14px", fontSize:11,
                         borderColor:"var(--accent-dark)", color:"var(--accent-dark)" }}>
-                      📦 Save to Collection
+                      📦 I built this deck
                     </button>`}
                   `}
                   ${previewingPrecon && (() => {
@@ -11686,6 +11784,46 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       })()}
 
       <!-- ── Add card from collection to the open deck ────────────────────── -->
+      ${deckDeleteAsk && (() => {
+        const target = (groups.decks || []).find(d => d.name === deckDeleteAsk);
+        if (!target) return null;
+        const total = (target.cards || []).reduce((n, c) => n + (c.qty || 1), 0);
+        const back  = returnableRows(target).reduce((n, c) => n + (c.qty || 1), 0);
+        const close = () => setDeckDeleteAsk(null);
+        return html`
+          <div onClick=${close}
+            style=${{ position:"fixed", inset:0, background:"rgba(20,10,0,0.45)",
+              display:"flex", alignItems:"flex-start", justifyContent:"center", paddingTop:"12vh", zIndex:9999 }}>
+            <div onClick=${e => e.stopPropagation()} role="dialog" aria-label=${`Delete deck ${deckDeleteAsk}`}
+              style=${{ background:"var(--bg-surface-softer)", border:"1px solid var(--border)", borderRadius:12,
+                width:"min(460px, 94vw)", padding:"16px 18px", boxShadow:"0 8px 32px rgba(0,0,0,0.35)" }}>
+              <div style=${{ fontSize:15, fontWeight:700, color:"var(--fg-text-heading)", marginBottom:6 }}>
+                Delete "${deckDeleteAsk}"?
+              </div>
+              <div style=${{ fontSize:13, color:"var(--fg-text-body)", lineHeight:1.6, marginBottom:14 }}>
+                ${total === 0
+                  ? "This deck is empty."
+                  : back > 0
+                    ? html`Taking the deck apart? Put its <strong>${back}</strong> card${back === 1 ? "" : "s"} back into your binders so ${back === 1 ? "it" : "they"} can be used again.${back < total ? html` ${total - back} other card${total - back === 1 ? " was" : "s were"} never taken out of your binders (basic lands, for example) and ${total - back === 1 ? "is" : "are"} skipped.` : ""}`
+                    : "None of this deck's cards were taken out of your binders."}
+              </div>
+              <div style=${{ display:"flex", flexDirection:"column", gap:8 }}>
+                ${back > 0 && html`
+                  <button onClick=${() => finishDeleteDeck(deckDeleteAsk, true)}
+                    style=${{ ...btn, padding:"9px 14px", fontSize:13 }}>
+                    ↩ Delete deck, return ${back} card${back === 1 ? "" : "s"} to binders
+                  </button>`}
+                <button onClick=${() => finishDeleteDeck(deckDeleteAsk, false)}
+                  style=${{ ...btnSec, padding:"8px 14px", fontSize:12,
+                    color:"var(--danger-text)", borderColor:"var(--danger-border)" }}>
+                  🗑 ${back > 0 ? "Delete deck and its cards (gone from your collection)" : "Delete deck"}
+                </button>
+                <button onClick=${close} style=${{ ...btnSec, padding:"8px 14px", fontSize:12 }}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        `;
+      })()}
       ${pickListOpen && deck && selCmd && (() => {
         const key = selCmd.card.name;
         const cmdrCards = [selCmd.card, deck.partner?.card].filter(Boolean).map(c => ({
