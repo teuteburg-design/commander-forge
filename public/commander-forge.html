@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.10-d";
+  const APP_VERSION = "v2026.10.10-e";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -957,9 +957,13 @@
         (list.cardviews || []).forEach(cv => {
           if (!cv.name) return;
           const syn = typeof cv.synergy   === "number" ? cv.synergy   : 0;
-          const inc = typeof cv.inclusion === "number" ? cv.inclusion : 0;
+          // EDHRec renamed `inclusion` to `num_decks` (decks running the card
+          // with this commander) out of `potential_decks` (decks that could).
+          const inc = typeof cv.num_decks === "number" ? cv.num_decks
+                    : typeof cv.inclusion === "number" ? cv.inclusion : 0;
+          const pct = cv.potential_decks > 0 ? inc / cv.potential_decks : 0;
           if (!byName.has(cv.name) || syn > byName.get(cv.name).synergy) {
-            byName.set(cv.name, { name: cv.name, synergy: syn, inclusion: inc });
+            byName.set(cv.name, { name: cv.name, synergy: syn, inclusion: inc, pct });
           }
         });
       });
@@ -2702,6 +2706,69 @@
     lsSetItemSafe(LS_PICKLISTS, JSON.stringify(all));
   }
 
+  // ── Deck insights: ownership + swap suggestions ─────────────────────────
+  // Name key that survives accents, case and double-faced names, so
+  // "Arwen Undómiel" from EDHRec matches "Arwen Undomiel" in a CSV import.
+  function normCardName(n) {
+    return (n || "").split("//")[0].normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+  }
+
+  // Rough functional role from rules text, used to pair a swap's "add" card
+  // with a "cut" card that does the same job (ramp for ramp, removal for removal).
+  function cardRole(sf) {
+    if (!sf) return "synergy";
+    const type = (sf.type_line || "").split("//")[0];
+    if (/\bLand\b/.test(type)) return "land";
+    const t = [sf.oracle_text, ...(sf.card_faces || []).map(f => f.oracle_text)].filter(Boolean).join("\n").toLowerCase();
+    if (/(destroy|exile) all |all creatures get -|deals? \d+ damage to each creature|return all .* to their owners'? hands/.test(t)) return "wipe";
+    if (/(destroy|exile) target|counter target|return target [^.]*to its owner's hand|deals? \d+ damage to (any|target)/.test(t)) return "removal";
+    if (/\badd \{|search your library for (a|an|up to \w+) [^.]*land|create (a|an|\w+) treasure/.test(t)) return "ramp";
+    if (/\bdraws? (a|an|two|three|four|x|\w+) cards?|draw cards/.test(t)) return "draw";
+    return "synergy";
+  }
+  const ROLE_LABEL = { land:"land", wipe:"board wipe", removal:"removal", ramp:"ramp", draw:"card draw", synergy:"synergy" };
+
+  // Where each card the user owns lives. `available` = in the pool the deck
+  // builder draws from (an included binder or deck); `where` lists every
+  // binder / deck holding it, with whether that source is included.
+  function buildOwnershipIndex(groups, deckInc, binInc, skipDeckName) {
+    const idx = new Map();
+    const note = (name, entry) => {
+      const k = normCardName(name);
+      if (!idx.has(k)) idx.set(k, { name, available: false, where: [] });
+      const rec = idx.get(k);
+      rec.where.push(entry);
+      if (entry.included) rec.available = true;
+    };
+    (groups.binders || []).forEach(b => (b.cards || []).forEach(c => {
+      if ((c.qty || 0) > 0) note(c.name, { kind: "binder", name: b.name, included: !!binInc[b.name] });
+    }));
+    (groups.decks || []).forEach(d => {
+      if (d.name === skipDeckName) return;
+      (d.cards || []).forEach(c => note(c.name, { kind: "deck", name: d.name, included: !!deckInc[d.name] }));
+    });
+    return idx;
+  }
+
+  // Card names (from `idx`) mentioned in free text, longest first, matched on
+  // word boundaries so "Opt" doesn't hit "Option".
+  function ownedNamesIn(text, idx) {
+    const t = normCardName(text);
+    const hits = [];
+    for (const [k, rec] of idx) {
+      if (k.length < 3) continue;
+      let i = t.indexOf(k);
+      while (i >= 0) {
+        const before = t[i - 1], after = t[i + k.length];
+        if (!/[a-z0-9]/.test(before || "") && !/[a-z0-9]/.test(after || "")) { hits.push(rec); break; }
+        i = t.indexOf(k, i + 1);
+      }
+    }
+    hits.sort((a, b) => b.name.length - a.name.length);
+    // Drop names contained in a longer hit ("Sol Ring" vs "Sol Ring Fork").
+    return hits.filter((h, i) => !hits.slice(0, i).some(l => normCardName(l.name).includes(normCardName(h.name))));
+  }
+
   // Card-condition scale — mirrors Cardmarket's 7-tier ladder
   // (M, NM, EX, GD, LP, PL, PO). The colors are our own green→red gradient
   // used to stand in for an icon set; not a copy of any third-party glyphs.
@@ -3083,6 +3150,8 @@
     const [addToDeckOpen,  setAddToDeckOpen]  = useState(false);
     const [pickListOpen,   setPickListOpen]   = useState(false);
     const [deckDeleteAsk,  setDeckDeleteAsk]  = useState(null);   // name of the Collection deck pending deletion
+    const [showAlmostCombos, setShowAlmostCombos] = useState(false);
+    const [swapState,      setSwapState]      = useState(null);   // { key, status, swaps, ownedElsewhere, error }
     const [pickChecked,    setPickChecked]    = useState(() => new Set());
     const [pickHideDone,   setPickHideDone]   = useState(false);
     const [addToDeckQuery, setAddToDeckQuery] = useState("");
@@ -4816,11 +4885,109 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         const finalLands = deckData.categories.flatMap(c => c.cards).filter(c => c.isLand).length;
         addLog(`✅ ${finalTotal} cards · ${finalLands} lands${finalTotal === 99 ? " (Commander legal)" : ` — ⚠️ expected 99`}.`);
         deckData.edhrecSuggestions = edhrecSuggestions;   // cards to acquire
+        deckData.buildPrefs = { budget: budgetNum, bracket, archetypes };   // swap suggestions honour these
         deckData.combosHave        = cspbHave;            // combos achievable now
         deckData.combosAlmost      = cspbAlmost;          // combos one card away
         setDeck(deckData); setProg(100); setPhase("deck");
       } catch(e) { setError(e.message); setPhase("error"); }
     }, [enriched, usable, apiKeys, provider, models, bracket, archetypes, budget, mech]);
+
+    // Ownership of the open deck's suggested cards, against the WHOLE
+    // collection (not just the build pool), for the insights panels.
+    const deckOwnership = () => {
+      const colDeck = deck && (groups.decks || []).some(d => d.name === deck.theme) ? deck.theme : null;
+      return buildOwnershipIndex(groups, deckInc, binInc, colDeck);
+    };
+    // Short "where is it" label for a card the user owns.
+    const ownedWhere = (rec) => {
+      if (!rec) return "";
+      const deckHit = rec.where.find(w => w.kind === "deck" && !w.included);
+      if (rec.available) return "you own it";
+      if (deckHit) return `you own it · in deck "${deckHit.name}"`;
+      const bin = rec.where.find(w => w.kind === "binder");
+      return bin ? `you own it · binder "${bin.name}" is excluded` : "you own it";
+    };
+
+    // ── Swap suggestions from the user's own collection ─────────────────────
+    // EDHRec says how often each card is played with this commander (pct) and
+    // how much more than in other decks (synergy). Owned, available cards the
+    // deck doesn't run are ranked by that; each is paired with the weakest
+    // card in the deck that fills the same role. Respects the deck's colour
+    // identity, EDH legality, the per-card budget limit used at build time,
+    // and never cuts the commander or pieces of a combo the deck already has.
+    const findSwaps = async () => {
+      const key = `${selCmd.card.name}|${deck.theme}`;
+      setSwapState({ key, status: "loading" });
+      try {
+        const res = await fetchEDHRec(selCmd.card.scryfall || selCmd.card.name);
+        if (res.status !== "ok") throw new Error(res.status === "network" ? "EDHRec couldn't be reached" : "EDHRec has no data for this commander");
+        const edh   = new Map(res.suggestions.map(e => [normCardName(e.name), e]));
+        const score = n => { const e = edh.get(normCardName(n)); return e ? (e.pct || 0) + (e.synergy || 0) / 2 : 0; };
+        const cache = getSFCache();
+        const sfOf  = n => cache[(n || "").toLowerCase()]?.d || cache[normCardName(n)]?.d || null;
+
+        const ci       = selCmd.card.scryfall?.color_identity || [];
+        const cmdrKeys = new Set([selCmd.card.name, deck.partner?.card?.name].filter(Boolean).map(normCardName));
+        const deckRows = deck.categories.flatMap(cat => cat.cards.map(c => ({ ...c, category: cat.name })));
+        const inDeck   = new Set([...cmdrKeys, ...deckRows.map(c => normCardName(c.name))]);
+        const colDeck  = (groups.decks || []).some(d => d.name === deck.theme) ? deck.theme : null;
+        const own      = buildOwnershipIndex(groups, deckInc, binInc, colDeck);
+        const budgetNum = parseFloat(deck.buildPrefs?.budget ?? budget) || 0;
+        const cardCap   = budgetNum > 0 ? budgetNum * 0.25 : Infinity;
+
+        // Candidates: EDHRec cards the user owns, in colour, legal, not in the deck.
+        const candidates = [], ownedElsewhere = [];
+        for (const e of res.suggestions) {
+          const k = normCardName(e.name);
+          const rec = own.get(k);
+          if (!rec || inDeck.has(k) || BASIC_NAMES.has(rec.name)) continue;
+          const sf = sfOf(rec.name);
+          if (!sf || !isEDHLegalCard(sf) || !(sf.color_identity || []).every(c => ci.includes(c))) continue;
+          const sc = score(e.name);
+          if (!rec.available) { ownedElsewhere.push({ name: rec.name, where: rec.where, score: sc }); continue; }
+          const price = parseFloat(sf.prices?.usd || 0);
+          if (price > cardCap) continue;
+          candidates.push({ name: rec.name, sf, edh: e, score: sc, role: cardRole(sf), price,
+            from: rec.where.find(w => w.included)?.name });
+        }
+        candidates.sort((a, b) => b.score - a.score);
+
+        // Cut pool: deck cards minus commanders and combo pieces.
+        const comboKeys = new Set((deck.combosHave || []).flatMap(c => c.cards || []).map(normCardName));
+        const cutCount  = new Map();
+        const cuts = deckRows
+          .filter(c => !cmdrKeys.has(normCardName(c.name)) && !comboKeys.has(normCardName(c.name)))
+          .map(c => {
+            const sf = sfOf(c.name);
+            const role = BASIC_NAMES.has(c.name) ? "land" : cardRole(sf || { type_line: c.type_line });
+            // EDHRec lists basics as near-universal, but one basic is the
+            // cheapest slot to give up for a better land, so they rank lowest.
+            const basic = BASIC_NAMES.has(c.name);
+            return { name: c.name, sf, edh: basic ? null : edh.get(normCardName(c.name)),
+              score: basic ? -1 : score(c.name), role, basic };
+          });
+        const qtyInDeck = n => deckRows.filter(c => c.name === n).length;
+
+        const swaps = [];
+        for (const add of candidates) {
+          if (swaps.length >= 5) break;
+          const isLand = add.role === "land";
+          const open = cuts.filter(x => (cutCount.get(x.name) || 0) < qtyInDeck(x.name)
+            && (x.role === "land") === isLand
+            && x.score < add.score - 0.15);
+          const byScore = (a, b) => a.score - b.score || (b.basic - a.basic);
+          const pick = open.filter(x => x.role === add.role).sort(byScore)[0]
+            || (!isLand ? open.filter(x => x.role === "synergy").sort(byScore)[0] : null);
+          if (!pick) continue;
+          cutCount.set(pick.name, (cutCount.get(pick.name) || 0) + 1);
+          swaps.push({ add, cut: pick });
+        }
+        ownedElsewhere.sort((a, b) => b.score - a.score);
+        setSwapState({ key, status: "done", swaps, ownedElsewhere: ownedElsewhere.slice(0, 6), cardCap });
+      } catch (e) {
+        setSwapState({ key, status: "error", error: e.message || String(e) });
+      }
+    };
 
     const exportDeck = () => {
       // Plain "QTY Name" lines only — no `//` comments or category headers.
@@ -10545,6 +10712,49 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 </div>
               `}
 
+              ${showInsights && !previewingPrecon && (() => {
+                const key = `${selCmd.card.name}|${deck.theme}`;
+                const st = swapState?.key === key ? swapState : null;
+                const pctText = e => e ? `in ${Math.round((e.pct || 0) * 100)}% of ${selCmd.card.name.split(",")[0]} decks` : "not on EDHRec's list for this commander";
+                return html`
+                  <div style=${{ background:"var(--success-soft)", border:"1px solid var(--border)", borderRadius:10,
+                    padding:"14px 18px", marginBottom:18 }}>
+                    <div style=${{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
+                      <div style=${{ fontSize:11, letterSpacing:3, color:"var(--success-text)", textTransform:"uppercase", fontWeight:700 }}>
+                        🔁 Swap suggestions from your collection
+                      </div>
+                      <button onClick=${findSwaps} disabled=${st?.status === "loading"}
+                        style=${{ ...btnSec, padding:"4px 12px", fontSize:11, marginLeft:"auto" }}>
+                        ${st?.status === "loading" ? "Checking EDHRec…" : st ? "↻ Refresh" : "Find swaps"}
+                      </button>
+                    </div>
+                    ${!st && html`<div style=${{ fontSize:12, color:"var(--fg-text-body)", marginTop:6 }}>
+                      Compares your available cards with what EDHRec players run with ${selCmd.card.name} and suggests up to 5 swaps — only cards you own, in colour, and within your per-card budget.
+                    </div>`}
+                    ${st?.status === "error" && html`<div style=${{ fontSize:12, color:"var(--danger-text)", marginTop:6 }}>Couldn't load swap data: ${st.error}</div>`}
+                    ${st?.status === "done" && html`
+                      ${st.swaps.length === 0
+                        ? html`<div style=${{ fontSize:12, color:"var(--fg-text-body)", marginTop:6 }}>No clear upgrades found — the deck already runs your best available cards for ${selCmd.card.name}.</div>`
+                        : html`<ol style=${{ margin:"10px 0 0", paddingLeft:20, display:"flex", flexDirection:"column", gap:8 }}>
+                            ${st.swaps.map((sw, i) => html`
+                              <li key=${i} style=${{ fontSize:13, color:"var(--fg-text)", lineHeight:1.5 }}>
+                                <div><span style=${{ color:"var(--success-text)", fontWeight:700 }}>＋ ${sw.add.name}</span>
+                                  <span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}> · ${ROLE_LABEL[sw.add.role]} · ${pctText(sw.add.edh)}${sw.add.edh?.synergy ? ` · synergy ${sw.add.edh.synergy > 0 ? "+" : ""}${Math.round(sw.add.edh.synergy * 100)}%` : ""}${sw.add.price ? ` · $${sw.add.price.toFixed(2)}` : ""}${sw.add.from ? ` · in "${sw.add.from}"` : ""}</span></div>
+                                <div><span style=${{ color:"var(--danger-text)", fontWeight:700 }}>− ${sw.cut.name}</span>
+                                  <span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}> · ${sw.cut.basic ? "one of your basic lands" : `${ROLE_LABEL[sw.cut.role]} · ${pctText(sw.cut.edh)}`}</span></div>
+                              </li>`)}
+                          </ol>`}
+                      ${st.ownedElsewhere?.length > 0 && html`<div style=${{ fontSize:11, color:"var(--fg-text-muted)", marginTop:10, lineHeight:1.6 }}>
+                        Also strong here, but tied up elsewhere: ${st.ownedElsewhere.map((o, i) => html`${i ? " · " : ""}<strong>${o.name}</strong> (${ownedWhere({ available:false, where:o.where })})`)}
+                      </div>`}
+                      <div style=${{ fontSize:11, color:"var(--fg-text-muted)", fontStyle:"italic", marginTop:8 }}>
+                        Each swap replaces a card doing the same job (ramp for ramp, removal for removal…). Combo pieces and the commander are never cut.${Number.isFinite(st.cardCap) ? ` Cards over $${st.cardCap.toFixed(0)} (25% of your budget) are left out.` : ""}
+                      </div>
+                    `}
+                  </div>
+                `;
+              })()}
+
               ${showInsights && deck.warnings && deck.warnings.length > 0 && html`
                 <div style=${{ background:"var(--bg-surface-soft)", border:"1px solid var(--border-input)", borderRadius:10,
                   padding:"14px 18px", marginBottom:18 }}>
@@ -10552,12 +10762,42 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     fontWeight:700, marginBottom:8 }}>
                     ⚠️ Collection Gaps · ${deck.warnings.length}
                   </div>
-                  <ul style=${{ margin:0, paddingLeft:20, fontSize:13, color:"var(--accent-strong)", lineHeight:1.7 }}>
-                    ${deck.warnings.map((w, i) => html`<li key=${i} style=${{ marginBottom:4 }}>${w}</li>`)}
-                  </ul>
-                  <div style=${{ fontSize:11, color:"var(--accent-text)", fontStyle:"italic", marginTop:10 }}>
-                    The deck below uses what's in your collection plus synergistic substitutes. The cards listed in each warning are recommendations to acquire, not part of the deck.
-                  </div>
+                  ${(() => {
+                    // The AI writes these from general knowledge and only saw
+                    // the cards sent to it, so it can recommend cards the user
+                    // already owns. Tag those, with why they aren't in the deck.
+                    const own = deckOwnership();
+                    const inDeck = new Set(deck.categories.flatMap(c => c.cards.map(x => normCardName(x.name))));
+                    const cap = (parseFloat(deck.buildPrefs?.budget ?? budget) || 0) * 0.25;
+                    const cache = getSFCache();
+                    const why = rec => {
+                      if (inDeck.has(normCardName(rec.name))) return { text: "already in this deck", tone: "ok" };
+                      if (!rec.available) return { text: ownedWhere(rec), tone: "muted" };
+                      const price = parseFloat((cache[rec.name.toLowerCase()]?.d || cache[normCardName(rec.name)]?.d)?.prices?.usd || 0);
+                      if (cap > 0 && price > cap) return { text: `you own it · over your per-card budget ($${price.toFixed(2)} > $${cap.toFixed(0)})`, tone: "muted" };
+                      return { text: "you own it · available but not picked", tone: "info" };
+                    };
+                    const toneColor = { ok:"var(--success-text)", info:"var(--info)", muted:"var(--fg-text-muted)" };
+                    return html`
+                      <ul style=${{ margin:0, paddingLeft:20, fontSize:13, color:"var(--accent-strong)", lineHeight:1.7 }}>
+                        ${deck.warnings.map((w, i) => {
+                          const owned = ownedNamesIn(w, own);
+                          return html`<li key=${i} style=${{ marginBottom:6 }}>
+                            ${w}
+                            ${owned.length > 0 && html`<div style=${{ display:"flex", gap:6, flexWrap:"wrap", marginTop:3 }}>
+                              ${owned.map(rec => { const r = why(rec); return html`
+                                <span key=${rec.name} style=${{ fontSize:11, padding:"1px 8px", borderRadius:10,
+                                  border:"1px solid var(--border)", background:"var(--bg-surface)", color: toneColor[r.tone] }}>
+                                  <strong>${rec.name}</strong>: ${r.text}
+                                </span>`; })}
+                            </div>`}
+                          </li>`;
+                        })}
+                      </ul>
+                      <div style=${{ fontSize:11, color:"var(--accent-text)", fontStyle:"italic", marginTop:10 }}>
+                        The AI writes these notes from general Commander knowledge; it only sees part of your collection. Cards you already own are tagged with why they're not in the deck — "available but not picked" ones are good swap candidates.
+                      </div>`;
+                  })()}
                 </div>
               `}
 
@@ -10572,8 +10812,18 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       Top synergy cards for ${selCmd.card.name} not yet in your collection
                     </div>
                   </div>
+                  ${(() => {
+                    // Built against the build pool only, so cards sitting in a
+                    // reserved deck or excluded binder slipped in. Split them out.
+                    const own = deckOwnership();
+                    const owned = deck.edhrecSuggestions.filter(c => own.has(normCardName(c.name)));
+                    if (!owned.length) return null;
+                    return html`<div style=${{ fontSize:11, color:"var(--info)", marginBottom:8, lineHeight:1.6 }}>
+                      Already in your collection: ${owned.map((c, i) => html`${i ? " · " : ""}<strong>${c.name}</strong> (${ownedWhere(own.get(normCardName(c.name)))})`)}
+                    </div>`;
+                  })()}
                   <div style=${{ display:"flex", gap:6, flexWrap:"wrap" }}>
-                    ${deck.edhrecSuggestions.map((c, i) => html`
+                    ${(() => { const own = deckOwnership(); return deck.edhrecSuggestions.filter(c => !own.has(normCardName(c.name))); })().map((c, i) => html`
                       <a key=${i}
                         href=${"https://scryfall.com/search?q=" + encodeURIComponent(c.name)}
                         target="_blank" rel="noopener"
@@ -10602,7 +10852,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     `)}
                   </div>
                   <div style=${{ fontSize:10, color:"var(--info)", fontStyle:"italic", marginTop:10 }}>
-                    ★ = synergy score vs average decks · "in X%" = how often this card appears in EDHRec decks for this commander. Click any card to view on Scryfall.
+                    ★ = synergy score vs average decks · "in N decks" = how many EDHRec decks with this commander run the card. Click any card to view on Scryfall.
                   </div>
                 </div>
               `}
@@ -10645,11 +10895,17 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               ${showInsights && deck.combosAlmost && deck.combosAlmost.length > 0 && html`
                 <div style=${{ background:"var(--bg-surface-soft)", border:"1px dashed var(--border-dashed)", borderRadius:10,
                   padding:"14px 18px", marginBottom:18 }}>
-                  <div style=${{ fontSize:11, letterSpacing:3, color:"var(--accent-dark)", textTransform:"uppercase",
-                    fontWeight:700, marginBottom:10 }}>
+                  <button onClick=${() => setShowAlmostCombos(v => !v)} aria-expanded=${showAlmostCombos}
+                    style=${{ all:"unset", cursor:"pointer", display:"flex", alignItems:"center", gap:8, width:"100%",
+                      fontSize:11, letterSpacing:3, color:"var(--accent-dark)", textTransform:"uppercase",
+                      fontWeight:700, marginBottom: showAlmostCombos ? 10 : 0 }}>
+                    <span>${showAlmostCombos ? "▾" : "▸"}</span>
                     🔮 Combos one card away · ${deck.combosAlmost.length}
-                  </div>
-                  <div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
+                    <span style=${{ marginLeft:"auto", letterSpacing:0, textTransform:"none", fontWeight:400, fontSize:11, color:"var(--fg-text-muted)" }}>
+                      need a card you don't own · ${showAlmostCombos ? "hide" : "show"}
+                    </span>
+                  </button>
+                  ${showAlmostCombos && html`<div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
                     ${deck.combosAlmost.slice(0, 8).map((c, i) => html`
                       <a key=${i}
                         href=${"https://commanderspellbook.com/combo/" + (c.id || "")}
@@ -10672,7 +10928,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         </div>
                       </a>
                     `)}
-                  </div>
+                  </div>`}
                 </div>
               `}
 
