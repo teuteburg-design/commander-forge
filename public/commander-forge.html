@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.10-g";
+  const APP_VERSION = "v2026.10.10-h";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -4992,7 +4992,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             // cheapest slot to give up for a better land, so they rank lowest.
             const basic = BASIC_NAMES.has(c.name);
             return { name: c.name, sf, edh: basic ? null : edh.get(normCardName(c.name)),
-              score: basic ? -1 : score(c.name), role, basic };
+              score: basic ? -1 : score(c.name), role, basic,
+              mana_cost: c.mana_cost || sf?.mana_cost || sf?.card_faces?.[0]?.mana_cost || "" };
           });
         const qtyInDeck = n => deckRows.filter(c => c.name === n).length;
 
@@ -10881,8 +10882,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                         style=${{ ...btnSec, padding:"3px 10px", fontSize:11 }}>⇄ Apply swap</button>`}
                                 </div>
                                 <div><span style=${{ color:"var(--success-text)", fontWeight:700 }}>＋ ${sw.add.name}</span>
+                                  ${" "}<${ManaCost} cost=${(sw.add.sf?.mana_cost || sw.add.sf?.card_faces?.[0]?.mana_cost || "").split("//")[0].trim()} size=${13} />
                                   <span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}> · ${ROLE_LABEL[sw.add.role]} · ${pctText(sw.add.edh)}${sw.add.edh?.synergy ? ` · synergy ${sw.add.edh.synergy > 0 ? "+" : ""}${Math.round(sw.add.edh.synergy * 100)}%` : ""}${sw.add.price ? ` · $${sw.add.price.toFixed(2)}` : ""}${sw.add.from ? ` · in "${sw.add.from}"` : ""}</span></div>
                                 <div><span style=${{ color:"var(--danger-text)", fontWeight:700 }}>− ${sw.cut.name}</span>
+                                  ${" "}<${ManaCost} cost=${(sw.cut.mana_cost || "").split("//")[0].trim()} size=${13} />
                                   <span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}> · ${sw.cut.basic ? "one of your basic lands" : `${ROLE_LABEL[sw.cut.role]} · ${pctText(sw.cut.edh)}`}</span></div>
                               </li>`)}
                           </ol>`}
