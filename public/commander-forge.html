@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.11-a";
+  const APP_VERSION = "v2026.10.11-b";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -6952,10 +6952,27 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       if ((groups.decks || []).some(d => d.name === name)) setDeckDeleteAsk(name);
     };
 
-    const finishDeleteDeck = (name, returnCards) => {
+    // returnCards: put the deck's cards back into their binders.
+    // keepInLibrary: "release" — the deck list moves to the Library (as an
+    // unbuilt deck idea) instead of being deleted, so it can be built again.
+    const finishDeleteDeck = (name, returnCards, keepInLibrary = false) => {
       setDeckDeleteAsk(null);
       const target = (groups.decks || []).find(d => d.name === name);
       if (!target) return;
+      let libEntry = null;
+      if (keepInLibrary && target.deckData && target.selCmd) {
+        // Undo the "Forge: <commander> · " prefix that "Mark as built" added,
+        // so building it again doesn't stack prefixes.
+        const cmdr = target.selCmd?.card?.name || target.commanderName || "";
+        const prefix = `Forge: ${cmdr}`;
+        let theme = target.deckData.theme || "";
+        if (theme.startsWith(prefix)) theme = theme.slice(prefix.length).replace(/^ · /, "").replace(/ \(\d+\)$/, "");
+        libEntry = { id: Date.now(), savedAt: new Date().toISOString(), selCmd: target.selCmd,
+          deck: { ...target.deckData, theme: theme || target.deckData.theme } };
+        const nextLibrary = [libEntry, ...library];
+        setLibrary(nextLibrary);
+        lsSetItemSafe(LS_LIBRARY, JSON.stringify(nextLibrary));
+      }
       const nextDecks = (groups.decks || []).filter(d => d.name !== name);
       let nextBinders = groups.binders || [];
       let nextBinInc  = binInc;
@@ -6973,12 +6990,19 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       const nextUsable = computeUsable(nextGroups, nextDeckInc, nextBinInc);
       setUsable(nextUsable);
       lsSetItemSafe(LS_CARDS, JSON.stringify(nextUsable));
-      // If the user is currently viewing the deck we just removed, bail
-      // back to the Collection so we don't render stale state.
+      // If the user is currently viewing the deck: after a release keep it
+      // open as the Library deck (so "I built this deck" is offered again);
+      // after a delete bail back to the Collection.
       if (deck && deck.theme === name) {
-        setDeck(null); setSelCmd(null);
-        setFromCollection(false); setFromSaved(false);
-        setPhase("select");
+        if (libEntry) {
+          setDeck(libEntry.deck);
+          setFromCollection(false); setFromSaved(true);
+          setLibSaved(true); setLibEntryId(libEntry.id); setDeckSvd(false);
+        } else {
+          setDeck(null); setSelCmd(null);
+          setFromCollection(false); setFromSaved(false);
+          setPhase("select");
+        }
       }
       persistGroups(nextGroups, nextDeckInc, nextBinInc);
     };
@@ -11145,7 +11169,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           }}
                           onMouseEnter=${e => e.currentTarget.style.background = "var(--danger-bg)"}
                           onMouseLeave=${e => e.currentTarget.style.background = "transparent"}>
-                          🗑 Delete deck…
+                          ↩ Release / delete deck…
                         </button>
                       </div>
                     `}
@@ -11198,6 +11222,12 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     `;
                   })()}
                   ${!previewingPrecon && html`
+                    ${(groups.decks || []).some(d => d.name === deck.theme) && html`
+                    <button onClick=${() => deleteDeck(deck.theme)}
+                      title="Take the deck apart: put its cards back into your binders, and keep the list in the Library or delete it"
+                      style=${{ ...btnSec, padding:"6px 14px", fontSize:11 }}>
+                      ↩ Release deck
+                    </button>`}
                     ${(groups.decks || []).some(d => d.name === deck.theme) && html`
                     <button onClick=${() => { setAddToDeckQuery(""); setAddToDeckOpen(true); }}
                       title="Move a card from one of your binders into this built deck"
@@ -12906,7 +12936,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               style=${{ background:"var(--bg-surface-softer)", border:"1px solid var(--border)", borderRadius:12,
                 width:"min(460px, 94vw)", padding:"16px 18px", boxShadow:"0 8px 32px rgba(0,0,0,0.35)" }}>
               <div style=${{ fontSize:15, fontWeight:700, color:"var(--fg-text-heading)", marginBottom:6 }}>
-                Delete "${deckDeleteAsk}"?
+                Release or delete "${deckDeleteAsk}"?
               </div>
               <div style=${{ fontSize:13, color:"var(--fg-text-body)", lineHeight:1.6, marginBottom:14 }}>
                 ${total === 0
@@ -12916,16 +12946,21 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     : "None of this deck's cards were taken out of your binders."}
               </div>
               <div style=${{ display:"flex", flexDirection:"column", gap:8 }}>
+                ${target.deckData && target.selCmd && html`
+                  <button onClick=${() => finishDeleteDeck(deckDeleteAsk, true, true)}
+                    style=${{ ...btn, padding:"9px 14px", fontSize:13 }}>
+                    ↩ Release: ${back > 0 ? `return ${back} card${back === 1 ? "" : "s"} to binders, ` : ""}keep the deck list in the Library
+                  </button>`}
                 ${back > 0 && html`
                   <button onClick=${() => finishDeleteDeck(deckDeleteAsk, true)}
-                    style=${{ ...btn, padding:"9px 14px", fontSize:13 }}>
+                    style=${{ ...btnSec, padding:"8px 14px", fontSize:12 }}>
                     ↩ Delete deck, return ${back} card${back === 1 ? "" : "s"} to binders
                   </button>`}
-                <button onClick=${() => finishDeleteDeck(deckDeleteAsk, false)}
+                ${back === 0 && html`<button onClick=${() => finishDeleteDeck(deckDeleteAsk, false)}
                   style=${{ ...btnSec, padding:"8px 14px", fontSize:12,
                     color:"var(--danger-text)", borderColor:"var(--danger-border)" }}>
-                  🗑 ${back > 0 ? "Delete deck and its cards (gone from your collection)" : "Delete deck"}
-                </button>
+                  🗑 Delete deck
+                </button>`}
                 <button onClick=${close} style=${{ ...btnSec, padding:"8px 14px", fontSize:12 }}>Cancel</button>
               </div>
             </div>
