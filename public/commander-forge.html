@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.11-b";
+  const APP_VERSION = "v2026.10.11-c";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -2957,6 +2957,31 @@
     return out;
   }
 
+  // ── Infinite combos ─────────────────────────────────────────────────────
+  // How a build treats combos the user owns every piece of. "auto" follows
+  // the chosen bracket (WotC guidance): 1-2 avoid them, 3 allows combos of
+  // three or more cards (no two-card instant wins), 4-5 builds around them.
+  const COMBO_POLICIES = [
+    { id: "auto",       label: "Auto (by bracket)" },
+    { id: "avoid",      label: "Avoid" },
+    { id: "owned",      label: "Include if I own all pieces" },
+    { id: "prioritise", label: "Prioritise" },
+  ];
+  function effectiveComboPolicy(policy, bracket) {
+    if (policy && policy !== "auto") return policy;
+    return bracket <= 2 ? "avoid" : bracket === 3 ? "owned3" : "prioritise";
+  }
+  const COMBO_POLICY_TEXT = {
+    avoid: "avoid infinite combos", owned3: "include combos of 3+ cards",
+    owned: "include combos you own", prioritise: "build around combos",
+  };
+  // The combos (all pieces owned) a policy lets the build include.
+  function allowedCombos(combos, eff) {
+    if (eff === "avoid") return [];
+    const list = (combos || []).filter(c => eff !== "owned3" || (c.cards || []).length >= 3);
+    return [...list].sort((a, b) => (a.cards || []).length - (b.cards || []).length).slice(0, eff === "prioritise" ? 8 : 4);
+  }
+
   // ── Deck insights: ownership + swap suggestions ─────────────────────────
   // Name key that survives accents, case and double-faced names, so
   // "Arwen Undómiel" from EDHRec matches "Arwen Undomiel" in a CSV import.
@@ -3143,7 +3168,7 @@
     "Lands matter","Stax","Group Hug","Politics","Ramp","Big Mana",
   ];
 
-  function BuildPrefs({ bracket, setBracket, archetypes, setArchetypes, budget, setBudget, mech, setMech, showMech, setShowMech }) {
+  function BuildPrefs({ bracket, setBracket, archetypes, setArchetypes, budget, setBudget, mech, setMech, showMech, setShowMech, comboPolicy, setComboPolicy }) {
     const toggleArch = a => setArchetypes(prev =>
       prev.includes(a) ? prev.filter(x => x !== a)
       : prev.length >= 3 ? prev
@@ -3224,6 +3249,27 @@
                 cursor:"pointer", fontSize:11, fontFamily:"inherit" }}>Clear</button>`}
           </div>
         </div>
+
+        <!-- Infinite combos -->
+        ${setComboPolicy && html`
+          <div style=${{ marginBottom: 14 }}>
+            <div style=${{ fontSize:11, color:"var(--fg-text-soft)", marginBottom:6 }}>
+              Infinite combos <span style=${{ color:"var(--fg-text-placeholder)" }}>(from cards you own)</span>
+            </div>
+            <div style=${{ display:"flex", gap:6, flexWrap:"wrap" }}>
+              ${COMBO_POLICIES.map(p => html`
+                <button key=${p.id} onClick=${() => setComboPolicy(p.id)}
+                  style=${{ padding:"5px 11px", borderRadius:16, fontSize:12, fontFamily:"inherit", cursor:"pointer",
+                    border:"1px solid " + (comboPolicy === p.id ? "var(--accent)" : "var(--border-strong)"),
+                    background: comboPolicy === p.id ? "var(--accent)" : "var(--bg-surface)",
+                    color: comboPolicy === p.id ? "var(--on-accent)" : "var(--fg-text-body)" }}>${p.label}</button>`)}
+            </div>
+            <div style=${{ fontSize:11, color:"var(--fg-text-muted)", marginTop:5 }}>
+              ${comboPolicy === "auto"
+                ? html`Bracket ${bracket}: <strong>${COMBO_POLICY_TEXT[effectiveComboPolicy("auto", bracket)]}</strong> (brackets 1–2 avoid · 3 allows 3+ card combos · 4–5 prioritise).`
+                : html`Overrides the bracket: <strong>${COMBO_POLICY_TEXT[comboPolicy]}</strong>.`}
+            </div>
+          </div>`}
 
         <!-- Mechanics toggle -->
         ${(() => {
@@ -3817,6 +3863,7 @@
     const [bracket,    setBracket]    = useState(3);            // 1-5 (WotC Commander Brackets)
     const [archetypes, setArchetypes] = useState([]);           // up to 3
     const [budget,     setBudget]     = useState("");           // USD total, "" = no cap
+    const [comboPolicy, setComboPolicy] = useState("auto");       // see COMBO_POLICIES
     const [mech,       setMech]       = useState({              // construction targets
       lands: 37, ramp: 10, draw: 10, removal: 8, wipes: 3,
       interaction: "medium",   // low | medium | high
@@ -4082,6 +4129,7 @@
           if (p.archetypes) setArchetypes(p.archetypes);
           if (p.budget != null) setBudget(p.budget);
           if (p.mech)       setMech(prev => ({ ...prev, ...p.mech }));
+          if (p.comboPolicy) setComboPolicy(p.comboPolicy);
         } catch {}
       }
 
@@ -4241,8 +4289,8 @@
     // the defaults over them (and sync would push those defaults).
     useEffect(() => {
       if (!didInitRef.current) return;
-      lsSetItemSafe(LS_PREFS, JSON.stringify({ bracket, archetypes, budget, mech }));
-    }, [bracket, archetypes, budget, mech]);
+      lsSetItemSafe(LS_PREFS, JSON.stringify({ bracket, archetypes, budget, mech, comboPolicy }));
+    }, [bracket, archetypes, budget, mech, comboPolicy]);
 
     // Reset scroll position when entering any top-level view. Opening a deck
     // from Library used to land somewhere in the middle of the categories
@@ -4855,13 +4903,28 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
         }
 
         const roleLabel = Object.fromEntries(research.roles.map(r => [r.id, r.label]));
+
+        // ── Combo policy: which owned combos this build includes ────────────
+        const comboEff      = effectiveComboPolicy(comboPolicy, bracket);
+        const combosAllowed = allowedCombos(cspbHave, comboEff);
+        const cmdrNorm      = normCardName(chosenCmd.card.name);
+        const eligibleByNorm = new Map(eligible.map(c => [normCardName(c.name), c]));
+        // Every piece of an allowed combo is offered to the AI, even if its
+        // score alone wouldn't have made the candidate list.
+        for (const combo of combosAllowed) for (const n of combo.cards || []) {
+          const c = eligibleByNorm.get(normCardName(n));
+          if (!c) continue;
+          c._combo = true;
+          if (!candidates.includes(c)) candidates.unshift(c);
+        }
+        if (cspbHave.length) addLog(`💥 Combos (${COMBO_POLICY_TEXT[comboEff]}): ${combosAllowed.length ? combosAllowed.map(c => c.cards.join(" + ")).join(" · ") : `none included of ${cspbHave.length} owned`}.`);
         const cardLine = (c, withText) => {
           const price   = c.scryfall?.prices?.usd ? `$${c.scryfall.prices.usd}` : "—";
           const syn     = synergyMap[c.name.toLowerCase()];
           const synHint = syn ? ` ★${(syn.synergy * 100).toFixed(0)}%` : "";
           const base = `${c.name}${synHint} | ${(c.scryfall.type_line||"").split("—")[0].trim()} | CMC:${c.scryfall.cmc||0} | ${price}`;
           if (!withText) return base;
-          const rl = c._roles.length ? ` | ROLE: ${c._roles.map(id => roleLabel[id] || id).join(", ")}` : "";
+          const rl = (c._roles.length || c._combo) ? ` | ROLE: ${[...(c._combo ? ["Combo piece"] : []), ...c._roles.map(id => roleLabel[id] || id)].join(", ")}` : "";
           return `${base}${rl} | ${oracleSnippet(c.scryfall, 130)}`;
         };
         // Groq's per-minute token limit can't take rules text for 240 cards.
@@ -4912,8 +4975,11 @@ ${mechBlock}
 Unlimited basic lands available: ${basics.join(", ")||"Wastes"}
 
 ${planBlock}
-${cspbHave.length > 0 ? `Available infinite/synergy combos in this collection (from Commander Spellbook — INCLUDE all combo pieces in the deck and treat them as primary win conditions):
-${cspbHave.slice(0, 8).map((c, i) => `  ${i+1}. [${c.cards.join(" + ")}] → ${c.produces.join(", ") || "synergy"}`).join("\n")}
+${combosAllowed.length > 0 ? `Combos in this collection to INCLUDE (Commander Spellbook — put EVERY piece of each in the deck${comboEff === "prioritise" ? " and treat them as primary win conditions; add tutors/protection for them" : ""}):
+${combosAllowed.map((c, i) => `  ${i+1}. [${c.cards.join(" + ")}] → ${c.produces.join(", ") || "synergy"}`).join("\n")}
+
+` : comboEff === "avoid" && cspbHave.length > 0 ? `INFINITE COMBOS ARE NOT WANTED at this power level. Never include ALL pieces of any of these combos:
+${cspbHave.slice(0, 8).map((c, i) => `  ${i+1}. [${c.cards.join(" + ")}]`).join("\n")}
 
 ` : ""}Eligible non-basic cards from collection (name | type | CMC | est. USD | ROLE it fills | rules text — ★% = EDHRec synergy with this commander):
 ${cardList}
@@ -5155,6 +5221,59 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           if (outside.length) addLog(`🛡️ Removed ${outside.length} card(s) that weren't in your eligible pool: ${outside.slice(0, 6).join(", ")}${outside.length > 6 ? ", …" : ""}.`);
         }
 
+        // ── Combo check: the AI may include only part of a combo (useless) or,
+        // when combos aren't wanted, all of one. Fix both deterministically.
+        const comboBanned = new Set();   // removed pieces the filler must not re-add
+        {
+          const inDeckNorm = () => new Set(deckData.categories.flatMap(c => c.cards.map(x => normCardName(x.name))));
+          const isLandCard = c => /\bLand\b/.test((c?.scryfall?.type_line || "").split("//")[0]);
+          const removeOne = norm => {
+            for (const cat of deckData.categories) {
+              const i = cat.cards.findIndex(x => normCardName(x.name) === norm);
+              if (i >= 0) return cat.cards.splice(i, 1)[0];
+            }
+            return null;
+          };
+          if (comboEff === "avoid") {
+            for (const combo of cspbHave) {
+              const pieces = (combo.cards || []).map(normCardName).filter(n => n !== cmdrNorm);
+              const have = inDeckNorm();
+              if (!pieces.length || !pieces.every(n => have.has(n))) continue;
+              const victim = pieces.map(n => eligibleByNorm.get(n)).filter(Boolean).sort((a, b) => (a._score || 0) - (b._score || 0))[0];
+              if (victim && removeOne(normCardName(victim.name))) {
+                comboBanned.add(victim.name.toLowerCase());
+                addLog(`💥 Broke up combo [${combo.cards.join(" + ")}] (combos not wanted): removed ${victim.name}.`);
+              }
+            }
+          } else {
+            const protectedNorm = new Set(combosAllowed.flatMap(c => c.cards || []).map(normCardName));
+            for (const combo of combosAllowed) {
+              const have = inDeckNorm();
+              const missing = (combo.cards || []).map(normCardName).filter(n => n !== cmdrNorm && !have.has(n));
+              if (!missing.length || missing.length > 2) continue;
+              const adds = missing.map(n => eligibleByNorm.get(n));
+              if (adds.some(a => !a)) continue;
+              const done = [];
+              for (const add of adds) {
+                // Cut the weakest non-land card that isn't a combo piece and
+                // fills no commander role.
+                let best = null;
+                for (const cat of deckData.categories) cat.cards.forEach((dc, i) => {
+                  const n = normCardName(dc.name);
+                  const c = eligibleByNorm.get(n);
+                  if (!c || isLandCard(c) || protectedNorm.has(n) || n === cmdrNorm) return;
+                  const key = [(c._roles?.length ? 1 : 0), c._score || 0];
+                  if (!best || key[0] < best.key[0] || (key[0] === best.key[0] && key[1] < best.key[1])) best = { cat, i, key, name: dc.name };
+                });
+                if (!best) break;
+                best.cat.cards[best.i] = { name: add.name, reason: `Combo piece — completes ${combo.cards.join(" + ")}` };
+                done.push(`${add.name} (cut ${best.name})`);
+              }
+              if (done.length) addLog(`💥 Completed combo [${combo.cards.join(" + ")}]: added ${done.join(", ")}.`);
+            }
+          }
+        }
+
         // Post-process: ensure exactly 99 cards, with ≤ mech.lands lands.
         const MAX_LANDS = mech.lands;   // respect the user's construction target exactly
         const basicSet  = new Set(basics.concat(["Wastes"]));
@@ -5233,6 +5352,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           const extras = eligible
             .filter(c =>
               !used.has(c.name.toLowerCase()) &&
+              !comboBanned.has(c.name.toLowerCase()) &&
               !basicSet.has(c.name) &&
               !/land/i.test(c.scryfall?.type_line || ""))
             .sort((a, b) => (b._score || 0) - (a._score || 0));
@@ -5383,10 +5503,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         deckData.buildPrefs = { budget: budgetNum, bracket, archetypes };   // swap suggestions honour these
         deckData.research   = research;                                      // shown in the 🧭 Commander plan panel
         deckData.combosHave        = cspbHave;            // combos achievable now
+        deckData.comboPolicy       = comboEff;            // how this build treated them
         deckData.combosAlmost      = cspbAlmost;          // combos one card away
         setDeck(deckData); setProg(100); setPhase("deck");
       } catch(e) { setError(e.message); setPhase("error"); }
-    }, [enriched, usable, apiKeys, provider, models, bracket, archetypes, budget, mech]);
+    }, [enriched, usable, apiKeys, provider, models, bracket, archetypes, budget, mech, comboPolicy]);
 
     // Save an updated version of the open deck wherever it lives (Collection
     // deck and/or Library entry) and show it.
@@ -5671,6 +5792,49 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setBinderEnriched(m => { const next = { ...m }; touched.forEach(b => delete next[b]); return next; });
       setDeck(nextDeck);
       return true;
+    };
+
+    // Add one missing combo piece to the open deck, cutting the weakest card
+    // that isn't a combo piece, the commander, a land, or needed to keep a
+    // commander role at its target. Asks first, then reuses applySwap (so
+    // Collection decks move the cards between deck and binders).
+    const completeComboPiece = async (pieceName, combo) => {
+      const cache = getSFCache();
+      const sfOf = n => cache[(n || "").toLowerCase()]?.d || cache[normCardName(n)]?.d || null;
+      const rec = deckOwnership().get(normCardName(pieceName));
+      const sf = sfOf(pieceName);
+      if (!rec?.available || !sf) {
+        appAlert({ title: "Can't add this card", body: `${pieceName} isn't in an included binder${sf ? "" : " (or its card data isn't loaded yet)"}.` });
+        return;
+      }
+      let edh = new Map();
+      try { const r = await getEdhrec(selCmd); if (r.status === "ok") edh = new Map(r.suggestions.map(e => [normCardName(e.name), e])); } catch {}
+      const score = n => { const e = edh.get(normCardName(n)); return e ? (e.pct || 0) + (e.synergy || 0) / 2 : 0; };
+      const protectedNorm = new Set([selCmd.card.name, deck.partner?.card?.name,
+        ...(deck.combosHave || []).flatMap(c => c.cards || [])].filter(Boolean).map(normCardName));
+      const thin = roleCoverage().filter(r => r.target && r.have.length <= r.target);
+      let cut = null;
+      for (const dc of new Map(deck.categories.flatMap(c => c.cards).map(c => [c.name, c])).values()) {
+        const csf = sfOf(dc.name) || { type_line: dc.type_line };
+        if (BASIC_NAMES.has(dc.name) || protectedNorm.has(normCardName(dc.name))) continue;
+        if (/\bLand\b/.test((csf.type_line || "").split("//")[0])) continue;
+        const key = [thin.some(r => r.test(csf)) ? 1 : 0, score(dc.name)];
+        if (!cut || key[0] < cut.key[0] || (key[0] === cut.key[0] && key[1] < cut.key[1])) cut = { name: dc.name, key };
+      }
+      if (!cut) { appAlert("There's no card left that can be cut for this combo piece."); return; }
+      const from = rec.where.find(w => w.included)?.name;
+      const e = edh.get(normCardName(cut.name));
+      const ok = await appConfirm({
+        title: `Add ${rec.name}?`,
+        body: html`
+          <p style=${{ margin:"0 0 8px" }}>Completes the combo <strong>${combo.cards.join(" + ")}</strong>.</p>
+          <p style=${{ margin:0 }}>It ${from ? html`comes from <strong>"${from}"</strong> and ` : ""}replaces <strong>${cut.name}</strong>${" "}
+            (${e ? `in ${Math.round((e.pct || 0) * 100)}% of ${selCmd.card.name.split(",")[0]} decks` : "not on EDHRec's list for this commander"}) —
+            the weakest card that isn't a combo piece, a land, or needed for a commander role.</p>`,
+        okLabel: "➕ Add combo piece",
+      });
+      if (!ok) return;
+      applySwap({ add: { name: rec.name, sf, from }, cut: { name: cut.name } });
     };
 
     const exportDeck = () => {
@@ -10624,6 +10788,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     budget=${budget} setBudget=${setBudget}
                     mech=${mech} setMech=${setMech}
                     showMech=${showMech} setShowMech=${setShowMech}
+                    comboPolicy=${comboPolicy} setComboPolicy=${setComboPolicy}
                   />
 
                   <div style=${{ textAlign:"center" }}>
@@ -11738,40 +11903,70 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 `;
               })()}
 
-              ${showInsights && deck.combosHave && deck.combosHave.length > 0 && html`
+              ${showInsights && deck.combosHave && deck.combosHave.length > 0 && (() => {
+                // Status of each combo against THIS deck: every piece in the
+                // deck, or which pieces are missing and where you own them.
+                const own = deckOwnership();
+                const inDeck = new Set([selCmd.card.name, deck.partner?.card?.name,
+                  ...deck.categories.flatMap(c => c.cards.map(x => x.name))].filter(Boolean).map(normCardName));
+                const rows = deck.combosHave.map(c => {
+                  const pieces = (c.cards || []).map(name => {
+                    const n = normCardName(name);
+                    const rec = own.get(n);
+                    const status = n === normCardName(selCmd.card.name) ? "commander"
+                      : inDeck.has(n) ? "deck" : rec?.available ? "binder" : rec ? "elsewhere" : "missing";
+                    return { name, status, rec };
+                  });
+                  const missing = pieces.filter(p => p.status !== "deck" && p.status !== "commander");
+                  return { combo: c, pieces, missing, complete: missing.length === 0 };
+                }).sort((a, b) => a.missing.length - b.missing.length);
+                const complete = rows.filter(r => r.complete).length;
+                const pieceStyle = st => ({
+                  fontSize:11, padding:"2px 8px", borderRadius:10, border:"1px solid var(--border)", background:"var(--bg-surface)",
+                  color: st === "deck" || st === "commander" ? "var(--success-text)" : st === "binder" ? "var(--info)" : "var(--fg-text-muted)",
+                });
+                const pieceLabel = p => p.status === "commander" ? "👑 commander"
+                  : p.status === "deck" ? "✓ in deck"
+                  : p.status === "binder" ? `📦 in "${p.rec.where.find(w => w.included)?.name}"`
+                  : p.status === "elsewhere" ? ownedWhere(p.rec).replace(/^you own it · /, "")
+                  : "✗ not owned";
+                return html`
                 <div style=${{ background:"var(--bg-surface-soft)", border:"1px solid #d8a060", borderRadius:10,
                   padding:"14px 18px", marginBottom:18 }}>
                   <div style=${{ fontSize:11, letterSpacing:3, color:"var(--warning)", textTransform:"uppercase",
                     fontWeight:700, marginBottom:10 }}>
-                    💥 Combos in your collection · ${deck.combosHave.length}
+                    💥 Combos · ${complete} in this deck · ${rows.length - complete} you can complete
                   </div>
+                  ${deck.comboPolicy === "avoid" && html`<div style=${{ fontSize:11, color:"var(--fg-text-muted)", marginBottom:8 }}>
+                    This deck was built to avoid infinite combos (your power level). Completing one is up to you.</div>`}
                   <div style=${{ display:"flex", flexDirection:"column", gap:8 }}>
-                    ${deck.combosHave.slice(0, 12).map((c, i) => html`
-                      <a key=${i}
-                        href=${"https://commanderspellbook.com/combo/" + (c.id || "")}
-                        target="_blank" rel="noopener"
-                        style=${{
-                          display:"block", padding:"8px 12px", borderRadius:8,
-                          background:"var(--bg-surface)", border:"1px solid var(--border-input)",
-                          color:"var(--accent-strong)", textDecoration:"none",
-                          transition:"all .15s",
-                        }}
-                        onMouseOver=${e => { e.currentTarget.style.borderColor="var(--warning)"; e.currentTarget.style.background="var(--bg-surface-soft)"; }}
-                        onMouseOut=${e  => { e.currentTarget.style.borderColor="var(--border-input)"; e.currentTarget.style.background="var(--bg-surface)"; }}>
-                        <div style=${{ fontSize:12, fontWeight:600, color:"var(--fg-text-heading)", marginBottom:3 }}>
-                          ${c.cards.join(" + ")}
-                        </div>
-                        <div style=${{ fontSize:11, color:"var(--accent-dark)" }}>
-                          → ${c.produces.length > 0 ? c.produces.join(" · ") : "synergy"}
-                        </div>
-                      </a>
+                    ${rows.slice(0, 12).map(({ combo: c, pieces, missing, complete: done }, i) => html`
+                      <div key=${c.id || i} style=${{ padding:"8px 12px", borderRadius:8, background:"var(--bg-surface)",
+                        border:"1px solid " + (done ? "var(--success-border, var(--border-input))" : "var(--border-input)") }}>
+                        <a href=${"https://commanderspellbook.com/combo/" + (c.id || "")} target="_blank" rel="noopener"
+                          style=${{ textDecoration:"none" }}>
+                          <div style=${{ fontSize:12, fontWeight:600, color:"var(--fg-text-heading)", marginBottom:3 }}>
+                            ${done ? "✅ " : ""}${c.cards.join(" + ")}
+                          </div>
+                          <div style=${{ fontSize:11, color:"var(--accent-dark)" }}>
+                            → ${c.produces.length > 0 ? c.produces.join(" · ") : "synergy"}
+                          </div>
+                        </a>
+                        ${!done && html`
+                          <div style=${{ display:"flex", gap:6, flexWrap:"wrap", alignItems:"center", marginTop:6 }}>
+                            ${pieces.map(p => html`<span key=${p.name} style=${pieceStyle(p.status)}><strong>${p.name}</strong> · ${pieceLabel(p)}</span>`)}
+                            ${missing.filter(p => p.status === "binder").map(p => html`
+                              <button key=${"add-" + p.name} onClick=${() => completeComboPiece(p.name, c)}
+                                style=${{ ...btnSec, padding:"3px 10px", fontSize:11 }}>➕ Add ${p.name}</button>`)}
+                          </div>`}
+                      </div>
                     `)}
                   </div>
                   <div style=${{ fontSize:10, color:"var(--accent-text)", fontStyle:"italic", marginTop:10 }}>
-                    From Commander Spellbook · these combos work with cards already in your collection. Click any to view full step-by-step instructions.
+                    From Commander Spellbook · you own every piece of these combos. Click a combo for step-by-step instructions; "➕ Add" puts a missing piece in the deck and cuts its weakest card.
                   </div>
-                </div>
-              `}
+                </div>`;
+              })()}
 
               ${showInsights && deck.combosAlmost && deck.combosAlmost.length > 0 && html`
                 <div style=${{ background:"var(--bg-surface-soft)", border:"1px dashed var(--border-dashed)", borderRadius:10,
