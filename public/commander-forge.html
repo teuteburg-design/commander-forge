@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.13-b";
+  const APP_VERSION = "v2026.10.13-c";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -12847,10 +12847,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           const pw = (!isImported || isEnriched) ? deckPower(deckDataHere, cmdrLabel) : null;
                           if (!pw) return null;
                           return html`
-                            <!-- Power chip — bracket + score, below the other badges -->
+                            <!-- Power chip — bracket + score, top-left (badges sit top-right) -->
                             <div title=${`Estimated bracket ${pw.low ? "1–2" : pw.bracket} · power ${pw.score.toFixed(1)}/10 (${pw.band}). Open the deck for details.`}
                               style=${{
-                                position:"absolute", top: preconInfo ? 50 : 30, right: isLibrary ? 36 : 12, zIndex:1,
+                                position:"absolute", top:10, left:12, zIndex:1,
                                 padding:"2px 8px", borderRadius:10, fontSize:9, fontWeight:700, letterSpacing:0.5,
                                 background:"var(--bg-surface-soft)", color:"var(--accent-text)", border:"1px solid var(--border-input)",
                               }}>
@@ -12871,7 +12871,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         `}
 
                         <!-- Commander row -->
-                        <div style=${{ display:"flex", gap:12, marginBottom:12, cursor:"pointer", marginTop:12 }}
+                        <div style=${{ display:"flex", gap:12, marginBottom:12, cursor:"pointer", marginTop:18 }}
                           onClick=${onOpen}>
                           ${img
                             ? html`<img src=${img} alt=${cmdrLabel}
@@ -12919,7 +12919,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           <div style=${{ borderTop:"1px solid var(--border-soft)", paddingTop:10 }}>
                             <div style=${{ fontSize:9, letterSpacing:2, color:"var(--accent-text)",
                               textTransform:"uppercase", fontWeight:700, marginBottom:6 }}>Mana Curve</div>
-                            <div style=${{ display:"flex", gap:4, alignItems:"flex-end", height:48 }}>
+                            <div style=${{ display:"flex", gap:4, alignItems:"flex-end" }}>
                               ${buckets.map((n, i) => html`
                                 <div key=${i} style=${{ flex:1, display:"flex", flexDirection:"column",
                                   alignItems:"center", gap:2 }}>
