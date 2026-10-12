@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.14-a";
+  const APP_VERSION = "v2026.10.14-b";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -2965,6 +2965,15 @@
     const [set, n] = [...by].sort((a, b) => b[1] - a[1])[0];
     return n / total >= 0.8 ? { set, share: n / total } : null;
   }
+  const _preconListCache = new Map();   // "set/slug" → Set of normalised names
+  async function preconNames(set, slug) {
+    const key = `${set}/${slug}`;
+    if (!_preconListCache.has(key)) {
+      _preconListCache.set(key, fetchMtgWtfDeck(set, slug).then(({ deck }) =>
+        new Set([...(deck?.commanders || []), ...(deck?.cards || []).map(c => c.name)].map(n => normCardName(typeof n === "string" ? n : n?.name)))));
+    }
+    return _preconListCache.get(key);
+  }
   async function identifyPrecon(d, index) {
     const dom = dominantSet(d);
     if (!dom) return null;
@@ -2976,11 +2985,9 @@
       let overlap = cands.length === 1 ? 1 : 0;
       if (cands.length > 1) {
         try {
-          const { deck } = await fetchMtgWtfDeck(e.set, e.slug);
-          const theirs = [...(deck?.commanders || []), ...(deck?.cards || []).map(c => c.name)].map(normCardName);
-          const uniq = new Set(theirs);
+          const uniq = await preconNames(e.set, e.slug);
           overlap = uniq.size ? [...uniq].filter(n => mine.has(n)).length / uniq.size : 0;
-        } catch { continue; }
+        } catch { _preconListCache.delete(`${e.set}/${e.slug}`); continue; }
       }
       if (!best || overlap > best.overlap) best = { e, overlap };
     }
@@ -4412,29 +4419,37 @@
     const preconScanRef = useRef(false);
     useEffect(() => {
       if (!didInitRef.current || preconScanRef.current) return;
-      const todo = (groups.decks || []).filter(d => !d.preconChecked && d.source !== "precon" && d.source !== "generated" && dominantSet(d));
-      const plain = (groups.decks || []).filter(d => !d.preconChecked && d.source !== "precon" && d.source !== "generated" && !dominantSet(d));
+      const todo = (groups.decks || []).filter(d => (d.preconChecked || 0) < 2 && d.source !== "precon" && d.source !== "generated" && dominantSet(d));
+      const plain = (groups.decks || []).filter(d => (d.preconChecked || 0) < 2 && d.source !== "precon" && d.source !== "generated" && !dominantSet(d));
       if (!todo.length && !plain.length) return;
       preconScanRef.current = true;
-      (async () => {
-        const found = new Map();
-        if (todo.length) {
-          let index = [];
-          try { index = (await fetchMtgWtfIndex()).entries || []; } catch {}
-          if (!index.length) { preconScanRef.current = false; return; }   // catalog unavailable — try again later
-          for (const d of todo) {
-            try { found.set(d.name, await identifyPrecon(d, index)); } catch { found.set(d.name, null); }
-          }
-        }
-        const checked = new Set([...todo, ...plain].map(d => d.name));
-        const patch = decks => decks.map(d => !checked.has(d.name) ? d
-          : { ...d, preconChecked: 1, ...(found.get(d.name) ? { precon: found.get(d.name) } : {}) });
+      // Results are saved deck by deck, so badges appear as they're found.
+      const save = (names, found) => {
+        const patch = decks => decks.map(d => !names.has(d.name) ? d
+          : { ...d, preconChecked: 2, ...(found.get(d.name) ? { precon: found.get(d.name) } : {}) });
         setGroups(g => ({ ...g, decks: patch(g.decks || []) }));
         try {
           const blob = JSON.parse(localStorage.getItem(LS_BINDERS) || "null");
           if (blob?.groups) { blob.groups.decks = patch(blob.groups.decks || []); lsSetItemSafe(LS_BINDERS, JSON.stringify(blob)); }
         } catch {}
-        preconScanRef.current = false;
+      };
+      (async () => {
+        try {
+          if (plain.length) save(new Set(plain.map(d => d.name)), new Map());
+          if (todo.length) {
+            let index = [];
+            for (let attempt = 0; attempt < 4 && !index.length; attempt++) {
+              if (attempt) await new Promise(r => setTimeout(r, 5000));   // worker may be refreshing its catalog
+              try { index = (await fetchMtgWtfIndex()).entries || []; } catch {}
+            }
+            if (!index.length) return;   // catalog unavailable — next visit retries
+            for (const d of todo) {
+              let hit = null;
+              try { hit = await identifyPrecon(d, index); } catch {}
+              save(new Set([d.name]), new Map([[d.name, hit]]));
+            }
+          }
+        } finally { preconScanRef.current = false; }
       })();
     }, [groups.decks?.length, phase]);
     useEffect(() => {
@@ -10025,7 +10040,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   : sortedDecks.map((d, i) => {
                       // Maindeck rows + commander(s) in the command zone.
                       const maindeck = cardTotal(d.cards);
-                      const cmdrCount = (d.commanderName ? 1 : 0) + ((d.partner || d.partnerName) ? 1 : 0);
+                      // Manabox lists the commander among the deck's cards (flagged as
+                      // commander) — only add commanders that aren't already counted.
+                      const inRows = n => !!n && (d.cards || []).some(c => normCardName(c.name) === normCardName(n));
+                      const partnerName = d.partner?.name || d.partner?.card?.name || d.partnerName;
+                      const cmdrCount = (d.commanderName && !inRows(d.commanderName) ? 1 : 0) + (partnerName && !inRows(partnerName) ? 1 : 0);
                       const fmt = (d.format || "commander");
                       const isCmdr = fmt === "commander";
                       const total  = maindeck + (isCmdr ? cmdrCount : 0);
