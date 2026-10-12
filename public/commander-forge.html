@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.12-a";
+  const APP_VERSION = "v2026.10.12-b";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -2942,6 +2942,57 @@
     return hits.slice(0, 3).map(x => x.id);
   }
 
+  // ── AI Suggest pre-ranking ──────────────────────────────────────────────
+  // The suggest prompt can only carry a few dozen commanders, so score the
+  // whole collection locally first and send the best fits instead of
+  // whichever came first in the CSV.
+  //   - archetype fit: the commander's own text hits the archetype's package
+  //     roles (payoff roles 3×), or a keyword pattern for archetypes that
+  //     have no package (Control, Ramp, Tribal, …)
+  //   - popularity: EDHRec rank, log-scaled, as a tiebreaker / quality signal
+  //   - strategy depth: any package hit at all, so "vanilla" legends sink
+  const ARCHETYPE_PACKAGES = {
+    "Aggro": ["attack"], "Tokens": ["tokens"], "Voltron": ["voltron"],
+    "Spellslinger": ["spellslinger"], "Aristocrats": ["aristocrats"],
+    "Reanimator": ["graveyard"], "Lifegain": ["lifegain"],
+    "+1/+1 counters": ["counters"], "Lands matter": ["landfall"],
+    "Midrange": ["blink", "draw"], "Politics": ["theft", "drain"],
+  };
+  const ARCHETYPE_TEXT = {
+    "Control":   /counter target|destroy (target|all)|exile (target|all)|return target [^.]* to its owner's hand|tap target/,
+    "Combo":     /untap|copy (target|that|it)|whenever you cast|infinite|take an extra/,
+    "Tribal":    /choose a creature type|of the chosen type|\b(elf|elves|goblin|zombie|vampire|dragon|merfolk|wizard|knight|sliver|angel|human|cat|dinosaur|pirate|soldier|warrior|spirit)s? you control/,
+    "Stax":      /can't (cast|attack|untap|search)|costs? \{\d\} more|each (player|opponent) sacrifices|don't untap/,
+    "Group Hug": /each player (draws|may|creates|adds)|each opponent (draws|may)/,
+    "Ramp":      /search your library for [^.]*land|additional land|add \{|put [^.]*land[^.]* onto the battlefield/,
+    "Big Mana":  /add (\{[wubrgc]\}){2,}|mana value \d or greater|\bx\b[^.]*spell|for each [^.]* add/,
+    "Lands matter": /landfall|whenever a land enters|play an additional land/,
+  };
+  const _compiledPkgs = new Map();
+  function packageScore(pkgId, sf) {
+    if (!_compiledPkgs.has(pkgId)) {
+      const p = STRATEGY_PACKAGES.find(x => x.id === pkgId);
+      _compiledPkgs.set(pkgId, p ? compileRoles(p.roles.filter(r => r.re && r.id !== "fodder")) : []);
+    }
+    return _compiledPkgs.get(pkgId).reduce((w, r) => w + (r.test(sf) ? (r.key ? 3 : 1) : 0), 0);
+  }
+  function commanderFit(c, archetypes) {
+    const sf = c.scryfall || {};
+    const t = rulesText(sf);
+    const fits = [];
+    let arch = 0;
+    for (const a of archetypes) {
+      let w = (ARCHETYPE_PACKAGES[a] || []).reduce((s, id) => s + packageScore(id, sf), 0);
+      if (ARCHETYPE_TEXT[a]?.test(t)) w += 2;
+      if (w > 0) { arch += Math.min(w, 6); fits.push(a); }
+    }
+    const depth = STRATEGY_PACKAGES.reduce((s, p) => s + Math.min(packageScore(p.id, sf), 3), 0);
+    const rank = sf.edhrec_rank;
+    // rank 1 → 4 pts, ~1k → 2.5, ~20k → 0.6, unranked → 0
+    const pop = rank ? Math.max(0, 4 - Math.log10(rank) * 0.75) : 0;
+    return { score: arch * 3 + Math.min(depth, 6) + pop, fits };
+  }
+
   // Turn a research result into concrete roles with targets.
   //   research: { packages:[ids], roles:[{ id, label?, target, why?, re? }] }
   function researchRoles(research) {
@@ -4725,10 +4776,18 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
           !suggestedNames.includes((c.name || "").toLowerCase())
         );
         const pool = unseenFiltered.length >= 3 ? unseenFiltered : budgetFiltered;
-        const sample = pool.slice(0, 25);
-        const list   = sample.map(c => {
+        // Score every candidate locally and send the best fits — the prompt
+        // only has room for SUGGEST_MAX, and CSV order is arbitrary.
+        const SUGGEST_MAX = 60;
+        const seen = new Set();
+        const scored = pool
+          .filter(c => { const k = (c.name || "").toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; })
+          .map(c => ({ c, ...commanderFit(c, archetypes) }))
+          .sort((a, b) => b.score - a.score);
+        const sample = scored.slice(0, SUGGEST_MAX);
+        const list   = sample.map(({ c, fits }) => {
           const price = c.scryfall?.prices?.usd ? `$${c.scryfall.prices.usd}` : "—";
-          return `${c.name} | ${c.scryfall.mana_cost||"—"} | ${price} | ${(c.scryfall.oracle_text||"").slice(0,80)}`;
+          return `${c.name} | ${c.scryfall.mana_cost||"—"} | ${price}${fits.length ? ` | fits: ${fits.join(", ")}` : ""} | ${oracleSnippet(c.scryfall, 110)}`;
         }).join("\n");
 
         const sel = BRACKETS.find(b => b.n === bracket) || BRACKETS[2];
@@ -4738,7 +4797,9 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
           (archetypes.length ? `- Preferred archetypes: ${archetypes.join(", ")}\n` : "") +
           (budgetNum > 0 ? `- Budget cap: ~$${budgetNum} total deck cost\n` : "");
 
-        addLog(`🤖 Asking AI to rank ${sample.length} commanders…`);
+        addLog(sample.length < scored.length
+          ? `🤖 Asking AI to rank the ${sample.length} best-fitting of ${scored.length} commanders…`
+          : `🤖 Asking AI to rank ${sample.length} commanders…`);
         const replyObj = await callAI(
           `${prefsBlock}\nLegendary cards available as commanders (name | mana cost | est. USD | oracle text snippet):\n\n${list}\n\nRank the TOP 3 commanders by fit with the build preferences above and EDH potential. Prioritise commanders that match the preferred archetypes and stay within the bracket's power band. JSON only:\n{"commanders":[{"name":"exact name","theme":"2-4 word theme","reason":"1 sentence one-liner","strategy":"3-5 sentences explaining the deck's plan: how it wins, what synergies the commander enables, key card categories to lean into, and how it plays in the early/mid/late game"}]}`,
           "You are an expert MTG Commander/EDH deckbuilder. Respect the user's bracket and archetype preferences. Respond only with valid JSON, no markdown.",
