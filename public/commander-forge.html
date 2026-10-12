@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.13-c";
+  const APP_VERSION = "v2026.10.14-a";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -637,6 +637,8 @@
   // in-memory copy loaded once at startup, so getSFCache() stays synchronous
   // and no longer re-parses megabytes of JSON on every render.
   const SF_IDB_NAME = "cmdr_forge", SF_IDB_STORE = "kv", SF_IDB_KEY = "sf_cache";
+  const BACKUP_IDB_KEY = "backup_pre_library_v3";   // Collection + Library before built decks moved
+  const LS_SKIP_LIB_MIGRATION = "cmdr_forge_skip_library_migration";   // set by "Restore pre-update backup" (not synced)
   let sfCacheMem = {};
   let sfPersistTimer = null;
 
@@ -1083,6 +1085,26 @@
   // "Creature (29)", "Land (38)", etc.). Card lines look like:
   //   1 [Captain America, Team Leader {U}{R}{W}](/card/msc/5/Captain-America-Team-Leader)
   // …or in raw HTML: <li>1 <a href="/card/...">Captain America, Team Leader</a> {U}{R}{W}</li>
+  // mtg.wtf "/download" text: "// NAME: …" metadata, "COMMANDER: 1 Name",
+  // then "1 Card Name [SET:NUM]" lines (mirrors the worker's parser).
+  function parseMtgWtfDownloadText(text) {
+    const meta = {}, commanders = [], cards = [];
+    const lineRe = /^(\d+)\s+(.+?)(?:\s*\[([A-Za-z0-9_]+):([^\]]+)\])?(?:\s*\[(foil|etched)\])?\s*$/i;
+    for (const raw of (text || "").split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      if (line.startsWith("//")) { const m = line.match(/^\/\/\s*([A-Z]+):\s*(.+)$/); if (m) meta[m[1].toLowerCase()] = m[2].trim(); continue; }
+      const cm = line.match(/^(COMMANDER|PARTNER|COMPANION)\s*:\s*(.+)$/i);
+      const body = cm ? cm[2] : line;
+      const m = body.match(lineRe);
+      if (!m) continue;
+      const c = { name: m[2].trim(), qty: parseInt(m[1], 10), set: m[3] ? m[3].toLowerCase() : null, number: m[4] || null };
+      if (cm) { if (/^(COMMANDER|PARTNER)$/i.test(cm[1])) commanders.push(c.name); }
+      else cards.push(c);
+    }
+    return { name: meta.name || "Untitled deck", commanders, partners: commanders.length >= 2, cards };
+  }
+
   function parseMtgWtfDeck(html) {
     const doc = new DOMParser().parseFromString(html, "text/html");
     // Title: first <h4> or <h1> usually carries the deck name.
@@ -1169,6 +1191,13 @@
       }
     } catch {}
     const url = `https://mtg.wtf/deck/${encodeURIComponent(setCode)}/${encodeURIComponent(slug)}`;
+    // Plain-text export first (same format the worker parses); mtg.wtf's
+    // HTML layout changes more often than its download format.
+    try {
+      const { html: text, via } = await fetchHtmlViaProxies(`${url}/download`);
+      const deck = parseMtgWtfDownloadText(text);
+      if (deck.cards.length) return { deck, via: `mtg.wtf:${via}`, url };
+    } catch {}
     const { html, via } = await fetchHtmlViaProxies(url);
     const deck = parseMtgWtfDeck(html);
     return { deck, via: `mtg.wtf:${via}`, url };
@@ -2530,7 +2559,9 @@
       default:                  return "";
     }
   }
-  function computeUsable(groups, deckInc, binInc) {
+  // The forge pool: included binders + Collection decks, minus copies
+  // claimed by built Library decks (see builtClaims).
+  function computeUsable(groups, deckInc, binInc, claims = []) {
     const seen = new Map();
     const add = cards => cards.forEach(c => {
       if (seen.has(c.name)) seen.get(c.name).qty += c.qty;
@@ -2538,7 +2569,11 @@
     });
     (groups.decks || []).forEach(d => { if (deckInc[d.name]) add(d.cards); });
     (groups.binders || []).forEach(b => { if (binInc[b.name]) add(b.cards); });
-    return [...seen.values()];
+    if (!claims.length) return [...seen.values()];
+    const used = claimedQty(groups, deckInc, binInc, claims);
+    return [...seen.values()]
+      .map(c => { const u = used.get(normCardName(c.name)) || 0; return u ? { ...c, qty: (c.qty || 0) - u } : c; })
+      .filter(c => (c.qty || 0) > 0);
   }
 
   // ── Style constants ─────────────────────────────────────────────────────────
@@ -2788,6 +2823,170 @@
   function deckFingerprint(cmdrName, deck) {
     const names = (deck?.categories || []).flatMap(c => (c.cards || []).map(x => normCardName(x.name))).sort();
     return names.length ? `${normCardName(cmdrName)}|${names.join("\u0001")}` : null;
+  }
+
+  // ── Built decks claim their cards (Collection stays as imported) ────────
+  // The Collection mirrors the user's Manabox / Moxfield export and is never
+  // reduced by building a deck. A Library deck marked as built instead
+  // CLAIMS one copy of each of its cards (commander included, basics never),
+  // derived live from its card list — so swaps / edits update the claims
+  // automatically. `built.from` remembers which binder or Collection deck a
+  // card was pulled from; claims only reduce availability when that source
+  // is included in the pool (or unknown / gone).
+  //   entry.built = { at, from: { [cardName]: sourceName } }
+  function entryClaims(e) {
+    if (!e?.built) return [];
+    const counts = new Map();
+    const add = n => { if (n && !BASIC_NAMES.has(n)) counts.set(n, (counts.get(n) || 0) + 1); };
+    add(e.selCmd?.card?.name || e.selCmd?.name);
+    add(e.deck?.partner?.card?.name || e.deck?.partner?.name);
+    (e.deck?.categories || []).forEach(cat => (cat.cards || []).forEach(c => add(c.name)));
+    const title = e.deck?.theme || e.selCmd?.card?.name || "built deck";
+    return [...counts].map(([name, qty]) => ({ name, qty, from: e.built.from?.[name] || null, deckId: e.id, deckTitle: title }));
+  }
+  const builtClaims = library => (library || []).flatMap(entryClaims);
+
+  // Copies claimed per card (normalised name) that reduce the pool: claims
+  // whose source is included, missing, or unknown.
+  function claimedQty(groups, deckInc, binInc, claims) {
+    const inc = new Map([
+      ...(groups.binders || []).map(b => [b.name, !!binInc[b.name]]),
+      ...(groups.decks   || []).map(d => [d.name, !!deckInc[d.name]]),
+    ]);
+    const used = new Map();
+    for (const c of claims || []) {
+      if (c.from && inc.has(c.from) && !inc.get(c.from)) continue;
+      const k = normCardName(c.name);
+      used.set(k, (used.get(k) || 0) + c.qty);
+    }
+    return used;
+  }
+
+  // Pick a source for each card of a deck being marked as built: an included
+  // binder / Collection deck with an unclaimed copy first, then any source
+  // that has one. Returns { from, missing }.
+  function pickClaimSources(names, groups, deckInc, binInc, otherClaims) {
+    const left = new Map();   // "source|card" → unclaimed copies
+    const sources = [
+      ...(groups.binders || []).map(s => ({ s, inc: !!binInc[s.name] })),
+      ...(groups.decks   || []).filter(d => d.source !== "generated").map(s => ({ s, inc: !!deckInc[s.name] })),
+    ].sort((a, b) => b.inc - a.inc);
+    for (const { s } of sources) for (const c of s.cards || []) {
+      const key = s.name + "|" + normCardName(c.name);
+      left.set(key, (left.get(key) || 0) + (c.qty || 0));
+    }
+    for (const c of otherClaims || []) {
+      if (!c.from) continue;
+      const key = c.from + "|" + normCardName(c.name);
+      if (left.has(key)) left.set(key, left.get(key) - c.qty);
+    }
+    const from = {}, missing = [];
+    for (const [name, qty] of names) {
+      const k = normCardName(name);
+      const hit = sources.find(({ s }) => (left.get(s.name + "|" + k) || 0) >= qty)
+        || sources.find(({ s }) => (left.get(s.name + "|" + k) || 0) > 0);
+      if (hit) { from[name] = hit.s.name; left.set(hit.s.name + "|" + k, left.get(hit.s.name + "|" + k) - qty); }
+      else missing.push(name);
+    }
+    return { from, missing };
+  }
+
+  // One-time move (v2026.10.13): built decks used to live in the Collection
+  // as source "generated" decks with their cards SUBTRACTED from the
+  // binders. Put those cards back into the binders they came from and turn
+  // each deck into a built Library entry. Idempotent: it only acts on
+  // "generated" decks and removes them in the same write.
+  function migrateBuiltDecks(binderBlob, library) {
+    const decks = binderBlob?.groups?.decks || [];
+    const gen = decks.filter(d => d.source === "generated");
+    if (!gen.length) return null;
+    let binders = (binderBlob.groups.binders || []).map(b => ({ ...b, cards: (b.cards || []).map(c => ({ ...c })) }));
+    const binInc = { ...(binderBlob.binInc || {}) };
+    const deckInc = { ...(binderBlob.deckInc || {}) };
+    let lib = [...(library || [])];
+    let returned = 0;
+    const moved = [];
+    const UNCAT = "Uncategorised";
+    gen.forEach((d, i) => {
+      const from = {};
+      for (const r of d.cards || []) {
+        const owned = !(BASIC_NAMES.has(r.name) || r.notOwned || (!d.reservedV && r.name === d.commanderName));
+        if (!owned) continue;
+        if (r.from && !from[r.name]) from[r.name] = r.from;
+        // Put the copy back where it was taken from.
+        const dest = r.from && binders.some(b => b.name === r.from) ? r.from : UNCAT;
+        if (!binders.some(b => b.name === dest)) {
+          binders.push({ name: dest, type: "binder", cards: [], commanderName: null, source: "manual" });
+          binInc[dest] = true;
+        }
+        const bin = binders.find(b => b.name === dest);
+        const same = c => (c.id || "") === (r.id || "") && normCardName(c.name) === normCardName(r.name)
+          && (c.condition || "NM") === (r.condition || "NM") && (c.finish || "normal") === (r.finish || "normal")
+          && (c.lang || "en") === (r.lang || "en") && !!c.misprint === !!r.misprint;
+        const qty = r.qty || 1;
+        const bi = bin.cards.findIndex(same);
+        if (bi >= 0) bin.cards[bi] = { ...bin.cards[bi], qty: (bin.cards[bi].qty || 0) + qty };
+        else bin.cards.push({ name: r.name, qty, id: r.id || "", condition: r.condition || "NM",
+          finish: r.finish || "normal", lang: r.lang || "en", ...(r.misprint ? { misprint: true } : {}) });
+        returned += qty;
+      }
+      delete deckInc[d.name];
+      if (!d.deckData || !d.selCmd) return;   // nothing to show — cards are back, deck is gone
+      // "Forge: <commander> · <theme>" was only needed while the deck lived in
+      // the Collection; the Library shows the plain theme.
+      const cmdr = d.selCmd?.card?.name || d.commanderName || "";
+      let theme = d.deckData.theme || d.name;
+      const prefix = `Forge: ${cmdr}`;
+      if (theme.startsWith(prefix)) theme = theme.slice(prefix.length).replace(/^ · /, "").replace(/ \(\d+\)$/, "") || cmdr;
+      const fp = deckFingerprint(cmdr, d.deckData);
+      lib = lib.filter(e => !(fp && deckFingerprint(e.selCmd?.card?.name, e.deck) === fp));
+      const savedAt = d.savedAt ? new Date(d.savedAt).toISOString() : new Date().toISOString();
+      lib.unshift({ id: Date.now() + i, savedAt, selCmd: d.selCmd, deck: { ...d.deckData, theme },
+        built: { at: d.savedAt || Date.now(), from } });
+      moved.push(theme);
+    });
+    return {
+      binderBlob: { ...binderBlob, groups: { ...binderBlob.groups, decks: decks.filter(d => d.source !== "generated"), binders }, deckInc, binInc },
+      library: lib, moved, returned,
+    };
+  }
+
+  // ── Precon detection for Collection decks ───────────────────────────────
+  // Manabox rows carry each card's set code. A deck whose non-basic cards
+  // mostly (≥ 80%) come from one set that has Commander precons is a
+  // precon; which one is decided by comparing against each precon list of
+  // that set (worker-cached mtg.wtf catalog).
+  function dominantSet(d) {
+    const rows = (d.cards || []).filter(r => r.set && !BASIC_NAMES.has(r.name));
+    const total = rows.reduce((n, r) => n + (r.qty || 1), 0);
+    if (total < 40) return null;
+    const by = new Map();
+    rows.forEach(r => by.set(r.set, (by.get(r.set) || 0) + (r.qty || 1)));
+    const [set, n] = [...by].sort((a, b) => b[1] - a[1])[0];
+    return n / total >= 0.8 ? { set, share: n / total } : null;
+  }
+  async function identifyPrecon(d, index) {
+    const dom = dominantSet(d);
+    if (!dom) return null;
+    const cands = index.filter(e => e.set === dom.set && (!e.category || e.category === "commander") && !e.collector);
+    if (!cands.length) return null;
+    const mine = new Set([d.commanderName, ...(d.cards || []).map(r => r.name)].filter(Boolean).map(normCardName));
+    let best = null;
+    for (const e of cands) {
+      let overlap = cands.length === 1 ? 1 : 0;
+      if (cands.length > 1) {
+        try {
+          const { deck } = await fetchMtgWtfDeck(e.set, e.slug);
+          const theirs = [...(deck?.commanders || []), ...(deck?.cards || []).map(c => c.name)].map(normCardName);
+          const uniq = new Set(theirs);
+          overlap = uniq.size ? [...uniq].filter(n => mine.has(n)).length / uniq.size : 0;
+        } catch { continue; }
+      }
+      if (!best || overlap > best.overlap) best = { e, overlap };
+    }
+    if (!best || best.overlap < 0.5) return { set: dom.set, setName: cands[0].setName || dom.set.toUpperCase(), name: null, partial: true, detected: true };
+    return { set: best.e.set, setName: best.e.setName || best.e.set.toUpperCase(), slug: best.e.slug, name: best.e.name,
+      partial: dom.share < 0.95 || best.overlap < 0.9, detected: true };
   }
 
   // ── Re-import: keep built decks reserved ────────────────────────────────
@@ -3262,22 +3461,35 @@
   // Where each card the user owns lives. `available` = in the pool the deck
   // builder draws from (an included binder or deck); `where` lists every
   // binder / deck holding it, with whether that source is included.
-  function buildOwnershipIndex(groups, deckInc, binInc, skipDeckName) {
+  // claims: built Library decks' claims (builtClaims) — a card is only
+  // "available" while an included source has an unclaimed copy.
+  function buildOwnershipIndex(groups, deckInc, binInc, skipDeckName, claims = []) {
     const idx = new Map();
-    const note = (name, entry) => {
+    const note = (name, entry, qty) => {
       const k = normCardName(name);
-      if (!idx.has(k)) idx.set(k, { name, available: false, where: [] });
+      if (!idx.has(k)) idx.set(k, { name, available: false, where: [], free: 0, owned: 0 });
       const rec = idx.get(k);
       rec.where.push(entry);
-      if (entry.included) rec.available = true;
+      rec.owned += qty;
+      if (entry.included) rec.free += qty;
     };
     (groups.binders || []).forEach(b => (b.cards || []).forEach(c => {
-      if ((c.qty || 0) > 0) note(c.name, { kind: "binder", name: b.name, included: !!binInc[b.name] });
+      if ((c.qty || 0) > 0) note(c.name, { kind: "binder", name: b.name, included: !!binInc[b.name] }, c.qty || 1);
     }));
     (groups.decks || []).forEach(d => {
       if (d.name === skipDeckName) return;
-      (d.cards || []).forEach(c => note(c.name, { kind: "deck", name: d.name, included: !!deckInc[d.name] }));
+      (d.cards || []).forEach(c => note(c.name, { kind: "deck", name: d.name, included: !!deckInc[d.name] }, c.qty || 1));
     });
+    const used = claimedQty(groups, deckInc, binInc, claims);
+    for (const c of claims) {
+      const rec = idx.get(normCardName(c.name));
+      if (rec && !rec.where.some(w => w.kind === "built" && w.name === c.deckTitle))
+        rec.where.push({ kind: "built", name: c.deckTitle, included: false });
+    }
+    for (const [k, rec] of idx) {
+      rec.free -= used.get(k) || 0;
+      rec.available = rec.free > 0;
+    }
     return idx;
   }
 
@@ -4192,6 +4404,47 @@
     // Game Changer list for the ⚡ Power panel / bracket rules (weekly).
     useEffect(() => { const t = setTimeout(refreshGameChangers, 4000); return () => clearTimeout(t); }, []);
     const [powerOpen, setPowerOpen] = useState(false);   // ⚡ Power panel (collapsed by default)
+    // Built Library decks claim their cards: whenever the claims change
+    // (mark built, release, swap, delete…), recompute the forge pool.
+    const claimsSig = builtClaims(library).map(c => `${c.name}|${c.qty}|${c.from || ""}`).sort().join("\n");
+    const claimsSigRef = useRef(null);
+    // Mark Collection decks that are precons (once per deck; see identifyPrecon).
+    const preconScanRef = useRef(false);
+    useEffect(() => {
+      if (!didInitRef.current || preconScanRef.current) return;
+      const todo = (groups.decks || []).filter(d => !d.preconChecked && d.source !== "precon" && d.source !== "generated" && dominantSet(d));
+      const plain = (groups.decks || []).filter(d => !d.preconChecked && d.source !== "precon" && d.source !== "generated" && !dominantSet(d));
+      if (!todo.length && !plain.length) return;
+      preconScanRef.current = true;
+      (async () => {
+        const found = new Map();
+        if (todo.length) {
+          let index = [];
+          try { index = (await fetchMtgWtfIndex()).entries || []; } catch {}
+          if (!index.length) { preconScanRef.current = false; return; }   // catalog unavailable — try again later
+          for (const d of todo) {
+            try { found.set(d.name, await identifyPrecon(d, index)); } catch { found.set(d.name, null); }
+          }
+        }
+        const checked = new Set([...todo, ...plain].map(d => d.name));
+        const patch = decks => decks.map(d => !checked.has(d.name) ? d
+          : { ...d, preconChecked: 1, ...(found.get(d.name) ? { precon: found.get(d.name) } : {}) });
+        setGroups(g => ({ ...g, decks: patch(g.decks || []) }));
+        try {
+          const blob = JSON.parse(localStorage.getItem(LS_BINDERS) || "null");
+          if (blob?.groups) { blob.groups.decks = patch(blob.groups.decks || []); lsSetItemSafe(LS_BINDERS, JSON.stringify(blob)); }
+        } catch {}
+        preconScanRef.current = false;
+      })();
+    }, [groups.decks?.length, phase]);
+    useEffect(() => {
+      if (!didInitRef.current || claimsSigRef.current === claimsSig) return;
+      claimsSigRef.current = claimsSig;
+      if (!(groups.binders?.length || groups.decks?.length)) return;
+      const next = computeUsable(groups, deckInc, binInc, builtClaims(library));
+      setUsable(next);
+      lsSetItemSafe(LS_CARDS, JSON.stringify(next));
+    }, [claimsSig]);
     const tooltipTimer = useRef(null);
     const headerRef    = useRef(null);
 
@@ -4371,7 +4624,26 @@
       setUseSharedGemini(useShared);
 
       const savedCards   = localStorage.getItem(LS_CARDS);
-      const savedBinders = localStorage.getItem(LS_BINDERS);
+      let   savedBinders = localStorage.getItem(LS_BINDERS);
+      // One-time: built decks move from the Collection to the Library (see
+      // migrateBuiltDecks). The pre-migration state is kept in IndexedDB so
+      // Settings can restore it.
+      try {
+        const mig = savedBinders && localStorage.getItem(LS_SKIP_LIB_MIGRATION) !== "1" && migrateBuiltDecks(JSON.parse(savedBinders), JSON.parse(localStorage.getItem(LS_LIBRARY) || "[]"));
+        if (mig) {
+          const backup = { at: Date.now(), binders: savedBinders, library: localStorage.getItem(LS_LIBRARY) || "[]" };
+          sfIdb().then(db => { const tx = db.transaction(SF_IDB_STORE, "readwrite"); tx.objectStore(SF_IDB_STORE).put(backup, BACKUP_IDB_KEY); }).catch(() => {});
+          savedBinders = JSON.stringify(mig.binderBlob);
+          lsSetItemSafe(LS_BINDERS, savedBinders);
+          lsSetItemSafe(LS_LIBRARY, JSON.stringify(mig.library));
+          setTimeout(() => appAlert({
+            title: "Built decks moved to the Library",
+            body: html`<p style=${{ margin:"0 0 8px" }}>Your Collection now mirrors your Manabox export exactly. Built decks live in the <strong>Library</strong> and keep their cards reserved there, so re-importing your collection no longer mixes up quantities.</p>
+              <p style=${{ margin:"0 0 8px" }}>Moved: <strong>${mig.moved.join(", ") || "—"}</strong>. ${mig.returned} card${mig.returned === 1 ? "" : "s"} went back into the binders they were taken from; the decks still claim them.</p>
+              <p style=${{ margin:0, fontSize:12, color:"var(--fg-text-muted)" }}>A backup of the old state is kept — Settings → "Restore pre-update backup".</p>`,
+          }), 600);
+        }
+      } catch (e) { console.warn("Built-deck migration failed:", e); }
       const savedCmdrs   = localStorage.getItem(LS_COMMANDERS);
       const savedPrefs   = localStorage.getItem(LS_PREFS);
 
@@ -4408,23 +4680,7 @@
       } catch {}
       const savedLib = localStorage.getItem(LS_LIBRARY);
       if (savedLib) { try {
-        let lib = JSON.parse(savedLib);
-        // Library copies of decks already marked as built (same commander +
-        // same cards as a Forge deck in Collection) are leftovers from before
-        // "Mark as built" reliably removed them — drop them.
-        let built = new Set();
-        try {
-          const bg = JSON.parse(savedBinders || "{}");
-          built = new Set((bg.groups?.decks || [])
-            .filter(d => d.source === "generated" && d.deckData)
-            .map(d => deckFingerprint(d.selCmd?.card?.name || d.commanderName, d.deckData))
-            .filter(Boolean));
-        } catch {}
-        const deduped = lib.filter(e => !built.has(deckFingerprint(e.selCmd?.card?.name, e.deck)));
-        if (deduped.length !== lib.length) {
-          lib = deduped;
-          lsSetItemSafe(LS_LIBRARY, JSON.stringify(lib));
-        }
+        const lib = JSON.parse(localStorage.getItem(LS_LIBRARY) || savedLib);
         setLibrary(lib);
       } catch {} }
 
@@ -4900,7 +5156,7 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
     };
 
     const confirmSelection = () => {
-      const cards = computeUsable(groups, deckInc, binInc);
+      const cards = computeUsable(groups, deckInc, binInc, builtClaims(library));
       lsSetItemSafe(LS_CARDS, JSON.stringify(cards));
       lsSetItemSafe(LS_BINDERS, JSON.stringify({ groups, deckInc, binInc }));
       setUsable(cards);
@@ -5020,7 +5276,7 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
       setSelCmd(chosenCmd); setPhase("building"); setLog([]); setProg(0);
       // A fresh build replaces any previously-pushed-aside unsaved deck.
       setUnsavedDeck(null); setLibSaved(false); setFromSaved(false);
-      setFromCollection(false); setDeckSvd(false); setArchResult(null);
+      setFromCollection(false); setDeckSvd(false); setArchResult(null); setLibEntryId(null);
       addLog(`⚒️ Building deck for ${chosenCmd.name}…`);
       try {
         let allCards = enriched;
@@ -5811,11 +6067,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // deck and/or Library entry) and show it.
     const persistOpenDeck = (nextDeck) => {
       setDeck(nextDeck);
-      if ((groups.decks || []).some(d => d.name === deck.theme)) {
+      if (!!openColDeck()) {
         persistGroups({ ...groups, decks: groups.decks.map(d => d.name === deck.theme ? { ...d, deckData: nextDeck } : d) });
       }
       const libMatch = e => libEntryId != null ? e.id === libEntryId : e.deck?.theme === deck.theme;
-      if (library.some(libMatch)) {
+      if (!fromCollection && library.some(libMatch)) {
         const updated = library.map(e => libMatch(e) ? { ...e, deck: nextDeck } : e);
         setLibrary(updated);
         lsSetItemSafe(LS_LIBRARY, JSON.stringify(updated));
@@ -5863,14 +6119,16 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // Ownership of the open deck's suggested cards, against the WHOLE
     // collection (not just the build pool), for the insights panels.
     const deckOwnership = () => {
-      const colDeck = deck && (groups.decks || []).some(d => d.name === deck.theme) ? deck.theme : null;
-      return buildOwnershipIndex(groups, deckInc, binInc, colDeck);
+      const colDeck = openColDeck() ? deck.theme : null;
+      return buildOwnershipIndex(groups, deckInc, binInc, colDeck, builtClaims(library));
     };
     // Short "where is it" label for a card the user owns.
     const ownedWhere = (rec) => {
       if (!rec) return "";
       const deckHit = rec.where.find(w => w.kind === "deck" && !w.included);
+      const builtHit = rec.where.find(w => w.kind === "built");
       if (rec.available) return "you own it";
+      if (builtHit) return `you own it · used in "${builtHit.name}"`;
       if (deckHit) return `you own it · in deck "${deckHit.name}"`;
       const bin = rec.where.find(w => w.kind === "binder");
       return bin ? `you own it · binder "${bin.name}" is excluded` : "you own it";
@@ -5922,8 +6180,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         const cmdrKeys = new Set([selCmd.card.name, deck.partner?.card?.name].filter(Boolean).map(normCardName));
         const deckRows = deck.categories.flatMap(cat => cat.cards.map(c => ({ ...c, category: cat.name })));
         const inDeck   = new Set([...cmdrKeys, ...deckRows.map(c => normCardName(c.name))]);
-        const colDeck  = (groups.decks || []).some(d => d.name === deck.theme) ? deck.theme : null;
-        const own      = buildOwnershipIndex(groups, deckInc, binInc, colDeck);
+        const colDeck  = openColDeck() ? deck.theme : null;
+        const own      = buildOwnershipIndex(groups, deckInc, binInc, colDeck, builtClaims(library));
         const budgetNum = parseFloat(deck.buildPrefs?.budget ?? budget) || 0;
         const cardCap   = budgetNum > 0 ? budgetNum * 0.25 : Infinity;
 
@@ -6024,12 +6282,13 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       })) };
       if (!replaced) { setError(`Couldn't find ${sw.cut.name} in the deck any more.`); return false; }
 
-      const colDeck = (groups.decks || []).find(d => d.name === deck.theme);
+      const colDeck = openColDeck();
       if (!colDeck) {
         setDeck(nextDeck);
         if (fromSaved) {
+          // Built decks: remember where the new card comes from (its claim).
           const updated = library.map(e => (libEntryId != null ? e.id === libEntryId : e.deck?.theme === deck.theme)
-            ? { ...e, deck: nextDeck } : e);
+            ? { ...e, deck: nextDeck, ...(e.built && sw.add.from ? { built: { ...e.built, from: { ...(e.built.from || {}), [sw.add.name]: sw.add.from } } } : {}) } : e);
           setLibrary(updated);
           lsSetItemSafe(LS_LIBRARY, JSON.stringify(updated));
         }
@@ -6084,7 +6343,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       const nextGroups = { ...groups, decks: nextDecks, binders: nextBinders };
       setBinInc(nextBinInc);
       persistGroups(nextGroups, deckInc, nextBinInc);
-      const nextUsable = computeUsable(nextGroups, deckInc, nextBinInc);
+      const nextUsable = computeUsable(nextGroups, deckInc, nextBinInc, builtClaims(library));
       setUsable(nextUsable);
       lsSetItemSafe(LS_CARDS, JSON.stringify(nextUsable));
       setBinderEnriched(m => { const next = { ...m }; touched.forEach(b => delete next[b]); return next; });
@@ -6428,140 +6687,51 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setUsable(remaining); setDeckSvd(true);
     };
 
-    // Save the freshly-generated deck back into the Collection as a navigable
-    // deck entry (just like a Manabox-imported deck). Cards are claimed from
-    // the user's binders qty-by-qty so the pool reflects what's still free.
-    //
-    // Behaviour:
-    //   - Adds groups.decks[<title>] with source="generated", full deck object
-    //     preserved so the preview later can render commander art / mana curve.
-    //   - For each non-basic card in the deck: decrements 1 from the first
-    //     binder/deck that still has stock. Basics are unlimited so we don't
-    //     touch them.
-    //   - Sets deckInc[title]=false so the deck is excluded from the eligible
-    //     pool by default (the cards are reserved). User can toggle ON later
-    //     to release them.
-    const saveDeckToCollection = async () => {
-      const basics    = new Set([...Object.values(BASIC_LAND), "Wastes"]);
-      const cmdrName  = selCmd?.card?.name || "Commander";
-      const themePart = (deck?.theme || "").trim();
-      const baseTitle = themePart
-        ? `Forge: ${cmdrName} · ${themePart}`
-        : `Forge: ${cmdrName}`;
-      // Avoid collisions if user saves multiple decks for the same commander.
-      let title = baseTitle, counter = 2;
-      while (groups.decks.some(d => d.name === title)) {
-        title = `${baseTitle} (${counter++})`;
-      }
-
-      // Count every card once (merging duplicates such as basic lands),
-      // commander(s) included — they come out of the drawer too.
-      const counts = new Map();
-      const addCount = (name) => counts.set(name, (counts.get(name) || 0) + 1);
-      const cmdrNames = new Set([cmdrName, deck.partner?.card?.name].filter(Boolean));
-      cmdrNames.forEach(addCount);
-      deck.categories.forEach(cat => cat.cards.forEach(c => { if (!cmdrNames.has(c.name)) addCount(c.name); }));
-
-      // Plan which binder rows each card comes from. Copies of the binders
-      // are mutated so `groups` stays untouched until the state update below.
-      const nextDecks   = [...groups.decks];
-      const nextBinders = groups.binders.map(b => ({
-        ...b, cards: b.cards.map(c => ({ ...c })),   // deep-ish copy
-      }));
-      // Deck rows remember the printing and the binder each copy came from,
-      // so deleting the deck later can put the cards back where they were.
-      const deckRows = [];
-      let reserved = 0;
-      const notOwned = [];
-      for (const [name, qty] of counts) {
-        if (basics.has(name)) { deckRows.push({ name, qty, id: "" }); continue; }   // unlimited
-        let needed = qty;
-        for (const bin of nextBinders) {
-          if (needed <= 0) break;
-          const entry = bin.cards.find(c => c.name === name && (c.qty || 0) > 0);
-          if (!entry) continue;
-          const take = Math.min(entry.qty, needed);
-          entry.qty -= take;
-          needed    -= take;
-          reserved  += take;
-          deckRows.push({
-            name, qty: take, id: entry.id || "",
-            condition: entry.condition || "NM", finish: entry.finish || "normal", lang: entry.lang || "en",
-            ...(entry.misprint ? { misprint: true } : {}),
-            from: bin.name,
-          });
-        }
-        if (needed > 0) {
-          notOwned.push(name);
-          deckRows.push({ name, qty: needed, id: "", notOwned: true });
-        }
-      }
-      for (const bin of nextBinders) {
-        bin.cards = bin.cards.filter(c => (c.qty || 0) > 0);   // trim emptied rows
-      }
-
-      const fromLibrary = libSaved && libEntryId != null;
+    // "📦 I built this deck": the deck (in the Library — saved there first if
+    // needed) claims one copy of each of its cards, commander included, so
+    // other decks don't use them. The Collection itself isn't changed, so a
+    // fresh Manabox import can't double-count or lose them.
+    const markDeckBuilt = async () => {
+      if (!deck || !selCmd) return;
+      const existing = openLibEntry();
+      const entry = existing || { id: Date.now(), savedAt: new Date().toISOString(), selCmd, deck };
+      const counts = entryClaims({ ...entry, deck, selCmd, built: { from: {} } }).map(c => [c.name, c.qty]);
+      const others = builtClaims(library.filter(e => e.id !== entry.id));
+      const { from, missing } = pickClaimSources(counts, groups, deckInc, binInc, others);
+      const total = counts.reduce((n, [, q]) => n + q, 0);
       const ok = await appConfirm({
         title: "Mark this deck as built?",
         body: html`
-          <p style=${{ margin:"0 0 10px" }}><strong>${reserved} card${reserved === 1 ? "" : "s"}</strong> (commander included) will be taken out of your binders, so they won't be suggested for other decks. Basic lands aren't counted.</p>
-          <p style=${{ margin:"0 0 10px" }}>The deck moves to <strong>Collection → Decks</strong> as "${title}"${fromLibrary ? " and out of the Library" : ""}.</p>
-          ${notOwned.length > 0 && html`<p style=${{ margin:"0 0 10px" }}>
-            ${notOwned.length} card${notOwned.length > 1 ? "s aren't" : " isn't"} in your binders, so nothing is taken out for ${notOwned.length > 1 ? "them" : "it"}:
-            <span style=${{ color:"var(--fg-text-muted)" }}> ${notOwned.slice(0, 8).join(", ")}${notOwned.length > 8 ? ", …" : ""}</span></p>`}
-          <p style=${{ margin:0, fontSize:12, color:"var(--fg-text-muted)" }}>Deleting the deck later lets you put the cards back into your binders.</p>`,
+          <p style=${{ margin:"0 0 10px" }}><strong>${total - missing.length} card${total - missing.length === 1 ? "" : "s"}</strong> (commander included) are reserved for this deck, so they won't be suggested for other decks. Basic lands aren't counted.</p>
+          <p style=${{ margin:"0 0 10px" }}>Your collection itself isn't changed — re-importing it from Manabox keeps the reservation.${existing ? "" : " The deck is saved to the Library."}</p>
+          ${missing.length > 0 && html`<p style=${{ margin:"0 0 10px" }}>
+            ${missing.length} card${missing.length > 1 ? "s aren't" : " isn't"} free in your collection${" "}
+            <span style=${{ color:"var(--fg-text-muted)" }}>(${missing.slice(0, 8).join(", ")}${missing.length > 8 ? ", …" : ""})</span> — the deck will flag ${missing.length > 1 ? "them" : "it"}.</p>`}
+          <p style=${{ margin:0, fontSize:12, color:"var(--fg-text-muted)" }}>Release the deck later to make its cards available again.</p>`,
         okLabel: "📦 Mark as built",
       });
       if (!ok) return;
+      const builtEntry = { ...entry, deck, selCmd, built: { at: Date.now(), from } };
+      const next = existing ? library.map(e => e.id === entry.id ? builtEntry : e) : [builtEntry, ...library];
+      setLibrary(next);
+      lsSetItemSafe(LS_LIBRARY, JSON.stringify(next));
+      setLibSaved(true); setLibEntryId(entry.id); setFromSaved(true); setFromCollection(false);
+    };
 
-      // The deck's theme doubles as its Collection key everywhere (add /
-      // remove / swap cards, rename, delete), so it must match the entry name.
-      const savedDeck = { ...deck, theme: title };
-      const newEntry = {
-        name: title,
-        type: "deck",
-        cards: deckRows,
-        commanderName: cmdrName,
-        source: "generated",
-        reservedV: 2,          // commander reserved + per-copy origin recorded
-        savedAt: Date.now(),
-        // Preserve the full deck object so the Collection preview can render
-        // mana curve / categories / commander art identically to the Library.
-        deckData: savedDeck,
-        selCmd: selCmd,
-      };
-      nextDecks.push(newEntry);
-
-      const nextGroups  = { decks: nextDecks, binders: nextBinders };
-      const nextDeckInc = { ...deckInc, [title]: false };
-      const nextUsable  = computeUsable(nextGroups, nextDeckInc, binInc);
-
-      setGroups(nextGroups);
-      setDeckInc(nextDeckInc);
-      setDeck(savedDeck);
-      setFromCollection(true);
-      setUsable(nextUsable);
-      lsSetItemSafe(LS_BINDERS, JSON.stringify({
-        groups: nextGroups, deckInc: nextDeckInc, binInc,
-      }));
-      lsSetItemSafe(LS_CARDS, JSON.stringify(nextUsable));
-
-      // The deck now lives in Collection: drop its Library copy — the entry
-      // it was opened from, plus any other copy with the same commander and
-      // cards (e.g. saved to the Library straight after forging).
-      const fp = deckFingerprint(cmdrName, deck);
-      const nextLibrary = library.filter(e =>
-        !(libEntryId != null && e.id === libEntryId)
-        && !(fp && deckFingerprint(e.selCmd?.card?.name, e.deck) === fp));
-      if (nextLibrary.length !== library.length) {
-        setLibrary(nextLibrary);
-        lsSetItemSafe(LS_LIBRARY, JSON.stringify(nextLibrary));
-      }
-      setLibEntryId(null);
-      setLibSaved(false);
-      setFromSaved(false);
-
-      setDeckSvd(true);
+    // Release a built deck: its cards are free again, the list stays in the Library.
+    const releaseBuiltDeck = async () => {
+      const entry = openLibEntry();
+      if (!entry?.built) return;
+      const n = entryClaims(entry).reduce((s, c) => s + c.qty, 0);
+      const ok = await appConfirm({
+        title: "Release this deck?",
+        body: `Its ${n} card${n === 1 ? "" : "s"} become available for other decks again. The deck stays in your Library, so you can build it again later.`,
+        okLabel: "↩ Release deck",
+      });
+      if (!ok) return;
+      const next = library.map(e => { if (e.id !== entry.id) return e; const { built, ...rest } = e; return rest; });
+      setLibrary(next);
+      lsSetItemSafe(LS_LIBRARY, JSON.stringify(next));
     };
 
     const saveDeckToLibrary = () => {
@@ -6575,10 +6745,105 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setLibrary(updated);
       lsSetItemSafe(LS_LIBRARY, JSON.stringify(updated));
       setLibSaved(true);
-      setLibEntryId(entry.id);   // so "Mark as built" can move it out of the Library
+      setLibEntryId(entry.id);   // so "Mark as built" marks this entry
     };
 
-    const deleteFromLibrary = id => {
+    // "➕ Add card from binder" on a built Library deck: the card joins the
+    // deck list and is claimed from that binder (the binder isn't changed).
+    const addBinderCardToBuiltDeck = (binderName, rowIndex) => {
+      const entry = openLibEntry();
+      const row = (groups.binders || []).find(b => b.name === binderName)?.cards?.[rowIndex];
+      if (!entry?.built || !row || !deck) return;
+      const cache = getSFCache();
+      const slim = cache[(row.id || "").toLowerCase()]?.d || cache[(row.name || "").toLowerCase()]?.d || null;
+      const catName = categoryForType(slim?.type_line);
+      const cats = deck.categories.map(c => ({ ...c, cards: [...c.cards] }));
+      let cat = cats.find(c => c.name === catName);
+      if (!cat) { cat = { name: catName, cards: [] }; cats.push(cat); }
+      cat.cards.push({
+        name: row.name, mana_cost: slim?.mana_cost || slim?.card_faces?.[0]?.mana_cost || "", type_line: slim?.type_line || "",
+        cmc: slim?.cmc || 0, color_identity: slim?.color_identity || [],
+        img: slim?.image_uris?.small || slim?.card_faces?.[0]?.image_uris?.small || null,
+        reason: `Added from "${binderName}"`, category: catName, id: row.id || null,
+        isLand: /\bLand\b/.test((slim?.type_line || "").split("//")[0]),
+      });
+      const nextDeck = { ...deck, categories: cats };
+      const from = { ...(entry.built.from || {}) };
+      if (!from[row.name]) from[row.name] = binderName;
+      const next = library.map(e => e.id === entry.id ? { ...e, deck: nextDeck, built: { ...e.built, from } } : e);
+      setLibrary(next);
+      lsSetItemSafe(LS_LIBRARY, JSON.stringify(next));
+      setDeck(nextDeck);
+    };
+
+    // "📚 Create in Library" for a Collection (Manabox) deck: a Library copy
+    // with the full deck view. The Collection deck itself is untouched;
+    // optionally the copy is marked as built, claiming its cards from that
+    // Collection deck.
+    const createInLibrary = async (name) => {
+      const d = (groups.decks || []).find(x => x.name === name);
+      if (!d) return;
+      const existing = library.find(e => e.sourceDeck === name);
+      if (existing) return loadFromLibrary(existing);
+      let reserve = false;
+      const ok = await appConfirm({
+        title: `Create "${name}" in the Library?`,
+        body: html`
+          <p style=${{ margin:"0 0 10px" }}>The Library copy gets the full deck view — power level, insights, swaps, pick list, Archidekt push. The deck in your Collection stays exactly as it is.</p>
+          <label style=${{ display:"flex", gap:8, alignItems:"flex-start", fontSize:13, cursor:"pointer" }}>
+            <input type="checkbox" onChange=${e => { reserve = e.target.checked; }} style=${{ marginTop:3 }} />
+            <span>This deck is built — reserve its cards so other decks don't use them<br/>
+              <span style=${{ fontSize:12, color:"var(--fg-text-muted)" }}>Only matters if "${name}" is included in the forge pool.</span></span>
+          </label>`,
+        okLabel: "📚 Create in Library",
+      });
+      if (!ok) return;
+      let deckData = d.deckData, sel = d.selCmd;
+      if (!deckData || !sel) {
+        setPhase("enriching"); setLog([]); setProg(0); setError("");
+        addLog(`📦 Preparing "${name}" for the Library…`);
+        try {
+          const r = await enrichImportedDeck(d);
+          deckData = r.deck; sel = r.selCmd;
+          const nextGroups = { ...groups, decks: groups.decks.map(x => x.name === name
+            ? { ...x, deckData, selCmd: sel, enrichedAt: Date.now(), commanderName: x.commanderName || sel?.name || null } : x) };
+          persistGroups(nextGroups);
+        } catch (e) {
+          setError(`Couldn't prepare deck: ${e?.message || e}`); setPhase("error"); return;
+        }
+      }
+      const precon = d.precon?.set
+        ? { setCode: d.precon.set, setName: d.precon.setName || d.precon.set, name: d.precon.name || null, partial: !!d.precon.partial }
+        : deckData.precon || null;
+      const entry = { id: Date.now(), savedAt: new Date().toISOString(), selCmd: sel,
+        deck: { ...deckData, theme: name, precon }, sourceDeck: name };
+      if (reserve) {
+        const from = {};
+        entryClaims({ ...entry, built: { from: {} } }).forEach(c => { from[c.name] = name; });
+        entry.built = { at: Date.now(), from };
+      }
+      const next = [entry, ...library];
+      setLibrary(next);
+      lsSetItemSafe(LS_LIBRARY, JSON.stringify(next));
+      loadFromLibrary(entry);
+    };
+
+    // The Library entry behind the open deck (null for unsaved / Collection decks).
+    const openLibEntry = () => (!fromCollection && libSaved && libEntryId != null) ? library.find(e => e.id === libEntryId) || null : null;
+    // The Collection deck behind the open deck — only when it was opened from
+    // the Collection (a Library copy shares its name but is a different deck).
+    const openColDeck = () => fromCollection && deck ? (groups.decks || []).find(d => d.name === deck.theme) || null : null;
+
+    const deleteFromLibrary = async id => {
+      const e = library.find(x => x.id === id);
+      if (e?.built) {
+        const ok = await appConfirm({
+          title: "Delete this built deck?",
+          body: `"${e.deck?.theme || e.selCmd?.card?.name}" is marked as built. Deleting it removes the deck list and makes its cards available for other decks again. Your collection isn't changed.`,
+          okLabel: "🗑 Delete deck", danger: true,
+        });
+        if (!ok) return;
+      }
       const updated = library.filter(e => e.id !== id);
       setLibrary(updated);
       lsSetItemSafe(LS_LIBRARY, JSON.stringify(updated));
@@ -7459,7 +7724,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setDeckInc(nextDeckInc);
       setBinInc(nextBinInc);
       // Returned cards are available again for analysis.
-      const nextUsable = computeUsable(nextGroups, nextDeckInc, nextBinInc);
+      const nextUsable = computeUsable(nextGroups, nextDeckInc, nextBinInc, builtClaims(library));
       setUsable(nextUsable);
       lsSetItemSafe(LS_CARDS, JSON.stringify(nextUsable));
       // If the user is currently viewing the deck: after a release keep it
@@ -8047,6 +8312,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       setFromSaved(false);
       setFromCollection(false);
       setLibSaved(false);
+      setLibEntryId(null);
       setUnsavedDeck(null);
       setPhase("deck");
     };
@@ -8668,7 +8934,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 let countsBlock = null;
                 if (showNav) {
                   const live = phase === "select"
-                    ? computeUsable(groups, deckInc, binInc)
+                    ? computeUsable(groups, deckInc, binInc, builtClaims(library))
                     : usable;
                   const total = live.reduce((s, c) => s + (c.qty || 1), 0);
                   countsBlock = html`
@@ -8723,7 +8989,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     active: phase==="select" || phase==="import" || phase==="binder_view" || phase==="precons"
                       || (phase==="deck" && (fromCollection || !!previewingPrecon)),
                     onClick: navToCollection },
-                  { label:`📚 Library${(library.length + (groups.decks?.length || 0)) > 0 ? " ("+(library.length + (groups.decks?.length || 0))+")" : ""}`,
+                  { label:`📚 Library${library.length > 0 ? " (" + library.length + ")" : ""}`,
                     active: phase==="saved_list"
                       || (phase === "deck" && fromSaved && !fromCollection),
                     onClick: () => setPhase("saved_list") },
@@ -9110,6 +9376,33 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     </div>
                   `;
                 })()}
+                <div style=${{ marginTop:18, paddingTop:14, borderTop:"1px solid var(--border)" }}>
+                  <div style=${label}>Pre-update backup</div>
+                  <div style=${{ fontSize:12, color:"var(--fg-text-body)", marginBottom:10, lineHeight:1.7 }}>
+                    When built decks moved from the Collection to the Library (Oct 2026), the previous Collection and Library were kept on this device. Restoring brings that state back as it was.
+                  </div>
+                  <button onClick=${async () => {
+                      let backup = null;
+                      try {
+                        const db = await sfIdb();
+                        backup = await new Promise((res, rej) => { const r = db.transaction(SF_IDB_STORE).objectStore(SF_IDB_STORE).get(BACKUP_IDB_KEY); r.onsuccess = () => res(r.result || null); r.onerror = () => rej(r.error); });
+                      } catch {}
+                      if (!backup) { appAlert("There's no pre-update backup on this device."); return; }
+                      const ok = await appConfirm({
+                        title: "Restore the pre-update backup?",
+                        body: `Replaces your current Collection and Library with the state from ${new Date(backup.at).toLocaleString()}. Changes made since then are lost. Built decks go back into the Collection and the move isn't repeated on this device.`,
+                        okLabel: "↺ Restore backup", danger: true,
+                      });
+                      if (!ok) return;
+                      localStorage.setItem(LS_SKIP_LIB_MIGRATION, "1");
+                      lsSetItemSafe(LS_BINDERS, backup.binders);
+                      lsSetItemSafe(LS_LIBRARY, backup.library);
+                      location.reload();
+                    }}
+                    style=${{ ...btnSec, padding:"6px 14px", fontSize:11 }}>
+                    ↺ Restore pre-update backup
+                  </button>
+                </div>
               </div>
             </div>
           `}
@@ -9278,8 +9571,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 <div>
                   <h2 style=${{ fontSize:18, color:"var(--fg-text-heading)", margin:"0 0 4px" }}>📋 Collection Check</h2>
                   <p style=${{ fontSize:13, color:"var(--fg-text-soft)" }}>
-                    Review what will change before applying the new import. Your
-                    saved-to-Collection generated decks and URL-imported decks are
+                    Review what will change before applying the new import. Decks
+                    you've built live in the Library and keep their cards reserved —
+                    the import only replaces your collection. URL-imported decks are
                     always preserved.
                   </p>
                 </div>
@@ -9511,7 +9805,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           <!-- ── SELECT SOURCES ────────────────────────────────────────── -->
           ${phase === "select" && (() => {
             const cardTotal = list => list.reduce((s, c) => s + (c.qty || 1), 0);
-            const selectedList = computeUsable(groups, deckInc, binInc);
+            const selectedList = computeUsable(groups, deckInc, binInc, builtClaims(library));
             const usableCount  = selectedList.reduce((s,c) => s + (c.qty||1), 0);
             const usableUnique = selectedList.length;
             // Whole-CSV totals, merged by card name across all sources.
@@ -9769,6 +10063,17 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                   background:"var(--accent-dark)", color:"var(--on-accent)", flexShrink:0,
                                 }}>FORGE</span>
                               `}
+                              ${d.precon?.set && html`
+                                <span title=${`Precon${d.precon.name ? ` "${d.precon.name}"` : ""} — ${d.precon.setName || d.precon.set} (${d.precon.set.toUpperCase()})${d.precon.partial ? "; some cards differ" : ""}`}
+                                  style=${{
+                                    padding:"1px 7px", borderRadius:8, fontSize:9, fontWeight:700, letterSpacing:0.3,
+                                    background:"var(--bg-surface-soft)", color:"var(--accent-text)", border:"1px solid var(--border-input)", flexShrink:0,
+                                    maxWidth:200, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap",
+                                  }}>🎁 ${d.source === "precon" ? "PRECON" : (d.precon.name || `${d.precon.set.toUpperCase()} precon`)}</span>
+                              `}
+                              ${library.some(e => e.sourceDeck === d.name) && html`
+                                <span title="Has a Library copy" style=${{ fontSize:9, fontWeight:700, color:"var(--success-text)", flexShrink:0 }}>📚 IN LIBRARY</span>
+                              `}
                             </div>
                             <div style=${{ fontSize:11, color:"var(--fg-text-muted)", display:"flex", gap:6, alignItems:"center", flexWrap:"wrap" }}>
                               <span style=${{
@@ -9784,6 +10089,17 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               ${isCmdr && d.commanderName && html`<span style=${{ color:"var(--accent-dark)" }}>· 👑 ${d.commanderName}</span>`}
                             </div>
                           </div>
+                          ${!isGen && (() => {
+                            const inLib = library.find(e => e.sourceDeck === d.name);
+                            return html`
+                              <button onClick=${e => { e.stopPropagation(); inLib ? loadFromLibrary(inLib) : createInLibrary(d.name); }}
+                                title=${inLib ? "Open the Library copy of this deck" : "Create this deck in the Library (power level, insights, swaps; optionally mark it as built)"}
+                                style=${{
+                                  padding:"5px 10px", borderRadius:16, border:"1px solid var(--border-input)",
+                                  background:"var(--bg-surface)", color:"var(--accent-dark)", cursor:"pointer",
+                                  fontFamily:"inherit", fontSize:11, fontWeight:600, whiteSpace:"nowrap", flexShrink:0,
+                                }}>${inLib ? "📚 Open" : "📚 + Library"}</button>`;
+                          })()}
                           <button onClick=${e => { e.stopPropagation(); setDeckInc(di => ({ ...di, [d.name]: !di[d.name] })); }}
                             title=${included ? "Included in analysis pool — click to exclude" : "Excluded from analysis pool — click to include"}
                             style=${{
@@ -10923,7 +11239,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         "Re-import your Manabox / Moxfield CSV to refresh card counts and printings.",
                         onUpdate, "var(--success)")}
                       ${actionCard("📚", "Check your decks",
-                        `Browse your ${(library.length + (groups.decks?.length || 0))} saved decks and edit, analyse, or share them.`,
+                        `Browse your ${library.length} saved decks and edit, analyse, or share them.`,
                         onCheck, "var(--info)")}
                     </div>
 
@@ -11539,6 +11855,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       padding:"1px 7px", borderRadius:10, fontSize:9, fontWeight:700,
                       background:"var(--success-bg)", color:"var(--success-text)", letterSpacing:0.3,
                     }}>📚 In Library</span>`}
+                    ${openLibEntry()?.built && html`<span title="Marked as built — its cards are reserved for this deck" style=${{
+                      padding:"1px 7px", borderRadius:10, fontSize:9, fontWeight:700,
+                      background:"var(--warning-bg)", color:"var(--accent-dark)", letterSpacing:0.3,
+                    }}>📦 Built</span>`}
                     ${deckSaved && html`<span style=${{
                       padding:"1px 7px", borderRadius:10, fontSize:9, fontWeight:700,
                       background:"var(--warning-bg)", color:"var(--accent-dark)", letterSpacing:0.3,
@@ -11673,13 +11993,28 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     `;
                   })()}
                   ${!previewingPrecon && html`
-                    ${(groups.decks || []).some(d => d.name === deck.theme) && html`
+                    ${!!openColDeck() && html`
                     <button onClick=${() => deleteDeck(deck.theme)}
-                      title="Take the deck apart: put its cards back into your binders, and keep the list in the Library or delete it"
+                      title="Take this Collection deck apart: put its cards back into your binders, and keep the list in the Library or delete it"
+                      style=${{ ...btnSec, padding:"6px 14px", fontSize:11 }}>
+                      ↩ Take apart…
+                    </button>`}
+                    ${openLibEntry()?.built && html`
+                    <button onClick=${releaseBuiltDeck}
+                      title="Took the deck apart? Makes its cards available for other decks again; the list stays in the Library"
                       style=${{ ...btnSec, padding:"6px 14px", fontSize:11 }}>
                       ↩ Release deck
                     </button>`}
-                    ${(groups.decks || []).some(d => d.name === deck.theme) && html`
+                    ${fromCollection && (() => {
+                      const inLib = library.find(e => e.sourceDeck === deck.theme);
+                      return html`
+                        <button onClick=${() => inLib ? loadFromLibrary(inLib) : createInLibrary(deck.theme)}
+                          title=${inLib ? "This Collection deck already has a Library copy — open it" : "Copy this deck into the Library: power level, insights, swaps, and optionally mark it as built"}
+                          style=${{ ...btn, padding:"6px 14px", fontSize:11, background:"linear-gradient(135deg,var(--success),#2e8a44)" }}>
+                          ${inLib ? "📚 Open in Library" : "📚 Create in Library"}
+                        </button>`;
+                    })()}
+                    ${(!!openColDeck() || openLibEntry()?.built) && html`
                     <button onClick=${() => { setAddToDeckQuery(""); setAddToDeckOpen(true); }}
                       title="Move a card from one of your binders into this built deck"
                       style=${{ ...btn, padding:"6px 14px", fontSize:11,
@@ -11703,8 +12038,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         background:"linear-gradient(135deg,var(--success),#2e8a44)" }}>
                       💾 Save to Library
                     </button>`}
-                    ${!deckSaved && html`<button onClick=${saveDeckToCollection}
-                      title="You've pulled the cards: takes them (and the commander) out of your binders so other decks don't use them, and moves the deck to Collection → Decks."
+                    ${!fromCollection && !openLibEntry()?.built && html`<button onClick=${markDeckBuilt}
+                      title="You've pulled the cards: reserves them (and the commander) for this deck so other decks don't use them. Your collection itself isn't changed."
                       style=${{ ...btnSec, padding:"6px 14px", fontSize:11,
                         borderColor:"var(--accent-dark)", color:"var(--accent-dark)" }}>
                       📦 I built this deck
@@ -11897,6 +12232,32 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               `}
 
 
+              ${openLibEntry()?.built && (() => {
+                // Built deck: cards its claims can't be covered by the
+                // collection — not owned (any more), or owned fewer times
+                // than built decks use them.
+                const entry = openLibEntry();
+                const own = buildOwnershipIndex(groups, {}, {}, null, []);
+                const all = builtClaims(library);
+                const totals = new Map();
+                all.forEach(c => { const k = normCardName(c.name); totals.set(k, (totals.get(k) || 0) + c.qty); });
+                const issues = entryClaims(entry).map(c => {
+                  const k = normCardName(c.name);
+                  const owned = own.get(k)?.owned || 0;
+                  const claimed = totals.get(k) || 0;
+                  if (owned >= claimed) return null;
+                  const others = [...new Set(all.filter(x => normCardName(x.name) === k && x.deckId !== entry.id).map(x => x.deckTitle))];
+                  return { name: c.name, text: owned === 0 ? "not in your collection" : `you own ${owned}, ${others.length ? `also used in ${others.join(", ")}` : "the deck needs more"}` };
+                }).filter(Boolean);
+                if (!issues.length) return null;
+                return html`
+                  <div style=${{ background:"var(--warning-bg)", border:"1px solid var(--warning)", borderRadius:10, padding:"10px 16px", marginBottom:14, fontSize:12, lineHeight:1.6 }}>
+                    <strong style=${{ color:"var(--warning)" }}>⚠ ${issues.length} card${issues.length === 1 ? "" : "s"} in this built deck ${issues.length === 1 ? "isn't" : "aren't"} covered by your collection</strong>
+                    <div style=${{ color:"var(--fg-text-body)" }}>${issues.map((x, i) => html`${i ? " · " : ""}<strong>${x.name}</strong> (${x.text})`)}</div>
+                    <div style=${{ color:"var(--fg-text-muted)", fontSize:11 }}>Sold, traded or not imported yet? Swap ${issues.length === 1 ? "it" : "them"} out, or re-import your collection.</div>
+                  </div>`;
+              })()}
+
               ${!previewingPrecon && (() => {
                 const pw = deckPower(deck, selCmd.card.name);
                 if (!pw) return null;
@@ -12070,7 +12431,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                           setSwapState(prev => prev && prev.key === st.key
                                             ? { ...prev, swaps: prev.swaps.map((x, j) => j === i ? { ...x, applied: true } : x) } : prev);
                                         }}
-                                        title=${(groups.decks || []).some(d => d.name === deck.theme)
+                                        title=${!!openColDeck()
                                           ? `Put ${sw.cut.name} back in its binder and take ${sw.add.name} out of "${sw.add.from || "your binder"}"`
                                           : `Replace ${sw.cut.name} with ${sw.add.name} in this deck list`}
                                         style=${{ ...btnSec, padding:"3px 10px", fontSize:11 }}>⇄ Apply swap</button>`}
@@ -12087,7 +12448,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         Also strong here, but tied up elsewhere: ${st.ownedElsewhere.map((o, i) => html`${i ? " · " : ""}<strong>${o.name}</strong> (${ownedWhere({ available:false, where:o.where })})`)}
                       </div>`}
                       <div style=${{ fontSize:11, color:"var(--fg-text-muted)", fontStyle:"italic", marginTop:8 }}>
-                        ${(groups.decks || []).some(d => d.name === deck.theme)
+                        ${!!openColDeck()
                           ? "Apply swap moves the cut card back to the binder it came from and takes the new card out of its binder. "
                           : "Apply swap only edits this deck list — mark the deck as built to reserve its cards. "}
                         Each swap replaces a card doing the same job (ramp for ramp, removal for removal…). Combo pieces and the commander are never cut.${Number.isFinite(st.cardCap) ? ` Cards over $${st.cardCap.toFixed(0)} (25% of your budget) are left out.` : ""}
@@ -12509,7 +12870,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       const colorId  = (card.color_identity && card.color_identity.length)
                         ? card.color_identity : (sf?.color_identity || []);
                       const editable = !isBasic && (
-                        (groups.decks || []).some(d => d.name === deck.theme) || fromSaved || fromCollection
+                        !!openColDeck() || fromSaved || fromCollection
                       );
                       const canBeCmdr = (sf ? isCommander(sf) : card.can_be_commander === true)
                         && dvFront((sf?.name || card.name)) !== dvFront(selCmd?.name || "");
@@ -12689,20 +13050,13 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
           <!-- ── SAVED LIBRARY ────────────────────────────────────────── -->
           ${phase === "saved_list" && (() => {
-            // Library shows EVERY deck the user has access to:
-            //   - kind="library"       : AI-built decks the user clicked "Save to Library"
-            //   - kind="collection-gen": AI-built decks the user clicked "Save to Collection"
-            //                            (also lives in groups.decks with full Scryfall data)
-            //   - kind="collection-imported": Decks from Manabox/Moxfield CSV import
-            //                            (no Scryfall — lookup at open time via `enriched`).
-            // Sorted newest-first; imported decks (no savedAt) sink to the bottom.
-            const libraryDecks   = library.map(e => ({ kind:"library", entry:e, savedAt:e.savedAt||0 }));
-            const collectionGen  = (groups.decks || [])
-              .filter(d => d.source === "generated")
-              .map(d => ({ kind:"collection-gen", entry:d, savedAt:d.savedAt||0 }));
-            const collectionImp  = (groups.decks || [])
-              .filter(d => d.source !== "generated")
-              .map(d => ({ kind:"collection-imported", entry:d, savedAt:0 }));
+            // The Library holds the user's decks: forged and saved, created
+            // from a Collection deck, and built ones (which claim their
+            // cards). Manabox decks stay in the Collection until the user
+            // creates them here. Newest first.
+            const libraryDecks   = library.map(e => ({ kind:"library", entry:e, savedAt: new Date(e.savedAt || 0).getTime() || 0 }));
+            const collectionGen  = [];
+            const collectionImp  = [];
             const unifiedDecks   = [...libraryDecks, ...collectionGen, ...collectionImp]
               .sort((a, b) => b.savedAt - a.savedAt);
             return html`
@@ -12712,10 +13066,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   <h2 style=${{ fontSize:18, color:"var(--fg-text-heading)", margin:"0 0 4px" }}>📚 Deck Library</h2>
                   <p style=${{ fontSize:13, color:"var(--fg-text-soft)" }}>
                     ${unifiedDecks.length === 0
-                      ? "No decks yet — build one, or import a Manabox / Moxfield CSV with deck data."
-                      : `${unifiedDecks.length} deck${unifiedDecks.length > 1 ? "s" : ""}. ` +
-                        `(${libraryDecks.length} saved · ${collectionGen.length} from Collection · ${collectionImp.length} imported.) ` +
-                        "Click any to view."}
+                      ? "No decks yet — forge one, or add a deck from your Collection with \"📚 Create in Library\"."
+                      : `${unifiedDecks.length} deck${unifiedDecks.length > 1 ? "s" : ""}` +
+                        ` · ${library.filter(e => e.built).length} built. Click any to view. ` +
+                        `Decks from your Manabox collection can be added with "📚 Create in Library" in the Collection.`}
                   </p>
                 </div>
               </div>
@@ -12806,7 +13160,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     };
 
                     // Top-right badge identifying the source.
-                    const badge = isLibrary  ? { txt:"💾 LIBRARY",   bg:"var(--success-soft)", col:"var(--success)" }
+                    const badge = isLibrary && entry.built ? { txt:"📦 BUILT", bg:"var(--warning-bg)", col:"var(--accent-dark)" }
+                                : isLibrary  ? { txt:"💾 LIBRARY",   bg:"var(--success-soft)", col:"var(--success)" }
                                 : isGen      ? { txt:"🃏 FORGE",     bg:"var(--warning-bg)", col:"var(--accent)" }
                                 :              { txt:"📦 IMPORTED",  bg:"var(--info-bg)", col:"var(--info)" };
                     // Precon badge appears alongside the source badge once an
@@ -12832,14 +13187,14 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
                         ${preconInfo && html`
                           <!-- Precon chip — sits below the source badge -->
-                          <div title=${`Detected as a precon — all cards from "${preconInfo.setName}" (${preconInfo.setCode.toUpperCase()})${preconInfo.partial ? "; some printings differ" : ""}.`}
+                          <div title=${`Precon${preconInfo.name ? ` "${preconInfo.name}"` : ""} — ${preconInfo.setName} (${(preconInfo.setCode || "").toUpperCase()})${preconInfo.partial ? "; some cards differ" : ""}.`}
                             style=${{
                               position:"absolute", top:30, right: isLibrary ? 36 : 12, zIndex:1,
                               padding:"2px 8px", borderRadius:10, fontSize:9, fontWeight:700, letterSpacing:0.5,
                               background:"var(--bg-surface-soft)", color:"var(--accent-text)", border:"1px solid var(--border-input)",
                               maxWidth:160, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap",
                             }}>
-                            🎁 ${preconInfo.partial ? "MOSTLY " : ""}${preconInfo.setCode.toUpperCase()}
+                            🎁 ${preconInfo.name || `${preconInfo.partial ? "MOSTLY " : ""}${(preconInfo.setCode || "").toUpperCase()}`}
                           </div>
                         `}
 
@@ -13636,7 +13991,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           </div>
         `;
       })()}
-      ${addToDeckOpen && deck && (groups.decks || []).some(d => d.name === deck.theme) && (() => {
+      ${addToDeckOpen && deck && (!!openColDeck() || openLibEntry()?.built) && (() => {
         const deckName = deck.theme;
         // Flatten all binder rows into pickable entries. Each row knows
         // which binder it came from so the click handler can find it back.
@@ -13732,7 +14087,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         <span>· ×${row.qty}</span>
                       </div>
                     </div>
-                    <button onClick=${() => moveCardCollectionToDeck(deckName, bn, rowIndex)}
+                    <button onClick=${() => openLibEntry()?.built ? addBinderCardToBuiltDeck(bn, rowIndex) : moveCardCollectionToDeck(deckName, bn, rowIndex)}
                       style=${{ ...btn, fontSize:11, padding:"5px 10px" }}>
                       → Add
                     </button>
