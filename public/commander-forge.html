@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.13-a";
+  const APP_VERSION = "v2026.10.13-b";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -2621,6 +2621,68 @@
   // look matches the existing in-card mana cost rendering.
   // Commander-sidebar tints per colour (mixed into the theme surface).
   const CMDR_TINT = { W:"#e8d48a", U:"#2f7fd0", B:"#4a3f55", R:"#d0402e", G:"#2e8b4a", C:"#a09080" };
+  // { background, border } tinted in a commander's colour identity —
+  // gradient for multicolour, mixed into the theme surface.
+  function cmdrTint(ci, strength = 1) {
+    const cols = (ci?.length ? ci : ["C"]).map(c => CMDR_TINT[c] || CMDR_TINT.C);
+    const mix = (col, pct) => `color-mix(in srgb, ${col} ${Math.round(pct * strength)}%, var(--bg-surface))`;
+    return {
+      background: cols.length === 1
+        ? `linear-gradient(170deg, ${mix(cols[0], 30)}, ${mix(cols[0], 12)})`
+        : `linear-gradient(170deg, ${cols.map((col, i) => `${mix(col, 26)} ${Math.round(i / (cols.length - 1) * 100)}%`).join(", ")})`,
+      border: mix(cols[0], 55),
+    };
+  }
+  // Front-face mana cost (double-faced cards keep it on card_faces[0]).
+  const cmdrManaCost = sf => sf?.mana_cost || sf?.card_faces?.[0]?.mana_cost || "";
+  // Rules text of every face.
+  const cmdrOracle = sf => [sf?.oracle_text, ...(sf?.card_faces || []).map(f => f.oracle_text)].filter(Boolean).join("\n— // —\n");
+
+  // Colour identity and mana cost as two labelled rows, so {2}{W}{U} next
+  // to the W/U identity pips doesn't read like a six-mana card.
+  function CmdrCostRows({ sf, size = 16, labelWidth = 78 }) {
+    const ci = sf?.color_identity || [];
+    const cost = cmdrManaCost(sf);
+    const label = { fontSize:9, letterSpacing:2, color:"var(--fg-text-soft)", textTransform:"uppercase", fontWeight:700, minWidth:labelWidth };
+    return html`
+      <div style=${{ display:"flex", alignItems:"center", gap:6, marginBottom:4 }}>
+        <span style=${label}>Colours</span>
+        <span style=${{ display:"inline-flex", alignItems:"center", gap:2 }}>
+          ${ci.length ? ci.map(c => html`<${Pip} key=${c} c=${c} size=${size - 2} />`) : html`<span style=${{ fontSize:11, color:"var(--fg-text-body)" }}>Colourless</span>`}
+        </span>
+      </div>
+      ${cost && html`
+        <div style=${{ display:"flex", alignItems:"center", gap:6, marginBottom:6, flexWrap:"wrap" }}>
+          <span style=${label}>Mana cost</span>
+          <${ManaCost} cost=${cost} size=${size} />
+          <span style=${{ fontSize:11, color:"var(--fg-text-soft)" }}>(MV ${sf.cmc ?? 0})</span>
+        </div>`}`;
+  }
+
+  // Commander image with a ⟳ Flip button for double-faced cards.
+  function CmdrImage({ sf, width, small = false, style = {} }) {
+    const [flipped, setFlipped] = useState(false);
+    const faces = (sf?.card_faces || []).filter(f => f.image_uris);
+    const isDFC = !sf?.image_uris && faces.length >= 2;
+    const pickImg = iu => iu && (small ? (iu.small || iu.normal) : (iu.normal || iu.small));
+    const src = isDFC ? pickImg(faces[flipped ? 1 : 0].image_uris) : pickImg(sf?.image_uris || faces[0]?.image_uris);
+    if (!src) return null;
+    return html`
+      <div style=${{ position:"relative", width, flexShrink:0 }}>
+        <img src=${src} class="cmd-img" alt=${sf.name} style=${{ width:"100%", display:"block", ...style }} />
+        ${isDFC && html`
+          <button onClick=${e => { e.stopPropagation(); setFlipped(f => !f); }}
+            title=${`Flip to ${faces[flipped ? 0 : 1].name}`}
+            style=${{
+              position:"absolute", bottom: small ? 4 : 8, right: small ? 4 : 8,
+              display:"inline-flex", alignItems:"center", gap:4,
+              background:"var(--accent)", color:"var(--on-accent)",
+              border:"1px solid var(--bg-surface)", borderRadius:16,
+              padding: small ? "2px 6px" : "4px 10px", fontSize: small ? 9 : 11, fontWeight:700,
+              cursor:"pointer", fontFamily:"inherit", boxShadow:"0 2px 6px rgba(0,0,0,0.3)",
+            }}>⟳${small ? "" : " Flip"}</button>`}
+      </div>`;
+  }
 
   function Pip({ c, size = 14 }) {
     const sym = c || "C";
@@ -3326,21 +3388,16 @@
   function CommanderCard({ cand, onBuild }) {
     const sf  = cand.scryfall || {};
     const ci  = sf.color_identity || [];
-    const img = sf.image_uris?.normal || sf.card_faces?.[0]?.image_uris?.normal;
     return html`
-      <div class="card pick-card" style=${{ display:"flex", gap:14, alignItems:"flex-start" }} onClick=${onBuild}>
-        ${img && html`<img src=${img} class="cmd-img" style=${{ width:80, flexShrink:0 }} alt=${sf.name} />`}
+      <div class="card pick-card" style=${{ display:"flex", gap:14, alignItems:"flex-start", background: cmdrTint(ci).background }} onClick=${onBuild}>
+        <${CmdrImage} sf=${sf} width=${80} small=${true} />
         <div style=${{ flex:1, minWidth:0 }}>
           <div style=${{ color:"var(--accent-strong)", fontSize:14, fontWeight:700, marginBottom:4 }}>${sf.name || cand.name}</div>
-          <div style=${{ display:"flex", alignItems:"center", gap:4, marginBottom:4, flexWrap:"wrap" }}>
-            ${sf.mana_cost
-              ? html`<${ManaCost} cost=${sf.mana_cost} size=${14} />`
-              : html`<span style=${{ fontSize:11, color:"var(--fg-text-soft)" }}>Colorless</span>`}
-          </div>
+          <${CmdrCostRows} sf=${sf} size=${14} labelWidth=${66} />
           <div style=${{ fontSize:11, color:"var(--fg-text-soft)", fontStyle:"italic", marginBottom:6 }}>${sf.type_line || ""}</div>
           <div style=${{ fontSize:11, color:"var(--fg-text-heading)", lineHeight:1.6,
             display:"-webkit-box", WebkitLineClamp:3, WebkitBoxOrient:"vertical", overflow:"hidden" }}>
-            ${(sf.oracle_text || "").substring(0, 220)}
+            ${cmdrOracle(sf).substring(0, 220)}
           </div>
           <div style=${{ marginTop:8, fontSize:11, color:"var(--accent-dark)", fontWeight:600 }}>Build deck →</div>
         </div>
@@ -11215,7 +11272,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         borderColor: isPicked ? "var(--accent)" : (i===0 ? "var(--accent-hover)" : "var(--border-neutral)"),
                         borderWidth: isPicked ? 2 : 1,
                         opacity: minimized ? 0.72 : 1,
-                        background: isPicked ? "var(--bg-surface-soft)" : "var(--bg-surface)",
+                        background: cmdrTint(ci, minimized ? 0.6 : 1).background,
                         transition: "all .25s",
                         padding: minimized ? "14px 10px" : "20px 24px",
                       }}>
@@ -11224,10 +11281,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         ? html`
                           <!-- Minimised vertical column -->
                           <div style=${{ display:"flex", flexDirection:"column", gap:8, alignItems:"center", textAlign:"center" }}>
-                            ${sf.image_uris?.small && html`
-                              <img src=${sf.image_uris.small} class="cmd-img"
-                                style=${{ width:62, flexShrink:0 }} alt=${cand.name} />
-                            `}
+                            <${CmdrImage} sf=${sf} width=${62} small=${true} />
                             <div style=${{ fontSize:11, fontWeight:700, color:"var(--fg-text-heading)", lineHeight:1.3 }}>${cand.name}</div>
                             <div style=${{ display:"flex", gap:3, justifyContent:"center", flexWrap:"wrap" }}>
                               ${ci.map(c => html`<${Pip} key=${c} c=${c} />`)}
@@ -11241,23 +11295,13 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           <!-- Picked: large image LEFT, all content RIGHT -->
                           <div style=${{ fontSize:9, letterSpacing:3, color:"var(--accent)",
                             textTransform:"uppercase", marginBottom:10, fontWeight:700 }}>✓ Selected</div>
-                          <div style=${{ display:"flex", gap:18, alignItems:"flex-start" }}>
-                            ${sf.image_uris?.normal && html`
-                              <img src=${sf.image_uris.normal} class="cmd-img"
-                                style=${{
-                                  width: 240, flexShrink:0, borderRadius:10,
-                                  boxShadow:"0 4px 16px rgba(0,0,0,0.22)",
-                                  transition:"width .25s",
-                                }}
-                                alt=${cand.name} />
-                            `}
-                            <div style=${{ flex:1, minWidth:0 }}>
+                          <div style=${{ display:"flex", gap:18, alignItems:"flex-start", flexWrap:"wrap" }}>
+                            <${CmdrImage} sf=${sf} width=${"clamp(150px, 40%, 240px)"}
+                              style=${{ borderRadius:10, boxShadow:"0 4px 16px rgba(0,0,0,0.22)" }} />
+                            <div style=${{ flex:"1 1 220px", minWidth:0 }}>
                               <div style=${{ color:"var(--fg-text-heading)", fontSize:18,
                                 fontWeight:700, marginBottom:6, lineHeight:1.3 }}>${cand.name}</div>
-                              <div style=${{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap", marginBottom:5 }}>
-                                ${ci.map(c => html`<${Pip} key=${c} c=${c} />`)}
-                                ${sf.mana_cost && html`<${ManaCost} cost=${sf.mana_cost} size=${14} />`}
-                              </div>
+                              <${CmdrCostRows} sf=${sf} size=${15} />
                               ${sf.type_line && html`
                                 <div style=${{ fontSize:11, color:"var(--fg-text-body)", fontStyle:"italic", marginBottom:10 }}>
                                   ${sf.type_line}
@@ -11276,11 +11320,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 <div style=${{ fontSize:12, color:"var(--fg-text-heading)", lineHeight:1.7 }}>
                                   ${cand.strategy || cand.reason}
                                 </div>
-                                ${sf.oracle_text && html`
+                                ${cmdrOracle(sf) && html`
                                   <div style=${{ fontSize:11, color:"var(--fg-text-soft)", lineHeight:1.6,
                                     marginTop:10, paddingTop:8, borderTop:"1px dashed var(--border-input)",
-                                    fontFamily:"Georgia, serif", fontStyle:"italic" }}>
-                                    ${sf.oracle_text}
+                                    fontFamily:"Georgia, serif", fontStyle:"italic", whiteSpace:"pre-wrap" }}>
+                                    ${cmdrOracle(sf)}
                                   </div>
                                 `}
                               </div>
@@ -11294,18 +11338,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               textTransform:"uppercase", marginBottom:10, fontWeight:700 }}>⭐ Top Pick</div>
                           `}
                           <div style=${{ display:"flex", gap:12, alignItems:"flex-start", marginBottom:10 }}>
-                            ${sf.image_uris?.normal && html`
-                              <img src=${sf.image_uris.normal} class="cmd-img"
-                                style=${{ width:78, flexShrink:0 }}
-                                alt=${cand.name} />
-                            `}
+                            <${CmdrImage} sf=${sf} width=${78} small=${true} />
                             <div style=${{ flex:1, minWidth:0 }}>
                               <div style=${{ color:"var(--fg-text-heading)", fontSize:14,
                                 fontWeight:700, marginBottom:5, lineHeight:1.3 }}>${cand.name}</div>
-                              <div style=${{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap", marginBottom:4 }}>
-                                ${ci.map(c => html`<${Pip} key=${c} c=${c} />`)}
-                                ${sf.mana_cost && html`<${ManaCost} cost=${sf.mana_cost} size=${14} />`}
-                              </div>
+                              <${CmdrCostRows} sf=${sf} size=${14} labelWidth=${66} />
                               ${sf.type_line && html`
                                 <div style=${{ fontSize:10, color:"var(--fg-text-body)", fontStyle:"italic" }}>
                                   ${sf.type_line}
@@ -11361,22 +11398,14 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               const oracleLines = [sf.oracle_text, ...(sf.card_faces||[]).map(f => f.oracle_text)]
                 .filter(Boolean);
               const oracle = oracleLines.join("\n— // —\n");
-              const manaCost = sf.mana_cost || sf.card_faces?.[0]?.mana_cost || "";
-              // Tint the sidebar in the commander's colours (a gradient for
-              // multicolour), mixed into the theme surface so it works in
-              // light and dark palettes.
-              const tintCols = (ci.length ? ci : ["C"]).map(c => CMDR_TINT[c]);
-              const tint = (col, pct) => `color-mix(in srgb, ${col} ${pct}%, var(--bg-surface))`;
-              const sidebarBg = tintCols.length === 1
-                ? `linear-gradient(170deg, ${tint(tintCols[0], 30)}, ${tint(tintCols[0], 12)})`
-                : `linear-gradient(170deg, ${tintCols.map((col, i) => `${tint(col, 26)} ${Math.round(i / (tintCols.length - 1) * 100)}%`).join(", ")})`;
-              const sideLabel = { fontSize:9, letterSpacing:2, color:"var(--fg-text-soft)", textTransform:"uppercase", fontWeight:700, minWidth:78 };
+              // Sidebar tinted in the commander's colours.
+              const sideTint = cmdrTint(ci);
               return html`
                 <div style=${{
                   flexShrink:0,
                   width:"clamp(220px, 22%, 300px)",
-                  background: sidebarBg,
-                  border:`1px solid ${tint(tintCols[0], 55)}`,
+                  background: sideTint.background,
+                  border:`1px solid ${sideTint.border}`,
                   borderRadius:12,
                   padding:"14px 14px 20px",
                   boxShadow:"0 4px 20px rgba(0,0,0,0.12)",
@@ -11450,19 +11479,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   <div style=${{ fontSize:13, fontWeight:700, color:"var(--fg-text-heading)",
                     lineHeight:1.3, marginBottom:5 }}>${selCmd.card?.name}</div>
 
-                  <div style=${{ display:"flex", alignItems:"center", gap:6, marginBottom:4 }}>
-                    <span style=${sideLabel}>Colours</span>
-                    <span style=${{ display:"inline-flex", alignItems:"center", gap:2 }}>
-                      ${ci.length ? ci.map(c => html`<${Pip} key=${c} c=${c} />`) : html`<span style=${{ fontSize:11, color:"var(--fg-text-body)" }}>Colourless</span>`}
-                    </span>
-                  </div>
-                  ${manaCost && html`
-                    <div style=${{ display:"flex", alignItems:"center", gap:6, marginBottom:6 }}>
-                      <span style=${sideLabel}>Mana cost</span>
-                      <${ManaCost} cost=${manaCost} size=${16} />
-                      <span style=${{ fontSize:11, color:"var(--fg-text-soft)" }}>(MV ${sf.cmc ?? 0})</span>
-                    </div>
-                  `}
+                  <${CmdrCostRows} sf=${sf} />
 
                   ${sf.type_line && html`
                     <div style=${{ fontSize:11, color:"var(--fg-text-body)", fontStyle:"italic",
