@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.12-b";
+  const APP_VERSION = "v2026.10.12-c";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -3062,6 +3062,138 @@
   }
   const ROLE_LABEL = { land:"land", wipe:"board wipe", removal:"removal", ramp:"ramp", draw:"card draw", synergy:"synergy" };
 
+  // ── Power level ─────────────────────────────────────────────────────────
+  // Two numbers per deck:
+  //   bracket — WotC's Commander Brackets (1-5), from the countable rules:
+  //             Game Changers (none in 1-2, up to 3 in 3), mass land
+  //             destruction, chained extra turns and two-card infinite combos
+  //             (none in 1-2, only late-game ones in 3).
+  //   score   — an unofficial 1-10 estimate *within* that: speed, fast mana,
+  //             interaction, card draw, tutors, combos and card quality.
+  // Game Changers come from Scryfall (is:gamechanger), refreshed weekly; the
+  // list below is the fallback (snapshot 2026-10).
+  const GAME_CHANGERS_FALLBACK = ["Ad Nauseam", "Ancient Tomb", "Aura Shards", "Biorhythm", "Bolas's Citadel", "Braids, Cabal Minion", "Chrome Mox", "Coalition Victory", "Consecrated Sphinx", "Crop Rotation", "Cyclonic Rift", "Demonic Tutor", "Drannith Magistrate", "Enlightened Tutor", "Farewell", "Field of the Dead", "Fierce Guardianship", "Force of Will", "Gaea's Cradle", "Gamble", "Gifts Ungiven", "Glacial Chasm", "Grand Arbiter Augustin IV", "Grim Monolith", "Humility", "Imperial Seal", "Intuition", "Jeska's Will", "Lion's Eye Diamond", "Mana Vault", "Mishra's Workshop", "Mox Diamond", "Mystical Tutor", "Narset, Parter of Veils", "Natural Order", "Necropotence", "Notion Thief", "Opposition Agent", "Orcish Bowmasters", "Panoptic Mirror", "Rhystic Study", "Seedborn Muse", "Serra's Sanctum", "Smothering Tithe", "Survival of the Fittest", "Teferi's Protection", "Tergrid, God of Fright", "Thassa's Oracle", "The One Ring", "The Tabernacle at Pendrell Vale", "Underworld Breach", "Vampiric Tutor", "Worldly Tutor"];
+  const LS_GAME_CHANGERS = "cmdr_forge_game_changers";   // { ts, names } — not synced
+  let gameChangerSet = new Set(GAME_CHANGERS_FALLBACK.map(normCardName));
+  try {
+    const v = JSON.parse(localStorage.getItem(LS_GAME_CHANGERS) || "null");
+    if (v?.names?.length) gameChangerSet = new Set(v.names.map(normCardName));
+  } catch {}
+  async function refreshGameChangers() {
+    try {
+      const v = JSON.parse(localStorage.getItem(LS_GAME_CHANGERS) || "null");
+      if (v?.ts && Date.now() - v.ts < 7 * 864e5) return;
+    } catch {}
+    try {
+      const names = [];
+      let url = "https://api.scryfall.com/cards/search?q=is%3Agamechanger&unique=cards";
+      for (let page = 0; url && page < 4; page++) {
+        const r = await fetch(url, { headers: { Accept: "application/json" } });
+        if (!r.ok) return;
+        const j = await r.json();
+        names.push(...(j.data || []).map(c => c.name));
+        url = j.has_more ? j.next_page : null;
+      }
+      if (names.length < 20) return;   // something's off — keep what we have
+      gameChangerSet = new Set(names.map(normCardName));
+      localStorage.setItem(LS_GAME_CHANGERS, JSON.stringify({ ts: Date.now(), names }));
+      powerMemo.clear();
+    } catch {}
+  }
+  const isGameChanger = name => gameChangerSet.has(normCardName(name));
+
+  const RE_MLD        = /destroy all (nonbasic )?lands|destroy all [^.]*\band lands\b|destroy all artifacts, creatures, and lands|(each|all) (player|players|opponent)s? sacrifices? (all|half|\w+|x) (of )?(the )?(nonbasic )?lands|return all lands|exile all lands|lands don't untap|each land is a swamp/;
+  const RE_EXTRA_TURN = /takes? an extra turn/;
+  const RE_TUTOR      = /search your library for ([^.]*?)card/g;
+  const RE_REMOVAL    = /(destroy|exile) (target|up to (one|two) target)|deals? (\d+|x) damage to (any|target|each opponent and each creature)|return target [^.]*to (its|their) owner'?s'? hand|target (player|opponent) sacrifices|gets -(\d+|x)\/-(\d+|x) until end of turn/;
+  const RE_COUNTER    = /counter target/;
+  const RE_DRAW       = /\bdraws? (a|an|two|three|four|five|seven|x|that many|\w+) cards?|draw cards|draws? cards equal|look at the top [^.]*(put|into) [^.]*into your hand/;
+  const RE_RAMP       = /\badd \{|add (one|two|three) mana|search your library for [^.]*\bland card|put [^.]*land[^.]* onto the battlefield|create (a|an|\w+) treasure/;
+  const RE_FREE       = /rather than pay this spell's mana cost|without paying (its|their) mana cost|if it's not your turn, you may (cast|exile)/;
+  const FAST_MANA     = new Set(["sol ring", "mana crypt", "mana vault", "grim monolith", "chrome mox", "mox diamond", "mox opal", "mox amber",
+    "jeweled lotus", "lotus petal", "dark ritual", "cabal ritual", "ancient tomb", "simian spirit guide", "elvish spirit guide",
+    "lion's eye diamond", "mishra's workshop", "gaea's cradle", "serra's sanctum", "carpet of flowers", "culling the weak", "rite of flame",
+    "seething song", "desperate ritual", "pyretic ritual", "mox opal", "mox tantalite", "springleaf drum", "mana drain"]);
+
+  const isMassLandDenial = sf => RE_MLD.test(rulesText(sf));
+
+  // cards: [{ name, sf?, cmc?, isLand? }] (the 99 — commander separately)
+  // cmdrNames: commander name(s); combos: Spellbook variants ({ cards, produces })
+  function assessPower(cards, cmdrNames, combos) {
+    const cache = getSFCache();
+    const sfOf = c => c.sf || cache[(c.name || "").toLowerCase()]?.d || (c.id && cache[c.id.toLowerCase()]?.d) || null;
+    const cmdrSet = new Set((cmdrNames || []).map(normCardName));
+    const rows = cards.map(c => ({ name: c.name, sf: sfOf(c), isLand: c.isLand ?? /\bLand\b/.test(((sfOf(c)?.type_line) || c.type_line || "").split("//")[0]) }));
+    const all = [...rows, ...(cmdrNames || []).map(n => ({ name: n, sf: cache[n.toLowerCase()]?.d || null, isLand: false, cmdr: true }))];
+    const textOf = r => rulesText(r.sf);
+    const pick = test => all.filter(r => r.sf && test(r)).map(r => r.name);
+    const unknown = rows.filter(r => !r.sf).length;
+
+    const gameChangers = all.filter(r => isGameChanger(r.name)).map(r => r.name);
+    const mld          = pick(r => RE_MLD.test(textOf(r)));
+    const extraTurns   = pick(r => !r.cmdr && RE_EXTRA_TURN.test(textOf(r)));
+    const tutors       = pick(r => !r.isLand && [...textOf(r).matchAll(RE_TUTOR)].some(m => !/\bland\b|basic|plains|island|swamp|mountain|forest/.test(m[1])));
+    const nonLand      = rows.filter(r => !r.isLand && r.sf);
+    const count = re => nonLand.filter(r => re.test(textOf(r))).length;
+    const removal = count(RE_REMOVAL), counters = count(RE_COUNTER), wipes = nonLand.filter(r => cardRole(r.sf) === "wipe").length;
+    const draw = count(RE_DRAW), ramp = count(RE_RAMP), free = count(RE_FREE);
+    const fastMana = all.filter(r => FAST_MANA.has(normCardName(r.name)) || /^mox /.test(normCardName(r.name))).map(r => r.name);
+    const avgCmc = nonLand.length ? nonLand.reduce((s, r) => s + (r.sf.cmc || 0), 0) / nonLand.length : 0;
+    const ranks = nonLand.map(r => r.sf.edhrec_rank).filter(Boolean).sort((a, b) => a - b);
+    const medianRank = ranks.length ? ranks[Math.floor(ranks.length / 2)] : null;
+
+    // Combos fully in the deck (commander counts as a piece).
+    const inDeck = new Set(all.map(r => normCardName(r.name)));
+    const cmcOf = n => all.find(r => normCardName(r.name) === n)?.sf?.cmc || 0;
+    const deckCombos = (combos || []).filter(c => c.cards?.length && c.cards.every(n => inDeck.has(normCardName(n))));
+    const twoCard = deckCombos.filter(c => c.cards.length === 2).map(c => ({ ...c,
+      cmc: c.cards.map(normCardName).filter(n => !cmdrSet.has(n)).reduce((s, n) => s + cmcOf(n), 0) }));
+    const earlyTwoCard = twoCard.filter(c => c.cmc <= 6);
+
+    // ── Bracket (WotC rules) ──
+    let bracket = 2;
+    const reasons = [];
+    const bump = (b, text, cardsList) => { if (b > bracket) bracket = b; reasons.push({ bracket: b, text, cards: cardsList || [] }); };
+    if (gameChangers.length >= 4) bump(4, `${gameChangers.length} Game Changers (bracket 3 allows 3)`, gameChangers);
+    else if (gameChangers.length) bump(3, `${gameChangers.length} Game Changer${gameChangers.length === 1 ? "" : "s"} (none allowed in 1–2)`, gameChangers);
+    if (mld.length) bump(4, "Mass land destruction (only bracket 4+)", mld);
+    if (extraTurns.length >= 2) bump(4, `${extraTurns.length} extra-turn cards — can chain turns (only bracket 4+)`, extraTurns);
+    if (earlyTwoCard.length) bump(4, `Early two-card infinite combo${earlyTwoCard.length === 1 ? "" : "s"} (only bracket 4+)`, earlyTwoCard.map(c => c.cards.join(" + ")));
+    else if (twoCard.length) bump(3, "Late-game two-card infinite combo (bracket 3 allows these)", twoCard.map(c => c.cards.join(" + ")));
+
+    // ── Score (unofficial) ──
+    const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+    const parts = [
+      { id: "speed",   label: "Speed",         pts: clamp((3.8 - avgCmc) * 0.9, 0, 1.5),   max: 1.5,   detail: `avg mana value ${avgCmc.toFixed(2)}` },
+      { id: "fast",    label: "Fast mana",     pts: clamp(fastMana.length * 0.35, 0, 1.5), max: 1.5, detail: `${fastMana.length}`, cards: fastMana },
+      { id: "ramp",    label: "Ramp",          pts: clamp(ramp / 10, 0, 1) * 0.8,          max: 0.8, detail: `${ramp}` },
+      { id: "inter",   label: "Interaction",   pts: clamp((removal + counters + wipes * 0.5) / 12, 0, 1) * 1.2, max: 1.2, detail: `${removal} removal · ${counters} counters · ${wipes} wipes` },
+      { id: "draw",    label: "Card draw",     pts: clamp(draw / 10, 0, 1) * 0.8,          max: 0.8, detail: `${draw}` },
+      { id: "tutors",  label: "Tutors",        pts: clamp(tutors.length * 0.3, 0, 1.2),    max: 1.2, detail: `${tutors.length}`, cards: tutors },
+      { id: "gc",      label: "Game Changers", pts: clamp(gameChangers.length * 0.3, 0, 1.5), max: 1.5, detail: `${gameChangers.length}`, cards: gameChangers },
+      { id: "combo",   label: "Combos",        pts: earlyTwoCard.length ? 1.2 : twoCard.length ? 0.9 : deckCombos.length ? 0.5 : 0, max: 1.2, detail: `${deckCombos.length} in deck` },
+      { id: "free",    label: "Free spells",   pts: clamp(free * 0.25, 0, 0.8),            max: 0.8, detail: `${free}` },
+      { id: "quality", label: "Card quality",  pts: medianRank ? clamp((4.3 - Math.log10(medianRank)) / 1.5, 0, 1) : 0, max: 1, detail: medianRank ? `median EDHRec rank #${medianRank}` : "no EDHRec ranks" },
+    ];
+    const score = Math.round(clamp(1 + parts.reduce((s, p) => s + p.pts, 0), 1, 10) * 10) / 10;
+    if (bracket >= 4 && score >= 9) { bracket = 5; reasons.push({ bracket: 5, text: "Plays at cEDH speed (score 9+)", cards: [] }); }
+    const band = score < 4 ? "casual" : score < 6 ? "focused" : score < 8 ? "strong" : "high-power";
+    return { bracket, low: bracket === 2 && score < 3.5, score, band, reasons, parts, gameChangers, mld, extraTurns, tutors, twoCard, deckCombos, unknown };
+  }
+
+  // Cheap cache for list views (Library tiles re-render often).
+  const powerMemo = new Map();
+  function deckPower(deckData, cmdrName) {
+    if (!deckData?.categories?.length || !cmdrName) return null;
+    const cards = deckData.categories.flatMap(c => c.cards || []);
+    const key = cmdrName + "|" + cards.map(c => c.name).sort().join("|") + "|" + (deckData.combosHave?.length || 0);
+    if (powerMemo.has(key)) return powerMemo.get(key);
+    const p = assessPower(cards, [cmdrName], deckData.combosHave || []);
+    if (p.unknown > cards.length / 2) return null;   // Scryfall data not loaded yet — don't guess
+    powerMemo.set(key, p);
+    return p;
+  }
+
   // Where each card the user owns lives. `available` = in the pool the deck
   // builder draws from (an included binder or deck); `where` lists every
   // binder / deck holding it, with whether that source is included.
@@ -3997,6 +4129,9 @@
       if (!didInitRef.current) return;
       localStorage.setItem(LS_USE_SHARED, useSharedGemini ? "1" : "0");
     }, [useSharedGemini]);
+    // Game Changer list for the ⚡ Power panel / bracket rules (weekly).
+    useEffect(() => { const t = setTimeout(refreshGameChangers, 4000); return () => clearTimeout(t); }, []);
+    const [powerOpen, setPowerOpen] = useState(false);   // ⚡ Power panel (collapsed by default)
     const tooltipTimer = useRef(null);
     const headerRef    = useRef(null);
 
@@ -4874,6 +5009,19 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
           if (dropped.length) addLog(`🚫 Left out ${dropped.length} card(s) that can't work in [${ci.join(",") || "C"}]: ${dropped.slice(0, 6).join(", ")}${dropped.length > 6 ? ", …" : ""}.`);
         }
 
+        // Bracket rules (WotC): no Game Changers in brackets 1-2, no mass
+        // land destruction below bracket 4. Bracket 3's "up to 3 Game
+        // Changers" is enforced after the AI picks.
+        {
+          const dropped = [];
+          eligible = eligible.filter(c => {
+            if (bracket <= 2 && isGameChanger(c.name)) { dropped.push(`${c.name} (Game Changer)`); return false; }
+            if (bracket <= 3 && isMassLandDenial(c.scryfall)) { dropped.push(`${c.name} (land destruction)`); return false; }
+            return true;
+          });
+          if (dropped.length) addLog(`⚡ Bracket ${bracket}: left out ${dropped.length} card(s): ${dropped.slice(0, 6).join(", ")}${dropped.length > 6 ? ", …" : ""}.`);
+        }
+
         const basics = ci.map(col => BASIC_LAND[col]).filter(Boolean);
         const basicNamesSet = new Set(basics.concat(["Wastes"]));
 
@@ -4990,7 +5138,8 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
           const price   = c.scryfall?.prices?.usd ? `$${c.scryfall.prices.usd}` : "—";
           const syn     = synergyMap[c.name.toLowerCase()];
           const synHint = syn ? ` ★${(syn.synergy * 100).toFixed(0)}%` : "";
-          const base = `${c.name}${synHint} | ${(c.scryfall.type_line||"").split("—")[0].trim()} | CMC:${c.scryfall.cmc||0} | ${price}`;
+          const gc      = bracket === 3 && isGameChanger(c.name) ? " [GAME CHANGER]" : "";
+          const base = `${c.name}${synHint}${gc} | ${(c.scryfall.type_line||"").split("—")[0].trim()} | CMC:${c.scryfall.cmc||0} | ${price}`;
           if (!withText) return base;
           const rl = (c._roles.length || c._combo) ? ` | ROLE: ${[...(c._combo ? ["Combo piece"] : []), ...c._roles.map(id => roleLabel[id] || id)].join(", ")}` : "";
           return `${base}${rl} | ${oracleSnippet(c.scryfall, 130)}`;
@@ -5034,7 +5183,7 @@ ${research.avoid.length ? `AVOID: ${research.avoid.join("; ")}\n` : ""}`;
 Color identity: [${ci.join(", ")||"Colorless"}]
 Theme: ${chosenCmd.theme}
 
-Power level: Bracket ${bracket} (${sel.label}) — ${sel.desc}
+Power level: Bracket ${bracket} (${sel.label}) — ${sel.desc}${bracket === 3 ? "\nAt most 3 cards tagged [GAME CHANGER]. No mass land destruction; at most one extra-turn card." : bracket <= 2 ? "\nNo mass land destruction; at most one extra-turn card." : ""}
 ${archLine}
 ${budgetLine}
 
@@ -5340,6 +5489,27 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               if (done.length) addLog(`💥 Completed combo [${combo.cards.join(" + ")}]: added ${done.join(", ")}.`);
             }
           }
+        }
+
+        // ── Bracket check: Game Changer cap (3 in bracket 3) and no chained
+        // extra turns below bracket 4. Cut the weakest extras; the filler
+        // below replaces them and must not re-add them.
+        if (bracket <= 3) {
+          const inDeck = () => deckData.categories.flatMap(c => c.cards.map(x => x.name));
+          const cutWeakest = (names, keep, why) => {
+            const ranked = names.map(n => ({ n, sc: eligibleByNorm.get(normCardName(n))?._score || 0 })).sort((a, b) => b.sc - a.sc);
+            const cut = ranked.slice(keep).map(x => x.n);
+            for (const n of cut) {
+              for (const cat of deckData.categories) {
+                const i = cat.cards.findIndex(x => x.name === n);
+                if (i >= 0) { cat.cards.splice(i, 1); break; }
+              }
+              comboBanned.add(n.toLowerCase());
+            }
+            if (cut.length) addLog(`⚡ Bracket ${bracket}: ${why} — removed ${cut.join(", ")}.`);
+          };
+          cutWeakest(inDeck().filter(isGameChanger), bracket === 3 ? 3 : 0, `too many Game Changers (max ${bracket === 3 ? 3 : 0})`);
+          cutWeakest(inDeck().filter(n => RE_EXTRA_TURN.test(rulesText(eligibleByNorm.get(normCardName(n))?.scryfall))), 1, "more than one extra-turn card");
         }
 
         // Post-process: ensure exactly 99 cards, with ≤ mech.lands lands.
@@ -11689,6 +11859,64 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               `}
 
 
+              ${!previewingPrecon && (() => {
+                const pw = deckPower(deck, selCmd.card.name);
+                if (!pw) return null;
+                const target = deck.buildPrefs?.bracket;
+                const over = target && pw.bracket > target;
+                const archB = deck.archidekt?.insights?.bracket;
+                const bLabel = n => `${n} · ${(BRACKETS.find(b => b.n === n) || {}).label || ""}`;
+                const overCards = pw.reasons.filter(r => r.bracket > target).flatMap(r => r.cards);
+                return html`
+                  <div style=${{ background:"var(--bg-surface-soft)", border:`1px solid ${over ? "var(--warning)" : "var(--border-strong)"}`, borderRadius:10,
+                    padding:"12px 18px", marginBottom:18 }}>
+                    <button onClick=${() => setPowerOpen(v => !v)} aria-expanded=${powerOpen}
+                      style=${{ all:"unset", cursor:"pointer", display:"flex", alignItems:"center", gap:8, width:"100%", flexWrap:"wrap" }}>
+                      <span style=${{ color:"var(--accent-dark)" }}>${powerOpen ? "▾" : "▸"}</span>
+                      <span style=${{ fontSize:11, letterSpacing:3, color:"var(--accent-dark)", textTransform:"uppercase", fontWeight:700 }}>⚡ Power</span>
+                      <span style=${{ fontSize:12, fontWeight:700, padding:"2px 10px", borderRadius:12, background:"var(--accent)", color:"var(--on-accent)" }}>
+                        Bracket ${pw.low ? "1–2" : pw.bracket}
+                      </span>
+                      <span style=${{ fontSize:12, color:"var(--fg-text-body)" }}><strong>${pw.score.toFixed(1)}</strong>/10 · ${pw.band}</span>
+                      ${over && html`<span style=${{ fontSize:11, color:"var(--warning)", fontWeight:700 }}>⚠ above bracket ${target}</span>`}
+                      <span style=${{ marginLeft:"auto", fontSize:11, color:"var(--accent-dark)" }}>${powerOpen ? "hide" : "show"}</span>
+                    </button>
+                    ${powerOpen && html`
+                      <div style=${{ marginTop:10, fontSize:12, lineHeight:1.6, color:"var(--fg-text-body)" }}>
+                        ${over && html`<div style=${{ color:"var(--warning)", marginBottom:8 }}>
+                          Built for bracket ${bLabel(target)}, but plays like bracket ${pw.bracket}${overCards.length ? html` because of <strong>${overCards.join(", ")}</strong>` : ""}.
+                        </div>`}
+                        ${!over && target && html`<div style=${{ color:"var(--success-text)", marginBottom:8 }}>✓ Within the rules of bracket ${bLabel(target)}, which it was built for.</div>`}
+                        <div style=${{ fontWeight:700, color:"var(--fg-text-heading)" }}>Bracket ${pw.low ? "1–2" : bLabel(pw.bracket)} — why</div>
+                        ${pw.reasons.length ? html`<ul style=${{ margin:"4px 0 0", paddingLeft:18 }}>
+                          ${pw.reasons.map(r => html`<li key=${r.text}>${r.text}${r.cards.length ? html`: <strong>${r.cards.join(", ")}</strong>` : ""}</li>`)}
+                        </ul>` : html`<div>No Game Changers, mass land destruction, chained extra turns or two-card infinite combos.
+                          ${" "}Brackets 1 and 2 differ mostly in intent, which a card list can't show.</div>`}
+                        ${pw.extraTurns.length === 1 && html`<div style=${{ color:"var(--fg-text-muted)" }}>One extra-turn card (${pw.extraTurns[0]}) — fine as long as it isn't chained.</div>`}
+                        ${pw.deckCombos.length > 0 && !pw.twoCard.length && html`<div style=${{ color:"var(--fg-text-muted)" }}>
+                          ${pw.deckCombos.length} combo${pw.deckCombos.length === 1 ? "" : "s"} of three or more cards — allowed from bracket 3; at the table, say so in bracket 2.</div>`}
+                        ${archB && html`<div style=${{ marginTop:6, color:"var(--info)" }}>Archidekt rates it bracket ${archB}${archB === pw.bracket ? " — same as ours." : "."}</div>`}
+
+                        <div style=${{ fontWeight:700, color:"var(--fg-text-heading)", marginTop:12 }}>Power score ${pw.score.toFixed(1)}/10 — what drives it</div>
+                        <div style=${{ display:"grid", gridTemplateColumns:"110px 1fr", gap:"4px 10px", alignItems:"center", marginTop:6 }}>
+                          ${pw.parts.map(pt => html`
+                            <span key=${pt.id + "l"} style=${{ color:"var(--fg-text-soft)" }}>${pt.label}</span>
+                            <div key=${pt.id + "b"} style=${{ display:"flex", alignItems:"center", gap:8, minWidth:0 }}>
+                              <div style=${{ flex:"0 0 90px", height:6, borderRadius:3, background:"var(--border)" }}>
+                                <div style=${{ width:`${Math.round(pt.pts / pt.max * 100)}%`, height:6, borderRadius:3, background:"var(--accent)" }}></div>
+                              </div>
+                              <span style=${{ fontSize:11, color:"var(--fg-text-muted)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}
+                                title=${(pt.cards || []).join(", ")}>${pt.detail}${pt.cards?.length ? ` — ${pt.cards.join(", ")}` : ""}</span>
+                            </div>`)}
+                        </div>
+                        <div style=${{ fontSize:11, color:"var(--fg-text-muted)", fontStyle:"italic", marginTop:8 }}>
+                          The bracket follows WotC's rules (Game Changers, land destruction, extra turns, two-card combos). The 1–10 score is Commander Forge's own estimate from the card list — use it to compare your decks, not as an official rating.
+                          ${pw.unknown > 0 ? ` ${pw.unknown} card(s) had no Scryfall data and were skipped.` : ""}
+                        </div>
+                      </div>`}
+                  </div>`;
+              })()}
+
               ${(deck.warnings?.length || deck.edhrecSuggestions?.length || deck.combosHave?.length || deck.combosAlmost?.length) > 0 && html`
                 <div style=${{ display:"flex", justifyContent:"flex-end", marginBottom:6 }}>
                   <button onClick=${() => setShowInsights(v => !v)}
@@ -12576,6 +12804,21 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             🎁 ${preconInfo.partial ? "MOSTLY " : ""}${preconInfo.setCode.toUpperCase()}
                           </div>
                         `}
+
+                        ${(() => {
+                          const pw = (!isImported || isEnriched) ? deckPower(deckDataHere, cmdrLabel) : null;
+                          if (!pw) return null;
+                          return html`
+                            <!-- Power chip — bracket + score, below the other badges -->
+                            <div title=${`Estimated bracket ${pw.low ? "1–2" : pw.bracket} · power ${pw.score.toFixed(1)}/10 (${pw.band}). Open the deck for details.`}
+                              style=${{
+                                position:"absolute", top: preconInfo ? 50 : 30, right: isLibrary ? 36 : 12, zIndex:1,
+                                padding:"2px 8px", borderRadius:10, fontSize:9, fontWeight:700, letterSpacing:0.5,
+                                background:"var(--bg-surface-soft)", color:"var(--accent-text)", border:"1px solid var(--border-input)",
+                              }}>
+                              ⚡ B${pw.low ? "1–2" : pw.bracket} · ${pw.score.toFixed(1)}
+                            </div>`;
+                        })()}
 
                         ${isLibrary && html`
                           <button onClick=${e => { e.stopPropagation(); deleteFromLibrary(entry.id); }}
