@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.14-c";
+  const APP_VERSION = "v2026.10.15-a";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -3623,6 +3623,39 @@
       </div>`;
   }
 
+  // ── Card set preference ─────────────────────────────────────────────────
+  // Which sets the user's copies of each card come from. Manabox rows carry
+  // the set code; rows without one fall back to the printing in the
+  // Scryfall cache. Returns { bySet: Map(code → copies), byCard: Map(norm → Set(codes)) }.
+  function collectionSetIndex(groups) {
+    const cache = getSFCache();
+    const bySet = new Map(), byCard = new Map();
+    const add = r => {
+      const code = (r.set || cache[(r.id || "").toLowerCase()]?.d?.set || "").toLowerCase();
+      if (!code || BASIC_NAMES.has(r.name)) return;
+      bySet.set(code, (bySet.get(code) || 0) + (r.qty || 1));
+      const k = normCardName(r.name);
+      if (!byCard.has(k)) byCard.set(k, new Set());
+      byCard.get(k).add(code);
+    };
+    (groups.binders || []).forEach(b => (b.cards || []).forEach(add));
+    (groups.decks || []).forEach(d => (d.cards || []).forEach(add));
+    return { bySet, byCard };
+  }
+  // Set code → name, from whatever the Scryfall cache knows.
+  function setNameMap() {
+    const out = new Map();
+    for (const v of Object.values(getSFCache())) {
+      const d = v?.d;
+      if (d?.set && d.set_name && !out.has(d.set)) out.set(d.set, d.set_name);
+    }
+    return out;
+  }
+  const SET_PREF_MODES = [
+    { id: "prefer", label: "Prefer" },
+    { id: "only",   label: "Only these sets" },
+  ];
+
   // ── Build preferences config ────────────────────────────────────────────────
   const BRACKETS = [
     { n: 1, label: "Exhibition",  desc: "Casual / jank — anything goes" },
@@ -3637,7 +3670,8 @@
     "Lands matter","Stax","Group Hug","Politics","Ramp","Big Mana",
   ];
 
-  function BuildPrefs({ bracket, setBracket, archetypes, setArchetypes, budget, setBudget, mech, setMech, showMech, setShowMech, comboPolicy, setComboPolicy }) {
+  function BuildPrefs({ bracket, setBracket, archetypes, setArchetypes, budget, setBudget, mech, setMech, showMech, setShowMech, comboPolicy, setComboPolicy, setPref, setSetPref, ownedSets }) {
+    const [setQuery, setSetQuery] = useState("");
     const toggleArch = a => setArchetypes(prev =>
       prev.includes(a) ? prev.filter(x => x !== a)
       : prev.length >= 3 ? prev
@@ -3739,6 +3773,49 @@
                 : html`Overrides the bracket: <strong>${COMBO_POLICY_TEXT[comboPolicy]}</strong>.`}
             </div>
           </div>`}
+
+        <!-- Card sets -->
+        ${setSetPref && (() => {
+          const picked = setPref?.sets || [];
+          const q = setQuery.trim().toLowerCase();
+          const toggle = code => setSetPref(p => ({ ...p, sets: (p.sets || []).includes(code) ? p.sets.filter(x => x !== code) : [...(p.sets || []), code] }));
+          const offer = (ownedSets || []).filter(x => !picked.includes(x.code)
+            && (!q || x.code.includes(q) || (x.name || "").toLowerCase().includes(q))).slice(0, q ? 12 : 8);
+          const label = x => x.name ? `${x.name} (${x.code.toUpperCase()})` : x.code.toUpperCase();
+          const byCode = new Map((ownedSets || []).map(x => [x.code, x]));
+          const chip = (on) => ({ padding:"4px 10px", borderRadius:14, fontSize:11, fontFamily:"inherit", cursor:"pointer",
+            border: on ? "1px solid var(--accent)" : "1px solid var(--border-strong)",
+            background: on ? "var(--accent)" : "var(--bg-surface)", color: on ? "var(--on-accent)" : "var(--fg-text-body)" });
+          return html`
+            <div style=${{ marginBottom: 14 }}>
+              <div style=${{ fontSize:11, color:"var(--fg-text-soft)", marginBottom:6 }}>
+                Card sets <span style=${{ color:"var(--fg-text-placeholder)" }}>(from your collection — optional)</span>
+              </div>
+              ${picked.length > 0 && html`
+                <div style=${{ display:"flex", gap:5, flexWrap:"wrap", marginBottom:6 }}>
+                  ${picked.map(code => html`<button key=${code} onClick=${() => toggle(code)} title="Remove" style=${chip(true)}>
+                    🎴 ${label(byCode.get(code) || { code })}${byCode.get(code) ? ` · ${byCode.get(code).n}` : ""} ✕</button>`)}
+                </div>`}
+              <div style=${{ display:"flex", gap:5, flexWrap:"wrap", alignItems:"center" }}>
+                <input value=${setQuery} onInput=${e => setSetQuery(e.target.value)} placeholder="Search sets…"
+                  style=${{ padding:"4px 10px", borderRadius:14, fontSize:11, fontFamily:"inherit", width:130,
+                    border:"1px solid var(--border-strong)", background:"var(--bg-surface)", color:"var(--fg-text-body)" }} />
+                ${offer.map(x => html`<button key=${x.code} onClick=${() => { toggle(x.code); setSetQuery(""); }} style=${chip(false)}>
+                  + ${label(x)} · ${x.n}</button>`)}
+                ${!offer.length && html`<span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}>${(ownedSets || []).length ? "No matching set." : "Import your collection to pick sets."}</span>`}
+              </div>
+              ${picked.length > 0 && html`
+                <div style=${{ display:"flex", gap:6, flexWrap:"wrap", marginTop:8, alignItems:"center" }}>
+                  ${SET_PREF_MODES.map(m => html`<button key=${m.id} onClick=${() => setSetPref(p => ({ ...p, mode: m.id }))}
+                    style=${{ ...chip((setPref.mode || "prefer") === m.id), fontSize:12, padding:"5px 11px" }}>${m.label}</button>`)}
+                  <span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}>
+                    ${(setPref.mode || "prefer") === "only"
+                      ? "Only cards from these sets (plus basic lands) — a pure set deck; may come out short."
+                      : "Cards from these sets are favoured; staples from other sets still get in where clearly better."}
+                  </span>
+                </div>`}
+            </div>`;
+        })()}
 
         <!-- Mechanics toggle -->
         ${(() => {
@@ -3849,6 +3926,8 @@
           }
           archetypes.forEach(a => chips.push(a));
           if (budget) chips.push(`$${budget} budget`);
+          if (setPref?.sets?.length) chips.push(`🎴 ${setPref.mode === "only" ? "only " : ""}${setPref.sets.map(c => c.toUpperCase()).join("/")}`);
+          if (comboPolicy && comboPolicy !== "auto") chips.push(`combos: ${(COMBO_POLICIES.find(p => p.id === comboPolicy) || {}).label || comboPolicy}`);
           if (mech.lands       !== D.lands)       chips.push(`${mech.lands} lands`);
           if (mech.ramp        !== D.ramp)        chips.push(`${mech.ramp} ramp`);
           if (mech.draw        !== D.draw)        chips.push(`${mech.draw} draw`);
@@ -4334,12 +4413,27 @@
     const [colorMode,   setCM]    = useState("at_least");
     const [colorless,   setCL]    = useState(false);
     const [cmdrQuery,   setCmdrQuery] = useState("");   // name search in Commanders tab
+    const [cmdrPrefOnly, setCmdrPrefOnly] = useState(false);   // Commanders tab: only preferred card sets
 
     // ── Build preferences ───────────────────────────────────────────────
     const [bracket,    setBracket]    = useState(3);            // 1-5 (WotC Commander Brackets)
     const [archetypes, setArchetypes] = useState([]);           // up to 3
     const [budget,     setBudget]     = useState("");           // USD total, "" = no cap
     const [comboPolicy, setComboPolicy] = useState("auto");       // see COMBO_POLICIES
+    const [setPref,     setSetPref]     = useState({ sets: [], mode: "prefer" });   // card set preference
+    // Which sets the collection's cards come from (recomputed when groups change).
+    const setIdxRef = useRef({ groups: null, idx: null });
+    if (setIdxRef.current.groups !== groups) setIdxRef.current = { groups, idx: collectionSetIndex(groups) };
+    const setIdx = setIdxRef.current.idx;
+    const ownedSets = (() => {
+      const names = setNameMap();
+      return [...setIdx.bySet].map(([code, n]) => ({ code, n, name: names.get(code) || "" })).sort((a, b) => b.n - a.n);
+    })();
+    const prefSetSet = new Set(setPref.sets || []);
+    const inPrefSets = name => prefSetSet.size > 0 && [...(setIdx.byCard.get(normCardName(name)) || [])].some(c => prefSetSet.has(c));
+    const prefSetLabel = (sets) => (sets || []).map(c => c.toUpperCase()).join("/");
+    // Is a card owned in one of the given sets (a deck's saved preference)?
+    const inSetsOf = (sets, name) => (sets || []).length > 0 && [...(setIdx.byCard.get(normCardName(name)) || [])].some(c => sets.includes(c));
     const [mech,       setMech]       = useState({              // construction targets
       lands: 37, ramp: 10, draw: 10, removal: 8, wipes: 3,
       interaction: "medium",   // low | medium | high
@@ -4677,6 +4771,7 @@
           if (p.budget != null) setBudget(p.budget);
           if (p.mech)       setMech(prev => ({ ...prev, ...p.mech }));
           if (p.comboPolicy) setComboPolicy(p.comboPolicy);
+          if (p.setPref?.sets) setSetPref({ sets: p.setPref.sets, mode: p.setPref.mode || "prefer" });
         } catch {}
       }
 
@@ -4820,8 +4915,8 @@
     // the defaults over them (and sync would push those defaults).
     useEffect(() => {
       if (!didInitRef.current) return;
-      lsSetItemSafe(LS_PREFS, JSON.stringify({ bracket, archetypes, budget, mech, comboPolicy }));
-    }, [bracket, archetypes, budget, mech, comboPolicy]);
+      lsSetItemSafe(LS_PREFS, JSON.stringify({ bracket, archetypes, budget, mech, comboPolicy, setPref }));
+    }, [bracket, archetypes, budget, mech, comboPolicy, setPref]);
 
     // Reset scroll position when entering any top-level view. Opening a deck
     // from Library used to land somewhere in the middle of the categories
@@ -5255,7 +5350,11 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
         const seen = new Set();
         const scored = pool
           .filter(c => { const k = (c.name || "").toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; })
-          .map(c => ({ c, ...commanderFit(c, archetypes) }))
+          .map(c => {
+            const fit = commanderFit(c, archetypes);
+            // Commanders the user owns from their preferred card sets rank first.
+            return inPrefSets(c.name) ? { c, score: fit.score + 6, fits: [...fit.fits, "preferred set"] } : { c, ...fit };
+          })
           .sort((a, b) => b.score - a.score);
         const sample = scored.slice(0, SUGGEST_MAX);
         const list   = sample.map(({ c, fits }) => {
@@ -5268,7 +5367,8 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
           `Build preferences:\n` +
           `- Power level: Bracket ${bracket} (${sel.label}) — ${sel.desc}\n` +
           (archetypes.length ? `- Preferred archetypes: ${archetypes.join(", ")}\n` : "") +
-          (budgetNum > 0 ? `- Budget cap: ~$${budgetNum} total deck cost\n` : "");
+          (budgetNum > 0 ? `- Budget cap: ~$${budgetNum} total deck cost\n` : "") +
+          (setPref.sets?.length ? `- Preferred card sets: ${prefSetLabel(setPref.sets)} — strongly favour commanders tagged "preferred set" and themes the user's cards from these sets support\n` : "");
 
         addLog(sample.length < scored.length
           ? `🤖 Asking AI to rank the ${sample.length} best-fitting of ${scored.length} commanders…`
@@ -5292,7 +5392,7 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
         addLog(`✅ ${withCards.length} suggestions — pick your favourite!`);
         setPhase("pick");
       } catch(e) { setError(e.message); setPhase("error"); }
-    }, [cmdrs, usable, apiKeys, provider, models, colorFilter, colorMode, colorless, bracket, archetypes, budget]);
+    }, [cmdrs, usable, apiKeys, provider, models, colorFilter, colorMode, colorless, bracket, archetypes, budget, setPref, groups]);
 
     const buildDeck = useCallback(async chosenCmd => {
       setSelCmd(chosenCmd); setPhase("building"); setLog([]); setProg(0);
@@ -5371,6 +5471,23 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
           if (dropped.length) addLog(`⚡ Bracket ${bracket}: left out ${dropped.length} card(s): ${dropped.slice(0, 6).join(", ")}${dropped.length > 6 ? ", …" : ""}.`);
         }
 
+        // Card set preference: "only" restricts the pool to those sets (basic
+        // lands always allowed); "prefer" just marks the cards for a boost.
+        const prefSets = setPref.sets || [];
+        const setMode  = prefSets.length ? (setPref.mode || "prefer") : null;
+        const setTag   = prefSetLabel(prefSets);
+        if (setMode) {
+          eligible.forEach(c => { c._pref = inPrefSets(c.name); });
+          const nPref = eligible.filter(c => c._pref).length;
+          if (setMode === "only") {
+            eligible = eligible.filter(c => c._pref);
+            const nonLand = eligible.filter(c => !/\bLand\b/.test((c.scryfall?.type_line || "").split("//")[0])).length;
+            addLog(`🎴 Only ${setTag}: ${eligible.length} eligible card(s) from those sets${nonLand < 55 ? ` — only ${nonLand} non-land, so the deck will lean on basic lands` : ""}.`);
+          } else {
+            addLog(`🎴 Preferring ${setTag}: ${nPref} eligible card(s) from those sets.`);
+          }
+        }
+
         const basics = ci.map(col => BASIC_LAND[col]).filter(Boolean);
         const basicNamesSet = new Set(basics.concat(["Wastes"]));
 
@@ -5421,7 +5538,7 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
         for (const c of eligible) {
           c._roles = roles.filter(r => r.test(c.scryfall)).map(r => r.id);
           c._core  = cardRole(c.scryfall);
-          c._score = edhScore(c) + c._roles.length * 0.4;
+          c._score = edhScore(c) + c._roles.length * 0.4 + (setMode === "prefer" && c._pref ? 0.8 : 0);
         }
         eligible.sort((a, b) => b._score - a._score || (a.scryfall?.cmc || 0) - (b.scryfall?.cmc || 0));
 
@@ -5442,6 +5559,7 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
         const MAX_CANDIDATES = 240;
         const cand = new Map();
         const take = (list, n) => { for (const c of list.slice(0, n)) cand.set(c.name, c); };
+        if (setMode === "prefer") take(eligible.filter(c => c._pref), 90);   // preferred-set cards are always offered
         for (const r of research.roles) take(eligible.filter(c => c._roles.includes(r.id)), Math.max(6, r.target * 3));
         for (const [role, n] of [["ramp", 16], ["draw", 16], ["removal", 16], ["wipe", 6]]) take(eligible.filter(c => c._core === role), n);
         take(eligible.filter(c => c._core === "land"), 30);
@@ -5487,7 +5605,7 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
           const price   = c.scryfall?.prices?.usd ? `$${c.scryfall.prices.usd}` : "—";
           const syn     = synergyMap[c.name.toLowerCase()];
           const synHint = syn ? ` ★${(syn.synergy * 100).toFixed(0)}%` : "";
-          const gc      = bracket === 3 && isGameChanger(c.name) ? " [GAME CHANGER]" : "";
+          const gc      = (bracket === 3 && isGameChanger(c.name) ? " [GAME CHANGER]" : "") + (setMode === "prefer" && c._pref ? " [PREF SET]" : "");
           const base = `${c.name}${synHint}${gc} | ${(c.scryfall.type_line||"").split("—")[0].trim()} | CMC:${c.scryfall.cmc||0} | ${price}`;
           if (!withText) return base;
           const rl = (c._roles.length || c._combo) ? ` | ROLE: ${[...(c._combo ? ["Combo piece"] : []), ...c._roles.map(id => roleLabel[id] || id)].join(", ")}` : "";
@@ -5532,7 +5650,7 @@ ${research.avoid.length ? `AVOID: ${research.avoid.join("; ")}\n` : ""}`;
 Color identity: [${ci.join(", ")||"Colorless"}]
 Theme: ${chosenCmd.theme}
 
-Power level: Bracket ${bracket} (${sel.label}) — ${sel.desc}${bracket === 3 ? "\nAt most 3 cards tagged [GAME CHANGER]. No mass land destruction; at most one extra-turn card." : bracket <= 2 ? "\nNo mass land destruction; at most one extra-turn card." : ""}
+${setMode === "prefer" ? `PREFERRED CARD SETS: ${setTag} — the user loves these. Cards tagged [PREF SET] come from them: whenever two cards do a similar job, pick the tagged one, and use as many tagged cards as the deck can play well. Keep strong staples from other sets where they're clearly better.\n` : setMode === "only" ? `CARD SETS: the list only contains cards from ${setTag} (the user wants a pure set deck) — use basic lands to fill.\n` : ""}Power level: Bracket ${bracket} (${sel.label}) — ${sel.desc}${bracket === 3 ? "\nAt most 3 cards tagged [GAME CHANGER]. No mass land destruction; at most one extra-turn card." : bracket <= 2 ? "\nNo mass land destruction; at most one extra-turn card." : ""}
 ${archLine}
 ${budgetLine}
 
@@ -5966,7 +6084,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             need--; addedExtras++;
           }
           // Pass 2: fill remaining slots with basics, strictly up to the cap.
-          while (need > 0 && countLands() < MAX_LANDS) {
+          // A pure set deck ("only") may run out of cards — fill with basics then.
+          while (need > 0 && (countLands() < MAX_LANDS || setMode === "only")) {
             landsCat.cards.push({ name: fillBasic, reason: "Basic land filler" });
             need--; basicsAdded++;
           }
@@ -6053,6 +6172,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           let replaced = 0, dropped = 0;
           const doSwap = (cat, idx) => {
             const r = pool.shift();
+            // A pure set deck keeps its extra basics when nothing can replace them.
+            if (!r && setMode === "only") { dropped = excess; return; }
             cat.cards.splice(idx, 1);
             if (r) {
               const sf2 = r.scryfall;
@@ -6079,7 +6200,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           }
 
           if (replaced) addLog(`♻️ Swapped ${replaced} excess land(s) for synergy cards from your collection.`);
-          if (dropped)  addLog(`🗑️ Removed ${dropped} excess land(s) — collection had no more non-land replacements.`);
+          if (dropped && setMode !== "only")  addLog(`🗑️ Removed ${dropped} excess land(s) — collection had no more non-land replacements.`);
         }
 
         // Re-count after post-mapping enforcement.
@@ -6087,14 +6208,18 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         const finalLands = deckData.categories.flatMap(c => c.cards).filter(c => c.isLand).length;
         addLog(`✅ ${finalTotal} cards · ${finalLands} lands${finalTotal === 99 ? " (Commander legal)" : ` — ⚠️ expected 99`}.`);
         deckData.edhrecSuggestions = edhrecSuggestions;   // cards to acquire
-        deckData.buildPrefs = { budget: budgetNum, bracket, archetypes };   // swap suggestions honour these
+        deckData.buildPrefs = { budget: budgetNum, bracket, archetypes, ...(setMode ? { setPref: { sets: prefSets, mode: setMode } } : {}) };   // swap suggestions honour these
+        if (setMode) {
+          const n = deckData.categories.flatMap(c => c.cards).filter(c => !BASIC_NAMES.has(c.name) && inPrefSets(c.name)).length;
+          addLog(`🎴 ${n} of ${finalTotal} cards from ${setTag}.`);
+        }
         deckData.research   = research;                                      // shown in the 🧭 Commander plan panel
         deckData.combosHave        = cspbHave;            // combos achievable now
         deckData.comboPolicy       = comboEff;            // how this build treated them
         deckData.combosAlmost      = cspbAlmost;          // combos one card away
         setDeck(deckData); setProg(100); setPhase("deck");
       } catch(e) { setError(e.message); setPhase("error"); }
-    }, [enriched, usable, apiKeys, provider, models, bracket, archetypes, budget, mech, comboPolicy]);
+    }, [enriched, usable, apiKeys, provider, models, bracket, archetypes, budget, mech, comboPolicy, setPref, groups]);
 
     // Save an updated version of the open deck wherever it lives (Collection
     // deck and/or Library entry) and show it.
@@ -6238,9 +6363,12 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         const coverage = roleCoverage();
         const shortRoles = coverage.filter(r => r.target && r.have.length < r.target);
         const thinRoles  = coverage.filter(r => r.target && r.have.length <= r.target);
+        const deckSets = deck.buildPrefs?.setPref?.sets || [];
         for (const c of candidates) {
           const fills = shortRoles.filter(r => r.test(c.sf));
           if (fills.length) { c.score += 0.3 * fills.length; c.fills = fills.map(r => r.label); }
+          // The deck was built preferring certain card sets: favour those.
+          if (inSetsOf(deckSets, c.name)) { c.score += 0.4; c.fills = [...(c.fills || []), `🎴 ${prefSetLabel(deckSets)}`]; }
         }
         candidates.sort((a, b) => b.score - a.score);
 
@@ -6257,7 +6385,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             const basic = BASIC_NAMES.has(c.name);
             const protectedBy = basic ? 0 : thinRoles.filter(r => r.test(sf)).length;
             return { name: c.name, sf, edh: basic ? null : edh.get(normCardName(c.name)),
-              score: basic ? -1 : score(c.name) + protectedBy * 0.3, role, basic,
+              score: basic ? -1 : score(c.name) + protectedBy * 0.3 + (inSetsOf(deckSets, c.name) ? 0.4 : 0), role, basic,
               mana_cost: c.mana_cost || sf?.mana_cost || sf?.card_faces?.[0]?.mana_cost || "" };
           });
         const qtyInDeck = n => deckRows.filter(c => c.name === n).length;
@@ -11451,6 +11579,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     mech=${mech} setMech=${setMech}
                     showMech=${showMech} setShowMech=${setShowMech}
                     comboPolicy=${comboPolicy} setComboPolicy=${setComboPolicy}
+                    setPref=${setPref} setSetPref=${setSetPref} ownedSets=${ownedSets}
                   />
 
                   <div style=${{ textAlign:"center" }}>
@@ -11487,10 +11616,11 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   if (colorMode === "at_least") return colorFilter.every(col => ci.includes(col));
                   return ci.length === colorFilter.length && colorFilter.every(col => ci.includes(col));
                 }) : availCmdrs;
-                const filtered = q
-                  ? colorFiltered.filter(c => (c.name || "").toLowerCase().includes(q))
-                  : colorFiltered;
-                const anyActiveFilter = anyFilter || !!q;
+                const prefOn = cmdrPrefOnly && (setPref.sets || []).length > 0;
+                const filtered = colorFiltered
+                  .filter(c => !q || (c.name || "").toLowerCase().includes(q))
+                  .filter(c => !prefOn || inPrefSets(c.name));
+                const anyActiveFilter = anyFilter || !!q || prefOn;
                 return html`
                   <div>
                     <!-- Search by name -->
@@ -11513,6 +11643,14 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             Clear
                           </button>
                         `}
+                        ${(setPref.sets || []).length > 0 && html`
+                          <button onClick=${() => setCmdrPrefOnly(v => !v)}
+                            title=${`Only commanders you own from ${prefSetLabel(setPref.sets)} (set under Build a new deck → Card sets)`}
+                            style=${{ padding:"5px 11px", borderRadius:16, fontSize:12, fontFamily:"inherit", cursor:"pointer", whiteSpace:"nowrap",
+                              border:"1px solid " + (prefOn ? "var(--accent)" : "var(--border-strong)"),
+                              background: prefOn ? "var(--accent)" : "var(--bg-surface)", color: prefOn ? "var(--on-accent)" : "var(--fg-text-body)" }}>
+                            🎴 From ${prefSetLabel(setPref.sets)}
+                          </button>`}
                       </div>
                     </div>
 
@@ -11993,6 +12131,14 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       const ok = total >= target;
                       return html`
                         <span>${total} cards · ${deck.categories.length} categories</span>
+                        ${(() => {
+                          const sets = deck.buildPrefs?.setPref?.sets || [];
+                          if (!sets.length) return null;
+                          const n = deck.categories.flatMap(c => c.cards).filter(c => !BASIC_NAMES.has(c.name) && inSetsOf(sets, c.name)).length;
+                          return html`<span title=${`Built ${deck.buildPrefs.setPref.mode === "only" ? "only from" : "preferring"} ${prefSetLabel(sets)}`}
+                            style=${{ marginLeft:8, padding:"1px 8px", borderRadius:10, fontSize:10, fontWeight:700,
+                              background:"var(--info-bg)", color:"var(--info)" }}>🎴 ${n} from ${prefSetLabel(sets)}</span>`;
+                        })()}
                         <span style=${{
                           marginLeft:8, padding:"1px 8px", borderRadius:10, fontSize:10, fontWeight:700,
                           background: ok ? "var(--success-soft)" : "var(--warning-bg)",
