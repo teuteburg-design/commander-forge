@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.15-a";
+  const APP_VERSION = "v2026.10.15-b";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -565,6 +565,36 @@
     }
     return { data: [], error: lastErr || "unknown", retryable: true };
   }
+
+  // Prices + card data for cards the user doesn't own (upgrade suggestions).
+  // Scryfall's default printing: Cardmarket trend (eur) and TCGplayer (usd).
+  const _priceCache = new Map();   // normalised name → { sf, eur, usd, uri }
+  async function fetchCardPrices(names) {
+    const todo = [...new Set(names)].filter(n => !_priceCache.has(normCardName(n)));
+    for (let i = 0; i < todo.length; i += 75) {
+      const { data } = await fetchBatch(todo.slice(i, i + 75).map(name => ({ name })));
+      for (const sf of data || []) {
+        const rec = { sf: slimSF(sf), eur: parseFloat(sf.prices?.eur) || null, usd: parseFloat(sf.prices?.usd) || null, uri: sf.scryfall_uri || null };
+        _priceCache.set(normCardName(sf.name), rec);
+      }
+    }
+    // Default printing without a price (promos, special editions): use the
+    // cheapest paper printing that has one.
+    for (const n of todo) {
+      const rec = _priceCache.get(normCardName(n));
+      if (!rec || rec.eur != null || rec.usd != null) continue;
+      try {
+        await sfThrottle();
+        const q = encodeURIComponent(`!"${n.split(" // ")[0]}" game:paper`);
+        const r = await fetch(`https://api.scryfall.com/cards/search?q=${q}&unique=prints&order=eur&dir=asc`);
+        if (!r.ok) continue;
+        const hit = ((await r.json()).data || []).find(c => c.prices?.eur || c.prices?.usd);
+        if (hit) { rec.eur = parseFloat(hit.prices.eur) || null; rec.usd = parseFloat(hit.prices.usd) || null; }
+      } catch {}
+    }
+    return new Map(names.map(n => [normCardName(n), _priceCache.get(normCardName(n)) || null]));
+  }
+  const LS_UPGRADES = "cmdr_forge_upgrades";   // { [deckId]: { key, at, items } } — not synced, refreshed daily
 
   // Standard basic lands (5 colours + Wastes). We have hardcoded image URIs and
   // metadata for these (BASIC_IMG / BASIC_LAND maps further down), so there's no
@@ -4922,7 +4952,7 @@
     // from Library used to land somewhere in the middle of the categories
     // because the browser kept the previous scroll offset.
     useEffect(() => {
-      if (["deck", "binder_view", "saved_list", "select", "ready", "setup"].includes(phase)) {
+      if (["deck", "binder_view", "saved_list", "upgrades", "select", "ready", "setup"].includes(phase)) {
         window.scrollTo({ top: 0 });
       }
     }, [phase]);
@@ -6309,6 +6339,132 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       }
       return edhCacheRef.current[k];
     };
+
+    // ── 🛒 Upgrades: cards to buy for Library decks ───────────────────────
+    // Up to 10 per deck the user doesn't own: combo completions (as the
+    // deck's combo setting allows), popular EDHRec cards for the commander,
+    // with a bonus for filling a commander role the deck is short on. Bracket
+    // rules apply (Game Changers, land destruction). Each comes with a price
+    // and the deck card it would most naturally replace.
+    const [upgrades, setUpgrades] = useState(() => {
+      try { return JSON.parse(localStorage.getItem(LS_UPGRADES) || "{}"); } catch { return {}; }
+    });
+    const [upgSort, setUpgSort] = useState("price");          // "price" | "impact"
+    const [upgAllDecks, setUpgAllDecks] = useState(false);    // include unbuilt Library decks
+    const [upgCopied, setUpgCopied] = useState(null);
+    const upgBusyRef = useRef(false);
+    const upgradeKey = e => deckFingerprint(e.selCmd?.card?.name, e.deck) || String(e.id);
+
+    const computeUpgrades = async (e) => {
+      const sel = e.selCmd, d = e.deck || {};
+      const cmdrName = sel?.card?.name;
+      if (!cmdrName) throw new Error("This deck has no commander.");
+      const cmdrShort = cmdrName.split(",")[0].split(" // ")[0];
+      const ci = sel.card.scryfall?.color_identity || [];
+      const bracketN = d.buildPrefs?.bracket || 3;
+      const eff = effectiveComboPolicy(d.comboPolicy, bracketN);
+      const own = buildOwnershipIndex(groups, {}, {}, null, []);
+      const cache = getSFCache();
+      const sfOf = n => cache[(n || "").toLowerCase()]?.d || cache[normCardName(n)]?.d || null;
+      const deckCards = (d.categories || []).flatMap(c => c.cards || []);
+      const inDeck = new Set([cmdrName, d.partner?.card?.name, ...deckCards.map(c => c.name)].filter(Boolean).map(normCardName));
+      const cands = new Map();
+      const add = (name, value, reason, kind) => {
+        const k = normCardName(name);
+        if (!name || inDeck.has(k) || own.has(k) || BASIC_NAMES.has(name)) return;
+        const c = cands.get(k) || { name, value: 0, reasons: [], kind };
+        c.value = Math.max(c.value, value) + (c.reasons.length ? 0.1 : 0);
+        c.reasons.push(reason);
+        if (kind === "combo") c.kind = "combo";
+        cands.set(k, c);
+      };
+      // Combos: one card away, every other piece already in the deck.
+      if (eff !== "avoid") for (const combo of d.combosAlmost || []) {
+        const missing = (combo.cards || []).filter(n => !inDeck.has(normCardName(n)));
+        if (missing.length !== 1) continue;
+        if (eff === "owned3" && (combo.cards || []).length < 3) continue;
+        add(missing[0], 2, `💥 completes ${combo.cards.join(" + ")}${combo.produces?.length ? ` → ${combo.produces.slice(0, 2).join(", ")}` : ""}`, "combo");
+      }
+      // EDHRec: what decks with this commander play.
+      let edh = new Map();
+      try {
+        const r = await getEdhrec(sel);
+        if (r.status === "ok") {
+          edh = new Map(r.suggestions.map(x => [normCardName(x.name), x]));
+          for (const x of r.suggestions) {
+            const v = (x.pct || 0) + (x.synergy || 0) / 2;
+            if (v < 0.2) continue;
+            add(x.name, v, `in ${Math.round((x.pct || 0) * 100)}% of ${cmdrShort} decks${(x.synergy || 0) > 0.15 ? ` · synergy +${Math.round(x.synergy * 100)}%` : ""}`, "edh");
+          }
+        }
+      } catch {}
+      if (!cands.size) return { items: [], note: edh.size ? "Nothing to buy — you own every strong card for this commander." : "EDHRec has no data for this commander, and there are no combos to complete." };
+
+      const prices = await fetchCardPrices([...cands.values()].map(c => c.name));
+      const roles = d.research?.roles?.length ? compileRoles(d.research.roles) : [];
+      const short = roles.map(r => ({ r, have: deckCards.filter(c => r.test(sfOf(c.name))).length }))
+        .filter(x => x.r.target && x.have < x.r.target);
+      const deckGC = [cmdrName, ...deckCards.map(c => c.name)].filter(isGameChanger).length;
+      const items = [];
+      for (const c of cands.values()) {
+        const p = prices.get(normCardName(c.name));
+        const sf = p?.sf;
+        if (!sf) continue;
+        if (!isEDHLegalCard(sf) || !(sf.color_identity || []).every(col => ci.includes(col))) continue;
+        if (isGameChanger(c.name) && (bracketN <= 2 || deckGC >= 3)) continue;
+        if (bracketN <= 3 && isMassLandDenial(sf)) continue;
+        const fills = short.filter(x => x.r.test(sf));
+        if (fills.length) { c.value += 0.3 * fills.length; c.reasons.push(`fills ${fills.map(x => `${x.r.label} (${x.have}/${x.r.target})`).join(", ")}`); }
+        items.push({ ...c, sf, eur: p.eur, usd: p.usd, uri: p.uri, role: cardRole(sf),
+          mana_cost: sf.mana_cost || sf.card_faces?.[0]?.mana_cost || "", gc: isGameChanger(c.name) });
+      }
+      items.sort((a, b) => b.value - a.value);
+      const top = items.slice(0, 10);
+      // Suggested cut: the weakest deck card doing the same job.
+      const protectedK = new Set([cmdrName, ...(d.combosHave || []).flatMap(x => x.cards || [])].map(normCardName));
+      const edhScore = n => { const x = edh.get(normCardName(n)); return x ? (x.pct || 0) + (x.synergy || 0) / 2 : 0; };
+      const cuts = [...new Map(deckCards.map(c => [c.name, c])).values()]
+        .filter(c => !BASIC_NAMES.has(c.name) && !protectedK.has(normCardName(c.name)))
+        .map(c => ({ name: c.name, role: cardRole(sfOf(c.name) || { type_line: c.type_line }), score: edhScore(c.name) }))
+        .sort((a, b) => a.score - b.score);
+      const used = new Set();
+      for (const it of top) {
+        const cut = cuts.find(x => !used.has(x.name) && x.role === it.role && x.score < it.value - 0.1)
+          || (it.role !== "land" ? cuts.find(x => !used.has(x.name) && x.role === "synergy" && x.score < it.value - 0.1) : null);
+        if (cut) { used.add(cut.name); it.cut = cut.name; }
+      }
+      return { items: top.map(({ sf, ...rest }) => ({ ...rest, img: sf.image_uris?.small || sf.card_faces?.[0]?.image_uris?.small || null })) };
+    };
+
+    const upgradeTargets = library.filter(e => e.selCmd && e.deck && (upgAllDecks || e.built));
+    const refreshUpgrades = (id) => setUpgrades(u => { const n = { ...u }; delete n[id]; return n; });
+    useEffect(() => {
+      if (phase !== "upgrades" || upgBusyRef.current) return;
+      const todo = upgradeTargets.filter(e => {
+        const u = upgrades[e.id];
+        return !u || u.key !== upgradeKey(e) || (u.status === "done" && Date.now() - (u.at || 0) > 864e5);
+      });
+      if (!todo.length) return;
+      upgBusyRef.current = true;
+      (async () => {
+        for (const e of todo) {
+          setUpgrades(u => ({ ...u, [e.id]: { key: upgradeKey(e), status: "loading" } }));
+          let rec;
+          try { rec = { key: upgradeKey(e), status: "done", at: Date.now(), ...(await computeUpgrades(e)) }; }
+          catch (err) { rec = { key: upgradeKey(e), status: "error", error: err.message || String(err) }; }
+          setUpgrades(u => {
+            const n = { ...u, [e.id]: rec };
+            try {
+              const keep = Object.fromEntries(Object.entries(n).filter(([, v]) => v.status === "done"));
+              localStorage.setItem(LS_UPGRADES, JSON.stringify(keep));
+            } catch {}
+            return n;
+          });
+        }
+        upgBusyRef.current = false;
+        setUpgrades(u => ({ ...u }));   // re-run the effect for anything that changed meanwhile
+      })();
+    }, [phase, upgrades, upgAllDecks, library]);
 
     const loadEdhTop = async () => {
       const cmdr = selCmd.card.name;
@@ -9151,7 +9307,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       || (phase==="deck" && (fromCollection || !!previewingPrecon)),
                     onClick: navToCollection },
                   { label:`📚 Library${library.length > 0 ? " (" + library.length + ")" : ""}`,
-                    active: phase==="saved_list"
+                    active: phase==="saved_list" || phase==="upgrades"
                       || (phase === "deck" && fromSaved && !fromCollection),
                     onClick: () => setPhase("saved_list") },
                   { label:"⚙ Settings",    active: phase==="setup",
@@ -9202,6 +9358,31 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           : item.active ? "var(--header-active)" : "var(--header-muted)",
                         borderRadius:"4px 4px 0 0", padding:"6px 12px", fontSize:11,
                         fontFamily:"inherit", cursor: item.disabled ? "default" : "pointer",
+                        marginBottom:"-1px", transition:"all .15s",
+                      }}>
+                      ${item.label}
+                    </button>
+                  `)}
+                </div>
+              `}
+
+              <!-- Contextual sub-nav for Library: decks + upgrade shopping list. -->
+              ${(phase === "saved_list" || phase === "upgrades" || (phase === "deck" && fromSaved && !fromCollection)) && html`
+                <div style=${{
+                  display:"flex", gap:0, marginTop:6, paddingLeft:6, flexWrap:"wrap",
+                  borderTop:"1px solid var(--header-overlay)",
+                }}>
+                  ${[
+                    { label:"📚 Decks", active: phase==="saved_list" || phase==="deck", onClick: () => setPhase("saved_list") },
+                    { label:"🛒 Upgrades", active: phase==="upgrades", onClick: () => setPhase("upgrades") },
+                  ].map(item => html`
+                    <button key=${item.label} onClick=${item.onClick}
+                      style=${{
+                        background: item.active ? "rgba(0,0,0,0.18)" : "transparent",
+                        border:"none", borderBottom: item.active ? "2px solid var(--header-accent)" : "2px solid transparent",
+                        color: item.active ? "var(--header-active)" : "var(--header-muted)",
+                        borderRadius:"4px 4px 0 0", padding:"6px 12px", fontSize:11,
+                        fontFamily:"inherit", cursor:"pointer",
                         marginBottom:"-1px", transition:"all .15s",
                       }}>
                       ${item.label}
@@ -13231,6 +13412,95 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             </div>
             <!-- end deck flex wrapper -->
           `}
+
+          <!-- ── LIBRARY → UPGRADES (cards to buy) ──────────────────────── -->
+          ${phase === "upgrades" && (() => {
+            const money = it => it.eur != null ? `€${it.eur.toFixed(2)}` : it.usd != null ? `$${it.usd.toFixed(2)}` : "—";
+            const sortItems = items => [...items].sort(upgSort === "impact"
+              ? (a, b) => b.value - a.value
+              : (a, b) => (a.eur ?? a.usd ?? 1e9) - (b.eur ?? b.usd ?? 1e9));
+            const pill = (on) => ({ padding:"5px 11px", borderRadius:16, fontSize:12, fontFamily:"inherit", cursor:"pointer",
+              border:"1px solid " + (on ? "var(--accent)" : "var(--border-strong)"),
+              background: on ? "var(--accent)" : "var(--bg-surface)", color: on ? "var(--on-accent)" : "var(--fg-text-body)" });
+            return html`
+            <div style=${{ maxWidth:1000, margin:"0 auto" }}>
+              <h2 style=${{ fontSize:18, color:"var(--fg-text-heading)", margin:"0 0 4px" }}>🛒 Upgrades</h2>
+              <p style=${{ fontSize:13, color:"var(--fg-text-soft)", margin:"0 0 14px", lineHeight:1.6 }}>
+                Up to 10 cards per deck that you don't own yet: combo pieces the deck is one card away from (as its combo setting allows),
+                cards EDHRec players run with the commander, and cards that fill a role the deck is short on. The deck's bracket is respected.
+                Prices are Cardmarket trend (€, via Scryfall) for the usual printing.
+              </p>
+              <div style=${{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center", marginBottom:18 }}>
+                <span style=${{ fontSize:12, color:"var(--fg-text-soft)" }}>Sort:</span>
+                <button onClick=${() => setUpgSort("price")} style=${pill(upgSort === "price")}>Cheapest first</button>
+                <button onClick=${() => setUpgSort("impact")} style=${pill(upgSort === "impact")}>Biggest impact first</button>
+                <span style=${{ width:12 }}></span>
+                <label style=${{ fontSize:12, color:"var(--fg-text-body)", display:"flex", gap:6, alignItems:"center", cursor:"pointer" }}>
+                  <input type="checkbox" checked=${upgAllDecks} onChange=${e => setUpgAllDecks(e.target.checked)} />
+                  Include decks that aren't built yet
+                </label>
+              </div>
+              ${upgradeTargets.length === 0 && html`
+                <div class="card" style=${{ fontSize:13, color:"var(--fg-text-body)" }}>
+                  No ${upgAllDecks ? "" : "built "}decks in your Library yet. Mark a deck with "📦 I built this deck"${upgAllDecks ? "" : ", or tick the box above to include unbuilt decks"}.
+                </div>`}
+              ${upgradeTargets.map(e => {
+                const u = upgrades[e.id];
+                const items = u?.status === "done" ? sortItems(u.items || []) : [];
+                const total = items.reduce((t, it) => t + (it.eur ?? it.usd ?? 0), 0);
+                const title = e.deck?.theme || e.selCmd.card.name;
+                const sf = e.selCmd.card.scryfall || {};
+                return html`
+                  <div key=${e.id} class="card" style=${{ marginBottom:16, padding:"14px 16px" }}>
+                    <div style=${{ display:"flex", gap:12, alignItems:"center", marginBottom:10, flexWrap:"wrap" }}>
+                      <${CmdrImage} sf=${sf} width=${44} small=${true} style=${{ borderRadius:5 }} />
+                      <div style=${{ flex:1, minWidth:180 }}>
+                        <div style=${{ fontSize:15, fontWeight:700, color:"var(--fg-text-heading)" }}>${title}
+                          ${e.built && html`<span style=${{ marginLeft:8, fontSize:9, fontWeight:700, padding:"1px 7px", borderRadius:10, background:"var(--warning-bg)", color:"var(--accent-dark)", verticalAlign:"middle" }}>📦 BUILT</span>`}</div>
+                        <div style=${{ fontSize:12, color:"var(--fg-text-soft)" }}>👑 ${e.selCmd.card.name}${e.deck?.buildPrefs?.bracket ? ` · bracket ${e.deck.buildPrefs.bracket}` : ""}</div>
+                      </div>
+                      ${u?.status === "done" && items.length > 0 && html`
+                        <span style=${{ fontSize:13, color:"var(--fg-text-body)" }}>${items.length} card${items.length === 1 ? "" : "s"} · <strong>≈ €${total.toFixed(2)}</strong></span>
+                        <button onClick=${async () => {
+                            try { await navigator.clipboard.writeText(items.map(it => `1 ${it.name}`).join("\n")); setUpgCopied(e.id); setTimeout(() => setUpgCopied(c => c === e.id ? null : c), 2000); }
+                            catch { appAlert({ title: "Couldn't copy", body: items.map(it => `1 ${it.name}`).join("\n") }); }
+                          }}
+                          title="Copy as '1 Card Name' lines — paste into a Cardmarket wants list or any store's deck import"
+                          style=${{ ...btnSec, padding:"5px 12px", fontSize:11 }}>${upgCopied === e.id ? "✓ Copied" : "📋 Copy list"}</button>`}
+                      <button onClick=${() => loadFromLibrary(e)} style=${{ ...btnSec, padding:"5px 12px", fontSize:11 }}>Open deck →</button>
+                      ${u && u.status !== "loading" && html`<button onClick=${() => refreshUpgrades(e.id)} title="Look again (EDHRec + prices)"
+                        style=${{ ...btnSec, padding:"5px 10px", fontSize:11 }}>↻</button>`}
+                    </div>
+                    ${(!u || u.status === "loading") && html`<div style=${{ fontSize:12, color:"var(--fg-text-muted)" }}><span class="spin">⚙️</span> Looking up EDHRec, combos and prices…</div>`}
+                    ${u?.status === "error" && html`<div style=${{ fontSize:12, color:"var(--danger-text)" }}>Couldn't find upgrades: ${u.error}</div>`}
+                    ${u?.status === "done" && !items.length && html`<div style=${{ fontSize:12, color:"var(--fg-text-muted)" }}>${u.note || "No upgrades found."}</div>`}
+                    ${items.length > 0 && html`
+                      <div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
+                        ${items.map(it => html`
+                          <div key=${it.name} style=${{ display:"flex", gap:10, alignItems:"flex-start", padding:"7px 8px", borderRadius:8,
+                            background: it.kind === "combo" ? "var(--warning-bg)" : "var(--bg-surface-soft)", border:"1px solid var(--border-soft)" }}>
+                            ${it.img && html`<img src=${it.img} alt="" style=${{ width:34, borderRadius:3, flexShrink:0 }} />`}
+                            <div style=${{ flex:1, minWidth:0, fontSize:12, lineHeight:1.5 }}>
+                              <div style=${{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap" }}>
+                                <a href=${it.uri || `https://scryfall.com/search?q=${encodeURIComponent(`!"${it.name}"`)}`} target="_blank" rel="noopener"
+                                  style=${{ fontWeight:700, color:"var(--fg-text-heading)", textDecoration:"none" }}>${it.name}</a>
+                                <${ManaCost} cost=${(it.mana_cost || "").split("//")[0].trim()} size=${13} />
+                                ${it.gc && html`<span title="Game Changer — counts towards the bracket 3 limit of 3" style=${{ fontSize:9, fontWeight:700, color:"var(--warning)" }}>GAME CHANGER</span>`}
+                              </div>
+                              <div style=${{ color:"var(--fg-text-body)" }}>${it.reasons.join(" · ")}</div>
+                              <div style=${{ color:"var(--fg-text-muted)", fontSize:11 }}>${it.cut ? html`would replace <strong>${it.cut}</strong>` : "an addition — no obvious card to cut"}</div>
+                            </div>
+                            <div style=${{ textAlign:"right", flexShrink:0 }}>
+                              <div style=${{ fontWeight:700, fontSize:13, color:"var(--fg-text-heading)" }}>${money(it)}</div>
+                              <a href=${`https://www.cardmarket.com/en/Magic/Products/Search?searchString=${encodeURIComponent(it.name.split(" // ")[0])}`}
+                                target="_blank" rel="noopener" style=${{ fontSize:10, color:"var(--info)" }}>Cardmarket ↗</a>
+                            </div>
+                          </div>`)}
+                      </div>`}
+                  </div>`;
+              })}
+            </div>`;
+          })()}
 
           <!-- ── SAVED LIBRARY ────────────────────────────────────────── -->
           ${phase === "saved_list" && (() => {
