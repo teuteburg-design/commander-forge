@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.14-b";
+  const APP_VERSION = "v2026.10.14-c";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -4280,6 +4280,13 @@
     const [usable,   setUsable]   = useState([]);
     const [enriched, setEnriched] = useState([]);
     const [cmdrs,    setCmdrs]    = useState([]);   // enriched commander objects
+    // Commanders still free to build with: the cached list (from "Load
+    // Commanders") filtered by the current pool, so commanders and legendary
+    // creatures claimed by built decks — or in excluded sources — drop out
+    // without a reload.
+    const usableNames = new Set((usable || []).map(c => normCardName(c.name)));
+    const availCmdrs  = cmdrs.filter(c => usableNames.has(normCardName(c.name)));
+    const hiddenCmdrs = cmdrs.length - availCmdrs.length;
     const [cands,    setCands]    = useState([]);   // AI top-3
     const [pickedIdx,setPickedIdx]= useState(null); // which AI suggestion is highlighted
     const [suggestUses,  setSuggestUses]  = useState(0);      // how many times AI Suggest was clicked
@@ -5214,13 +5221,13 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
       setSuggestUses(n => n + 1);
       try {
         const anyFilter = colorFilter.length > 0 || colorless;
-        const filtered = anyFilter ? cmdrs.filter(c => {
+        const filtered = anyFilter ? availCmdrs.filter(c => {
           const ci = c.scryfall?.color_identity || [];
           if (colorless && ci.length === 0) return true;
           if (colorFilter.length === 0) return false;
           if (colorMode === "at_least") return colorFilter.every(col => ci.includes(col));
           return ci.length === colorFilter.length && colorFilter.every(col => ci.includes(col));
-        }) : cmdrs;
+        }) : availCmdrs;
 
         addLog(`👑 ${filtered.length} commanders${anyFilter ? " match colour filter" : ""}.`);
         if (!filtered.length) throw new Error("No commanders match your filter. Try broader settings.");
@@ -5285,7 +5292,7 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
         addLog(`✅ ${withCards.length} suggestions — pick your favourite!`);
         setPhase("pick");
       } catch(e) { setError(e.message); setPhase("error"); }
-    }, [cmdrs, apiKeys, provider, models, colorFilter, colorMode, colorless, bracket, archetypes, budget]);
+    }, [cmdrs, usable, apiKeys, provider, models, colorFilter, colorMode, colorless, bracket, archetypes, budget]);
 
     const buildDeck = useCallback(async chosenCmd => {
       setSelCmd(chosenCmd); setPhase("building"); setLog([]); setProg(0);
@@ -5294,12 +5301,23 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
       setFromCollection(false); setDeckSvd(false); setArchResult(null); setLibEntryId(null);
       addLog(`⚒️ Building deck for ${chosenCmd.name}…`);
       try {
-        let allCards = enriched;
-        if (!allCards.length) {
-          addLog("🔍 Loading full card data from Scryfall…");
-          allCards = await fetchAllScryfall(usable, p => setProg(Math.round(p * 0.35)), addLog);
-          setEnriched(allCards);
+        // Card data comes from "Load Commanders", but the pool may have
+        // changed since (decks built or released, sources toggled): keep
+        // only cards still in the pool, with the pool's current quantities,
+        // and fetch any that weren't loaded yet (Scryfall cache first).
+        const poolByName = new Map((usable || []).map(c => [normCardName(c.name), c]));
+        let allCards = enriched.filter(c => poolByName.has(normCardName(c.name)))
+          .map(c => ({ ...c, qty: poolByName.get(normCardName(c.name)).qty }));
+        const have = new Set(allCards.map(c => normCardName(c.name)));
+        const missingCards = (usable || []).filter(c => !have.has(normCardName(c.name)));
+        if (missingCards.length) {
+          addLog(`🔍 Loading card data for ${missingCards.length} card(s) from Scryfall…`);
+          const more = await fetchAllScryfall(missingCards, p => setProg(Math.round(p * 0.35)), addLog);
+          allCards = [...allCards, ...more];
+          setEnriched(prev => [...prev.filter(c => !more.some(m => normCardName(m.name) === normCardName(c.name))), ...more]);
         }
+        const leftOut = enriched.length - enriched.filter(c => poolByName.has(normCardName(c.name))).length;
+        if (leftOut > 0) addLog(`📦 ${leftOut} card(s) aren't in the pool right now (used by built decks or in excluded sources) — left out.`);
         setProg(35);
         const ci = chosenCmd.card?.scryfall?.color_identity || [];
         const beforeFilter = allCards.length;
@@ -8957,7 +8975,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     <div>
                       ${phase === "select"
                         ? html`<span style=${{ color:"var(--header-accent)" }}>pending — confirm to update</span>`
-                        : html`${cmdrs.length} commanders`}
+                        : html`${availCmdrs.length} commanders`}
                     </div>
                   `;
                 }
@@ -9039,7 +9057,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     { label:"🎯 Build a new deck",
                       active: phase==="ready" && activeTab==="build",
                       onClick: () => { setPhase("ready"); setTab("build"); } },
-                    { label:`👑 Commanders${cmdrs.length ? ` (${cmdrs.length})` : ""}`,
+                    { label:`👑 Commanders${availCmdrs.length ? ` (${availCmdrs.length})` : ""}`,
                       active: phase==="ready" && activeTab==="commanders",
                       onClick: () => { setPhase("ready"); setTab("commanders"); },
                       disabled: cmdrs.length === 0 },
@@ -11365,7 +11383,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       <div style=${{ fontSize:14, color:"var(--fg-text)" }}>
                         <strong>${usable.reduce((s,c)=>s+(c.qty||1),0)}</strong> cards
                         <span style=${{ color:"var(--fg-text-muted)", fontWeight:400 }}>(${usable.length} unique)</span> ·
-                        <strong>${cmdrs.length}</strong> possible commanders
+                        <strong>${availCmdrs.length}</strong> possible commanders${hiddenCmdrs > 0 ? html`
+                        <span style=${{ color:"var(--fg-text-muted)", fontWeight:400 }}> (${hiddenCmdrs} more in built decks or excluded sources)</span>` : ""}
                       </div>
                       <button onClick=${() => loadCommanders(usable)}
                         style=${{ ...btnSec, fontSize:12, padding:"6px 14px" }}>
@@ -11436,10 +11455,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
                   <div style=${{ textAlign:"center" }}>
                     <button onClick=${analyze}
-                      disabled=${cmdrs.length === 0 || suggestUses >= 20}
+                      disabled=${availCmdrs.length === 0 || suggestUses >= 20}
                       style=${{ ...btn, padding:"13px 34px", fontSize:15,
-                        opacity: (cmdrs.length === 0 || suggestUses >= 20) ? 0.45 : 1,
-                        cursor: (cmdrs.length === 0 || suggestUses >= 20) ? "not-allowed" : "pointer" }}>
+                        opacity: (availCmdrs.length === 0 || suggestUses >= 20) ? 0.45 : 1,
+                        cursor: (availCmdrs.length === 0 || suggestUses >= 20) ? "not-allowed" : "pointer" }}>
                       ⚔️ AI Suggest Commanders
                       <span style=${{ fontSize:11, opacity:0.75, marginLeft:6 }}>(${suggestUses}/20)</span>
                     </button>
@@ -11461,13 +11480,13 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               ${activeTab === "commanders" && (() => {
                 const anyFilter = colorFilter.length > 0 || colorless;
                 const q = (cmdrQuery || "").trim().toLowerCase();
-                const colorFiltered = anyFilter ? cmdrs.filter(c => {
+                const colorFiltered = anyFilter ? availCmdrs.filter(c => {
                   const ci = c.scryfall?.color_identity || [];
                   if (colorless && ci.length === 0) return true;
                   if (colorFilter.length === 0) return false;
                   if (colorMode === "at_least") return colorFilter.every(col => ci.includes(col));
                   return ci.length === colorFilter.length && colorFilter.every(col => ci.includes(col));
-                }) : cmdrs;
+                }) : availCmdrs;
                 const filtered = q
                   ? colorFiltered.filter(c => (c.name || "").toLowerCase().includes(q))
                   : colorFiltered;
@@ -11555,7 +11574,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     </div>
 
                     <p style=${{ fontSize:13, color:"var(--fg-text-body)", marginBottom:16 }}>
-                      Showing <strong>${filtered.length}</strong> of ${cmdrs.length} possible commanders${anyActiveFilter ? " (filtered)" : ""}.
+                      Showing <strong>${filtered.length}</strong> of ${availCmdrs.length} possible commanders${anyActiveFilter ? " (filtered)" : ""}${hiddenCmdrs > 0 ? ` — ${hiddenCmdrs} more are in built decks or excluded sources` : ""}.
                       Click any to build a deck directly.
                     </p>
 
