@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.15-b";
+  const APP_VERSION = "v2026.10.15-c";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -6353,7 +6353,10 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     const [upgAllDecks, setUpgAllDecks] = useState(false);    // include unbuilt Library decks
     const [upgCopied, setUpgCopied] = useState(null);
     const upgBusyRef = useRef(false);
-    const upgradeKey = e => deckFingerprint(e.selCmd?.card?.name, e.deck) || String(e.id);
+    const upgradeKey = e => "v2|" + (deckFingerprint(e.selCmd?.card?.name, e.deck) || String(e.id));
+    const [upgView, setUpgView] = useState("all");          // "all" cards across decks | "deck" per deck
+    const [upgOpen, setUpgOpen] = useState({});             // per-deck view: expanded decks
+    const [upgFilter, setUpgFilter] = useState([]);         // all-cards view: combo / gc / synergy / staple / gap
 
     const computeUpgrades = async (e) => {
       const sel = e.selCmd, d = e.deck || {};
@@ -6395,6 +6398,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             const v = (x.pct || 0) + (x.synergy || 0) / 2;
             if (v < 0.2) continue;
             add(x.name, v, `in ${Math.round((x.pct || 0) * 100)}% of ${cmdrShort} decks${(x.synergy || 0) > 0.15 ? ` · synergy +${Math.round(x.synergy * 100)}%` : ""}`, "edh");
+            const c = cands.get(normCardName(x.name));
+            if (c) { c.pct = x.pct || 0; c.syn = x.synergy || 0; }
           }
         }
       } catch {}
@@ -6414,7 +6419,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         if (isGameChanger(c.name) && (bracketN <= 2 || deckGC >= 3)) continue;
         if (bracketN <= 3 && isMassLandDenial(sf)) continue;
         const fills = short.filter(x => x.r.test(sf));
-        if (fills.length) { c.value += 0.3 * fills.length; c.reasons.push(`fills ${fills.map(x => `${x.r.label} (${x.have}/${x.r.target})`).join(", ")}`); }
+        if (fills.length) { c.value += 0.3 * fills.length; c.gap = true; c.reasons.push(`fills ${fills.map(x => `${x.r.label} (${x.have}/${x.r.target})`).join(", ")}`); }
         items.push({ ...c, sf, eur: p.eur, usd: p.usd, uri: p.uri, role: cardRole(sf),
           mana_cost: sf.mana_cost || sf.card_faces?.[0]?.mana_cost || "", gc: isGameChanger(c.name) });
       }
@@ -13415,13 +13420,76 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
           <!-- ── LIBRARY → UPGRADES (cards to buy) ──────────────────────── -->
           ${phase === "upgrades" && (() => {
+            const price = it => it.eur ?? it.usd ?? null;
             const money = it => it.eur != null ? `€${it.eur.toFixed(2)}` : it.usd != null ? `$${it.usd.toFixed(2)}` : "—";
             const sortItems = items => [...items].sort(upgSort === "impact"
               ? (a, b) => b.value - a.value
-              : (a, b) => (a.eur ?? a.usd ?? 1e9) - (b.eur ?? b.usd ?? 1e9));
+              : (a, b) => (price(a) ?? 1e9) - (price(b) ?? 1e9));
             const pill = (on) => ({ padding:"5px 11px", borderRadius:16, fontSize:12, fontFamily:"inherit", cursor:"pointer",
               border:"1px solid " + (on ? "var(--accent)" : "var(--border-strong)"),
               background: on ? "var(--accent)" : "var(--bg-surface)", color: on ? "var(--on-accent)" : "var(--fg-text-body)" });
+            const tags = it => [
+              (it.kind === "combo") && "combo",
+              it.gc && "gc",
+              (it.syn || 0) >= 0.3 && "synergy",
+              (it.pct || 0) >= 0.5 && "staple",
+              it.gap && "gap",
+            ].filter(Boolean);
+            const FILTERS = [
+              { id: "combo",   label: "💥 Combo piece" },
+              { id: "gc",      label: "⚡ Game Changer" },
+              { id: "synergy", label: "✨ High synergy" },
+              { id: "staple",  label: "📈 Staple (in 50%+ of decks)" },
+              { id: "gap",     label: "🧩 Fills a gap" },
+            ];
+            const copyBtn = (id, items) => html`
+              <button onClick=${async () => {
+                  const text = items.map(it => `1 ${it.name}`).join("\n");
+                  try { await navigator.clipboard.writeText(text); setUpgCopied(id); setTimeout(() => setUpgCopied(c => c === id ? null : c), 2000); }
+                  catch { appAlert({ title: "Couldn't copy", body: text }); }
+                }}
+                title="Copy as '1 Card Name' lines — paste into a Cardmarket wants list or any store's deck import"
+                style=${{ ...btnSec, padding:"5px 12px", fontSize:11 }}>${upgCopied === id ? "✓ Copied" : "📋 Copy list"}</button>`;
+            const cardRow = (it, extra) => html`
+              <div key=${it.name} style=${{ display:"flex", gap:10, alignItems:"flex-start", padding:"7px 8px", borderRadius:8,
+                background: it.kind === "combo" ? "var(--warning-bg)" : "var(--bg-surface-soft)", border:"1px solid var(--border-soft)" }}>
+                ${it.img && html`<img src=${it.img} alt="" style=${{ width:34, borderRadius:3, flexShrink:0 }} />`}
+                <div style=${{ flex:1, minWidth:0, fontSize:12, lineHeight:1.5 }}>
+                  <div style=${{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap" }}>
+                    <a href=${it.uri || `https://scryfall.com/search?q=${encodeURIComponent(`!"${it.name}"`)}`} target="_blank" rel="noopener"
+                      style=${{ fontWeight:700, color:"var(--fg-text-heading)", textDecoration:"none" }}>${it.name}</a>
+                    <${ManaCost} cost=${(it.mana_cost || "").split("//")[0].trim()} size=${13} />
+                    ${it.gc && html`<span title="Game Changer — counts towards the bracket 3 limit of 3" style=${{ fontSize:9, fontWeight:700, color:"var(--warning)" }}>GAME CHANGER</span>`}
+                  </div>
+                  ${extra}
+                </div>
+                <div style=${{ textAlign:"right", flexShrink:0 }}>
+                  <div style=${{ fontWeight:700, fontSize:13, color:"var(--fg-text-heading)" }}>${money(it)}</div>
+                  <a href=${`https://www.cardmarket.com/en/Magic/Products/Search?searchString=${encodeURIComponent(it.name.split(" // ")[0])}`}
+                    target="_blank" rel="noopener" style=${{ fontSize:10, color:"var(--info)" }}>Cardmarket ↗</a>
+                </div>
+              </div>`;
+            const loading = upgradeTargets.filter(e => !upgrades[e.id] || upgrades[e.id].status === "loading").length;
+
+            // All-cards view: one row per card, listing every deck it would improve.
+            const merged = new Map();
+            for (const e of upgradeTargets) {
+              const u = upgrades[e.id];
+              if (u?.status !== "done") continue;
+              for (const it of u.items || []) {
+                const k = normCardName(it.name);
+                const m = merged.get(k) || { ...it, decks: [], value: 0, gap: false, kind: it.kind };
+                m.decks.push({ id: e.id, title: e.deck?.theme || e.selCmd.card.name, reasons: it.reasons, cut: it.cut, entry: e });
+                m.value = Math.max(m.value, it.value) + (m.decks.length > 1 ? 0.2 : 0);
+                m.gap = m.gap || it.gap; m.pct = Math.max(m.pct || 0, it.pct || 0); m.syn = Math.max(m.syn || 0, it.syn || 0);
+                if (it.kind === "combo") m.kind = "combo";
+                merged.set(k, m);
+              }
+            }
+            const allItems = sortItems([...merged.values()].filter(it => !upgFilter.length || tags(it).some(t => upgFilter.includes(t))));
+            const allTotal = allItems.reduce((t, it) => t + (price(it) ?? 0), 0);
+            const counts = Object.fromEntries(FILTERS.map(f => [f.id, [...merged.values()].filter(it => tags(it).includes(f.id)).length]));
+
             return html`
             <div style=${{ maxWidth:1000, margin:"0 auto" }}>
               <h2 style=${{ fontSize:18, color:"var(--fg-text-heading)", margin:"0 0 4px" }}>🛒 Upgrades</h2>
@@ -13430,72 +13498,88 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 cards EDHRec players run with the commander, and cards that fill a role the deck is short on. The deck's bracket is respected.
                 Prices are Cardmarket trend (€, via Scryfall) for the usual printing.
               </p>
-              <div style=${{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center", marginBottom:18 }}>
+              <div style=${{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center", marginBottom:12 }}>
+                <button onClick=${() => setUpgView("all")} style=${pill(upgView === "all")}>🗂 All cards</button>
+                <button onClick=${() => setUpgView("deck")} style=${pill(upgView === "deck")}>📚 Per deck</button>
+                <span style=${{ width:10 }}></span>
                 <span style=${{ fontSize:12, color:"var(--fg-text-soft)" }}>Sort:</span>
                 <button onClick=${() => setUpgSort("price")} style=${pill(upgSort === "price")}>Cheapest first</button>
                 <button onClick=${() => setUpgSort("impact")} style=${pill(upgSort === "impact")}>Biggest impact first</button>
-                <span style=${{ width:12 }}></span>
+                <span style=${{ width:10 }}></span>
                 <label style=${{ fontSize:12, color:"var(--fg-text-body)", display:"flex", gap:6, alignItems:"center", cursor:"pointer" }}>
                   <input type="checkbox" checked=${upgAllDecks} onChange=${e => setUpgAllDecks(e.target.checked)} />
                   Include decks that aren't built yet
                 </label>
               </div>
+              ${loading > 0 && html`<div style=${{ fontSize:12, color:"var(--fg-text-muted)", marginBottom:12 }}><span class="spin">⚙️</span> Looking up EDHRec, combos and prices for ${loading} deck${loading === 1 ? "" : "s"}…</div>`}
               ${upgradeTargets.length === 0 && html`
                 <div class="card" style=${{ fontSize:13, color:"var(--fg-text-body)" }}>
                   No ${upgAllDecks ? "" : "built "}decks in your Library yet. Mark a deck with "📦 I built this deck"${upgAllDecks ? "" : ", or tick the box above to include unbuilt decks"}.
                 </div>`}
-              ${upgradeTargets.map(e => {
+
+              ${upgView === "all" && upgradeTargets.length > 0 && html`
+                <div class="card" style=${{ padding:"14px 16px" }}>
+                  <div style=${{ display:"flex", gap:6, flexWrap:"wrap", alignItems:"center", marginBottom:12 }}>
+                    <span style=${{ fontSize:12, color:"var(--fg-text-soft)" }}>Show:</span>
+                    <button onClick=${() => setUpgFilter([])} style=${pill(!upgFilter.length)}>All</button>
+                    ${FILTERS.map(f => html`<button key=${f.id} disabled=${!counts[f.id]}
+                      onClick=${() => setUpgFilter(fs => fs.includes(f.id) ? fs.filter(x => x !== f.id) : [...fs, f.id])}
+                      style=${{ ...pill(upgFilter.includes(f.id)), opacity: counts[f.id] ? 1 : 0.45, cursor: counts[f.id] ? "pointer" : "default" }}>${f.label} · ${counts[f.id]}</button>`)}
+                  </div>
+                  <div style=${{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap", marginBottom:10 }}>
+                    <span style=${{ fontSize:13, color:"var(--fg-text-body)" }}>${allItems.length} card${allItems.length === 1 ? "" : "s"} · <strong>≈ €${allTotal.toFixed(2)}</strong></span>
+                    ${allItems.length > 0 && copyBtn("all", allItems)}
+                  </div>
+                  <div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
+                    ${allItems.map(it => cardRow(it, html`
+                      ${it.decks.map(dk => html`<div key=${dk.id} style=${{ color:"var(--fg-text-body)" }}>
+                        <button onClick=${() => loadFromLibrary(dk.entry)} title="Open this deck"
+                          style=${{ all:"unset", cursor:"pointer", fontWeight:700, color:"var(--accent-dark)" }}>${dk.title}</button>:
+                        ${" "}${dk.reasons.join(" · ")}${dk.cut ? html` <span style=${{ color:"var(--fg-text-muted)" }}>— would replace <strong>${dk.cut}</strong></span>` : ""}
+                      </div>`)}`))}
+                    ${!allItems.length && !loading && html`<div style=${{ fontSize:12, color:"var(--fg-text-muted)" }}>No cards match these filters.</div>`}
+                  </div>
+                </div>`}
+
+              ${upgView === "deck" && upgradeTargets.map(e => {
                 const u = upgrades[e.id];
                 const items = u?.status === "done" ? sortItems(u.items || []) : [];
-                const total = items.reduce((t, it) => t + (it.eur ?? it.usd ?? 0), 0);
+                const total = items.reduce((t, it) => t + (price(it) ?? 0), 0);
                 const title = e.deck?.theme || e.selCmd.card.name;
                 const sf = e.selCmd.card.scryfall || {};
+                const open = !!upgOpen[e.id];
                 return html`
-                  <div key=${e.id} class="card" style=${{ marginBottom:16, padding:"14px 16px" }}>
-                    <div style=${{ display:"flex", gap:12, alignItems:"center", marginBottom:10, flexWrap:"wrap" }}>
-                      <${CmdrImage} sf=${sf} width=${44} small=${true} style=${{ borderRadius:5 }} />
-                      <div style=${{ flex:1, minWidth:180 }}>
-                        <div style=${{ fontSize:15, fontWeight:700, color:"var(--fg-text-heading)" }}>${title}
-                          ${e.built && html`<span style=${{ marginLeft:8, fontSize:9, fontWeight:700, padding:"1px 7px", borderRadius:10, background:"var(--warning-bg)", color:"var(--accent-dark)", verticalAlign:"middle" }}>📦 BUILT</span>`}</div>
-                        <div style=${{ fontSize:12, color:"var(--fg-text-soft)" }}>👑 ${e.selCmd.card.name}${e.deck?.buildPrefs?.bracket ? ` · bracket ${e.deck.buildPrefs.bracket}` : ""}</div>
-                      </div>
-                      ${u?.status === "done" && items.length > 0 && html`
-                        <span style=${{ fontSize:13, color:"var(--fg-text-body)" }}>${items.length} card${items.length === 1 ? "" : "s"} · <strong>≈ €${total.toFixed(2)}</strong></span>
-                        <button onClick=${async () => {
-                            try { await navigator.clipboard.writeText(items.map(it => `1 ${it.name}`).join("\n")); setUpgCopied(e.id); setTimeout(() => setUpgCopied(c => c === e.id ? null : c), 2000); }
-                            catch { appAlert({ title: "Couldn't copy", body: items.map(it => `1 ${it.name}`).join("\n") }); }
-                          }}
-                          title="Copy as '1 Card Name' lines — paste into a Cardmarket wants list or any store's deck import"
-                          style=${{ ...btnSec, padding:"5px 12px", fontSize:11 }}>${upgCopied === e.id ? "✓ Copied" : "📋 Copy list"}</button>`}
+                  <div key=${e.id} class="card" style=${{ marginBottom:12, padding:"12px 16px" }}>
+                    <div style=${{ display:"flex", gap:12, alignItems:"center", flexWrap:"wrap" }}>
+                      <button onClick=${() => setUpgOpen(o => ({ ...o, [e.id]: !o[e.id] }))} aria-expanded=${open}
+                        style=${{ all:"unset", cursor:"pointer", display:"flex", gap:12, alignItems:"center", flex:1, minWidth:200 }}>
+                        <span style=${{ color:"var(--accent-dark)" }}>${open ? "▾" : "▸"}</span>
+                        <${CmdrImage} sf=${sf} width=${40} small=${true} style=${{ borderRadius:5 }} />
+                        <span style=${{ minWidth:0 }}>
+                          <span style=${{ display:"block", fontSize:15, fontWeight:700, color:"var(--fg-text-heading)" }}>${title}
+                            ${e.built && html`<span style=${{ marginLeft:8, fontSize:9, fontWeight:700, padding:"1px 7px", borderRadius:10, background:"var(--warning-bg)", color:"var(--accent-dark)", verticalAlign:"middle" }}>📦 BUILT</span>`}</span>
+                          <span style=${{ display:"block", fontSize:12, color:"var(--fg-text-soft)" }}>👑 ${e.selCmd.card.name}${e.deck?.buildPrefs?.bracket ? ` · bracket ${e.deck.buildPrefs.bracket}` : ""}</span>
+                        </span>
+                      </button>
+                      ${(!u || u.status === "loading") && html`<span style=${{ fontSize:12, color:"var(--fg-text-muted)" }}><span class="spin">⚙️</span> looking up…</span>`}
+                      ${u?.status === "done" && html`<span style=${{ fontSize:13, color:"var(--fg-text-body)" }}>${items.length
+                        ? html`${items.length} card${items.length === 1 ? "" : "s"}${items.some(it => it.kind === "combo") ? " · 💥 combo" : ""} · <strong>≈ €${total.toFixed(2)}</strong>`
+                        : "nothing to buy"}</span>`}
+                      ${u?.status === "error" && html`<span style=${{ fontSize:12, color:"var(--danger-text)" }}>couldn't load</span>`}
+                      ${items.length > 0 && copyBtn(e.id, items)}
                       <button onClick=${() => loadFromLibrary(e)} style=${{ ...btnSec, padding:"5px 12px", fontSize:11 }}>Open deck →</button>
                       ${u && u.status !== "loading" && html`<button onClick=${() => refreshUpgrades(e.id)} title="Look again (EDHRec + prices)"
                         style=${{ ...btnSec, padding:"5px 10px", fontSize:11 }}>↻</button>`}
                     </div>
-                    ${(!u || u.status === "loading") && html`<div style=${{ fontSize:12, color:"var(--fg-text-muted)" }}><span class="spin">⚙️</span> Looking up EDHRec, combos and prices…</div>`}
-                    ${u?.status === "error" && html`<div style=${{ fontSize:12, color:"var(--danger-text)" }}>Couldn't find upgrades: ${u.error}</div>`}
-                    ${u?.status === "done" && !items.length && html`<div style=${{ fontSize:12, color:"var(--fg-text-muted)" }}>${u.note || "No upgrades found."}</div>`}
-                    ${items.length > 0 && html`
-                      <div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
-                        ${items.map(it => html`
-                          <div key=${it.name} style=${{ display:"flex", gap:10, alignItems:"flex-start", padding:"7px 8px", borderRadius:8,
-                            background: it.kind === "combo" ? "var(--warning-bg)" : "var(--bg-surface-soft)", border:"1px solid var(--border-soft)" }}>
-                            ${it.img && html`<img src=${it.img} alt="" style=${{ width:34, borderRadius:3, flexShrink:0 }} />`}
-                            <div style=${{ flex:1, minWidth:0, fontSize:12, lineHeight:1.5 }}>
-                              <div style=${{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap" }}>
-                                <a href=${it.uri || `https://scryfall.com/search?q=${encodeURIComponent(`!"${it.name}"`)}`} target="_blank" rel="noopener"
-                                  style=${{ fontWeight:700, color:"var(--fg-text-heading)", textDecoration:"none" }}>${it.name}</a>
-                                <${ManaCost} cost=${(it.mana_cost || "").split("//")[0].trim()} size=${13} />
-                                ${it.gc && html`<span title="Game Changer — counts towards the bracket 3 limit of 3" style=${{ fontSize:9, fontWeight:700, color:"var(--warning)" }}>GAME CHANGER</span>`}
-                              </div>
-                              <div style=${{ color:"var(--fg-text-body)" }}>${it.reasons.join(" · ")}</div>
-                              <div style=${{ color:"var(--fg-text-muted)", fontSize:11 }}>${it.cut ? html`would replace <strong>${it.cut}</strong>` : "an addition — no obvious card to cut"}</div>
-                            </div>
-                            <div style=${{ textAlign:"right", flexShrink:0 }}>
-                              <div style=${{ fontWeight:700, fontSize:13, color:"var(--fg-text-heading)" }}>${money(it)}</div>
-                              <a href=${`https://www.cardmarket.com/en/Magic/Products/Search?searchString=${encodeURIComponent(it.name.split(" // ")[0])}`}
-                                target="_blank" rel="noopener" style=${{ fontSize:10, color:"var(--info)" }}>Cardmarket ↗</a>
-                            </div>
-                          </div>`)}
+                    ${open && html`
+                      <div style=${{ marginTop:10 }}>
+                        ${u?.status === "error" && html`<div style=${{ fontSize:12, color:"var(--danger-text)" }}>Couldn't find upgrades: ${u.error}</div>`}
+                        ${u?.status === "done" && !items.length && html`<div style=${{ fontSize:12, color:"var(--fg-text-muted)" }}>${u.note || "No upgrades found."}</div>`}
+                        <div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
+                          ${items.map(it => cardRow(it, html`
+                            <div style=${{ color:"var(--fg-text-body)" }}>${it.reasons.join(" · ")}</div>
+                            <div style=${{ color:"var(--fg-text-muted)", fontSize:11 }}>${it.cut ? html`would replace <strong>${it.cut}</strong>` : "an addition — no obvious card to cut"}</div>`))}
+                        </div>
                       </div>`}
                   </div>`;
               })}
