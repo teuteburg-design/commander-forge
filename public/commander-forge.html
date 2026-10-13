@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.15-c";
+  const APP_VERSION = "v2026.10.16-a";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -346,6 +346,7 @@
   const LS_USE_SHARED = "cmdr_forge_use_shared_gemini"; // "1" = route Gemini calls through host's key
   const LS_THEME      = "cmdr_forge_theme";
   const LS_PICKLISTS  = "cmdr_forge_picklists";    // { [commander name]: { checked: [card names], updatedAt } }
+  const LS_NEW_CARDS  = "cmdr_forge_new_cards";    // { at, cards: [{ name, n }], seen? } — what the last collection import added
   const LS_SYNC_BASE  = "cmdr_forge_sync_base";    // { lastModified, hashes } of the last state known to match the cloud
 
   const THEMES = [
@@ -379,6 +380,7 @@
     LS_ARCH_TOKEN,
     LS_USE_SHARED,
     LS_PICKLISTS,   // tick cards off on the phone at the drawers, see it on desktop
+    LS_NEW_CARDS,   // "your import added N cards" notice in the Library, on every device
   ];
   // fetch keepalive bodies are capped at 64 KiB in browsers; bigger pushes
   // must go out as normal requests.
@@ -4825,6 +4827,7 @@
           lsSetItemSafe(LS_COMMANDERS, JSON.stringify({ fp: c.fp, commanders: cleaned }));
         }
       } catch {}
+      try { setNewCards(JSON.parse(localStorage.getItem(LS_NEW_CARDS) || "null")); } catch {}   // may have arrived via sync
       const savedLib = localStorage.getItem(LS_LIBRARY);
       if (savedLib) { try {
         const lib = JSON.parse(localStorage.getItem(LS_LIBRARY) || savedLib);
@@ -5244,6 +5247,39 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
         bi[b.name] = (b.name in binInc) ? binInc[b.name] : true;      // binders included by default
       });
 
+      // Collection decks that come back from the import keep what was worked
+      // out about them (precon, and the enriched view if the cards match).
+      const oldDecks = new Map((groups.decks || []).map(d => [d.name, d]));
+      const sameCards = (a, b) => JSON.stringify((a.cards || []).map(c => [c.name, c.qty]).sort()) === JSON.stringify((b.cards || []).map(c => [c.name, c.qty]).sort());
+      for (let i = 0; i < nextDecks.length; i++) {
+        const old = oldDecks.get(nextDecks[i].name);
+        if (!old || old === nextDecks[i]) continue;
+        nextDecks[i] = { ...nextDecks[i],
+          ...(old.preconChecked ? { preconChecked: old.preconChecked, ...(old.precon ? { precon: old.precon } : {}) } : {}),
+          ...(old.deckData && old.selCmd && sameCards(old, nextDecks[i]) ? { deckData: old.deckData, selCmd: old.selCmd, enrichedAt: old.enrichedAt } : {}) };
+      }
+      // Remember which cards this import added (new, or more copies) for the
+      // Library's "your import added N cards" notice.
+      {
+        const totals = gs => {
+          const m = new Map();
+          [...(gs.binders || []), ...(gs.decks || [])].forEach(src => (src.cards || []).forEach(c => {
+            if (BASIC_NAMES.has(c.name)) return;
+            const k = normCardName(c.name);
+            m.set(k, { name: c.name, n: (m.get(k)?.n || 0) + (c.qty || 1) });
+          }));
+          return m;
+        };
+        const before = totals(groups), after = totals({ decks: nextDecks, binders: nextBinders });
+        const added = [...after].map(([k, v]) => ({ name: v.name, n: v.n - (before.get(k)?.n || 0) })).filter(x => x.n > 0);
+        if (added.length) {
+          const nc = { at: Date.now(), cards: added };
+          setNewCards(nc); setNewUpg({});
+          lsSetItemSafe(LS_NEW_CARDS, JSON.stringify(nc));
+        }
+        // The shopping list may contain cards that were just bought.
+        setUpgrades({}); try { localStorage.removeItem(LS_UPGRADES); } catch {}
+      }
       setGroups({ decks: nextDecks, binders: nextBinders });
       setDeckInc(di);
       setBinInc(bi);
@@ -6471,6 +6507,132 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       })();
     }, [phase, upgrades, upgAllDecks, library]);
 
+    // ── 🆕 New cards from the last import → upgrades for Library decks ────
+    const [newCards, setNewCards] = useState(() => { try { return JSON.parse(localStorage.getItem(LS_NEW_CARDS) || "null"); } catch { return null; } });
+    const [newUpg, setNewUpg] = useState({});   // deckId → { key, status, items: [{ name, cut, reasons, value }] }
+    const newUpgBusyRef = useRef(false);
+    const newActive = !!(newCards?.cards?.length && !newCards.seen);
+    const newKeySet = new Set(newActive ? newCards.cards.map(c => normCardName(c.name)) : []);
+    const markNewSeen = () => {
+      const nc = { ...(newCards || {}), seen: true };
+      setNewCards(nc); setNewUpg({});
+      lsSetItemSafe(LS_NEW_CARDS, JSON.stringify(nc));
+    };
+
+    // Which of the newly imported cards would improve this Library deck:
+    // free to use, in colour, within the bracket, and either popular with
+    // the commander (EDHRec), completing a combo, or filling a short role —
+    // and better than the weakest deck card doing the same job.
+    const newCardUpgrades = async (e) => {
+      const sel = e.selCmd, d = e.deck || {};
+      const cmdrName = sel?.card?.name;
+      if (!cmdrName) return [];
+      const ci = sel.card.scryfall?.color_identity || [];
+      const bracketN = d.buildPrefs?.bracket || 3;
+      const eff = effectiveComboPolicy(d.comboPolicy, bracketN);
+      const own = buildOwnershipIndex(groups, deckInc, binInc, null, builtClaims(library.filter(x => x.id !== e.id)));
+      const cache = getSFCache();
+      const sfOf = n => cache[(n || "").toLowerCase()]?.d || cache[normCardName(n)]?.d || null;
+      const deckCards = (d.categories || []).flatMap(c => c.cards || []);
+      const inDeck = new Set([cmdrName, d.partner?.card?.name, ...deckCards.map(c => c.name)].filter(Boolean).map(normCardName));
+      const names = newCards.cards.map(c => c.name).filter(n => {
+        const k = normCardName(n);
+        return !BASIC_NAMES.has(n) && !inDeck.has(k) && own.get(k)?.available;
+      });
+      if (!names.length) return [];
+      const info = await fetchCardPrices(names);
+      let edh = new Map();
+      try { const r = await getEdhrec(sel); if (r.status === "ok") edh = new Map(r.suggestions.map(x => [normCardName(x.name), x])); } catch {}
+      const edhScore = n => { const x = edh.get(normCardName(n)); return x ? (x.pct || 0) + (x.synergy || 0) / 2 : 0; };
+      const roles = d.research?.roles?.length ? compileRoles(d.research.roles) : [];
+      const short = roles.map(r => ({ r, have: deckCards.filter(c => r.test(sfOf(c.name))).length })).filter(x => x.r.target && x.have < x.r.target);
+      const comboFor = new Map();
+      if (eff !== "avoid") for (const combo of d.combosAlmost || []) {
+        const missing = (combo.cards || []).filter(n => !inDeck.has(normCardName(n)));
+        if (missing.length === 1 && (eff !== "owned3" || combo.cards.length >= 3)) comboFor.set(normCardName(missing[0]), combo);
+      }
+      const deckGC = [cmdrName, ...deckCards.map(c => c.name)].filter(isGameChanger).length;
+      const items = [];
+      for (const n of names) {
+        const sf = info.get(normCardName(n))?.sf || sfOf(n);
+        if (!sf || !isEDHLegalCard(sf) || !(sf.color_identity || []).every(col => ci.includes(col))) continue;
+        if (isGameChanger(n) && (bracketN <= 2 || deckGC >= 3)) continue;
+        if (bracketN <= 3 && isMassLandDenial(sf)) continue;
+        const reasons = [];
+        let value = edhScore(n);
+        const x = edh.get(normCardName(n));
+        if (x) reasons.push(`in ${Math.round((x.pct || 0) * 100)}% of ${cmdrName.split(",")[0]} decks`);
+        const combo = comboFor.get(normCardName(n));
+        if (combo) { value = Math.max(value, 2); reasons.unshift(`💥 completes ${combo.cards.join(" + ")}`); }
+        const fills = short.filter(y => y.r.test(sf));
+        if (fills.length) { value += 0.3 * fills.length; reasons.push(`fills ${fills.map(y => y.r.label).join(", ")}`); }
+        if (value < 0.2) continue;
+        items.push({ name: sf.name || n, value, reasons, role: cardRole(sf), combo: !!combo });
+      }
+      items.sort((a, b) => b.value - a.value);
+      const protectedK = new Set([cmdrName, ...(d.combosHave || []).flatMap(c => c.cards || [])].map(normCardName));
+      const cuts = [...new Map(deckCards.map(c => [c.name, c])).values()]
+        .filter(c => !BASIC_NAMES.has(c.name) && !protectedK.has(normCardName(c.name)))
+        .map(c => ({ name: c.name, role: cardRole(sfOf(c.name) || { type_line: c.type_line }), score: edhScore(c.name) }))
+        .sort((a, b) => a.score - b.score);
+      const used = new Set(), out = [];
+      for (const it of items) {
+        const cut = cuts.find(c => !used.has(c.name) && c.role === it.role && c.score < it.value - 0.1)
+          || (it.role !== "land" ? cuts.find(c => !used.has(c.name) && c.role === "synergy" && c.score < it.value - 0.1) : null);
+        if (!cut && !it.combo) continue;
+        if (cut) { used.add(cut.name); it.cut = cut.name; }
+        out.push(it);
+        if (out.length >= 5) break;
+      }
+      return out;
+    };
+    useEffect(() => {
+      if (phase !== "saved_list" || !newActive || newUpgBusyRef.current) return;
+      const keyOf = e => `${newCards.at}|${deckFingerprint(e.selCmd?.card?.name, e.deck)}`;
+      const todo = library.filter(e => e.selCmd && e.deck && newUpg[e.id]?.key !== keyOf(e));
+      if (!todo.length) return;
+      newUpgBusyRef.current = true;
+      (async () => {
+        for (const e of todo) {
+          setNewUpg(u => ({ ...u, [e.id]: { key: keyOf(e), status: "loading", items: [] } }));
+          let items = [];
+          try { items = await newCardUpgrades(e); } catch {}
+          setNewUpg(u => ({ ...u, [e.id]: { key: keyOf(e), status: "done", items } }));
+        }
+        newUpgBusyRef.current = false;
+        setNewUpg(u => ({ ...u }));
+      })();
+    }, [phase, newCards, newUpg, library]);
+
+    // Built deck: claimed cards the collection can't cover — not owned (any
+    // more), or owned fewer times than all built decks together use them.
+    const builtCoverageIssues = (entry) => {
+      if (!entry?.built) return [];
+      const own = buildOwnershipIndex(groups, {}, {}, null, []);
+      const all = builtClaims(library);
+      const totals = new Map();
+      all.forEach(c => { const k = normCardName(c.name); totals.set(k, (totals.get(k) || 0) + c.qty); });
+      return entryClaims(entry).map(c => {
+        const k = normCardName(c.name);
+        const owned = own.get(k)?.owned || 0;
+        const claimed = totals.get(k) || 0;
+        if (owned >= claimed) return null;
+        const others = [...new Set(all.filter(x => normCardName(x.name) === k && x.deckId !== entry.id).map(x => x.deckTitle))];
+        return { name: c.name, text: owned === 0 ? "not in your collection" : `you own ${owned}, ${others.length ? `also used in ${others.join(", ")}` : "the deck needs more"}` };
+      }).filter(Boolean);
+    };
+
+    // Open a Library deck with the swap suggestions showing (🆕 new cards first).
+    const pendingSwapsRef = useRef(null);
+    const openDeckSwaps = (e) => { pendingSwapsRef.current = e.deck?.theme; loadFromLibrary(e); };
+    useEffect(() => {
+      if (!deck || pendingSwapsRef.current !== deck.theme || phase !== "deck") return;
+      pendingSwapsRef.current = null;
+      setShowInsights(true); setSwapOpen(true);
+      findSwaps();
+      setTimeout(() => document.querySelector("[data-swaps-panel]")?.scrollIntoView({ behavior: "smooth", block: "start" }), 300);
+    }, [deck, phase]);
+
     const loadEdhTop = async () => {
       const cmdr = selCmd.card.name;
       if (edhLive?.cmdr === cmdr && (edhLive.status === "done" || edhLive.status === "loading")) return;
@@ -6510,7 +6672,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           const k = normCardName(e.name);
           const rec = own.get(k);
           if (!rec || inDeck.has(k) || BASIC_NAMES.has(rec.name)) continue;
-          const sf = sfOf(rec.name);
+          const sf = sfOf(rec.name) || _priceCache.get(k)?.sf;   // newly imported cards may only be in the price cache
           if (!sf || !isEDHLegalCard(sf) || !(sf.color_identity || []).every(c => ci.includes(c))) continue;
           const sc = score(e.name);
           if (!rec.available) { ownedElsewhere.push({ name: rec.name, where: rec.where, score: sc }); continue; }
@@ -6522,16 +6684,42 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
         // Commander plan: favour cards that fill a role the deck is short on,
         // and avoid cutting the only cards filling a role.
         const coverage = roleCoverage();
+        // Cards from the last import (🆕): offered first, including ones EDHRec
+        // doesn't list but that complete a combo or fill a short role.
+        if (newKeySet.size) {
+          const have = new Set(candidates.map(c => normCardName(c.name)));
+          const comboMissing = new Map();
+          for (const c of deck.combosAlmost || []) {
+            const m = (c.cards || []).filter(n => !inDeck.has(normCardName(n)));
+            if (m.length === 1) comboMissing.set(normCardName(m[0]), c);
+          }
+          for (const k of newKeySet) {
+            const rec = own.get(k);
+            if (have.has(k) || !rec?.available || inDeck.has(k) || BASIC_NAMES.has(rec.name)) continue;
+            const sf = sfOf(rec.name) || _priceCache.get(k)?.sf;
+            if (!sf || !isEDHLegalCard(sf) || !(sf.color_identity || []).every(c => ci.includes(c))) continue;
+            const fillsShort = coverage.some(r => r.target && r.have.length < r.target && r.test(sf));
+            if (!comboMissing.has(k) && !fillsShort) continue;
+            candidates.push({ name: rec.name, sf, edh: null, score: comboMissing.has(k) ? 2 : 0.2, role: cardRole(sf),
+              price: parseFloat(sf.prices?.usd || 0), from: rec.where.find(w => w.included)?.name });
+          }
+          candidates.forEach(c => {
+            const k = normCardName(c.name);
+            c.isNew = newKeySet.has(k);
+            const combo = comboMissing.get(k);
+            if (combo) { c.score = Math.max(c.score, 2); c.fills = [`💥 completes ${combo.cards.join(" + ")}`, ...(c.fills || [])]; }
+          });
+        }
         const shortRoles = coverage.filter(r => r.target && r.have.length < r.target);
         const thinRoles  = coverage.filter(r => r.target && r.have.length <= r.target);
         const deckSets = deck.buildPrefs?.setPref?.sets || [];
         for (const c of candidates) {
           const fills = shortRoles.filter(r => r.test(c.sf));
-          if (fills.length) { c.score += 0.3 * fills.length; c.fills = fills.map(r => r.label); }
+          if (fills.length) { c.score += 0.3 * fills.length; c.fills = [...(c.fills || []), ...fills.map(r => r.label)]; }
           // The deck was built preferring certain card sets: favour those.
           if (inSetsOf(deckSets, c.name)) { c.score += 0.4; c.fills = [...(c.fills || []), `🎴 ${prefSetLabel(deckSets)}`]; }
         }
-        candidates.sort((a, b) => b.score - a.score);
+        candidates.sort((a, b) => (b.isNew ? 1 : 0) - (a.isNew ? 1 : 0) || b.score - a.score);
 
         // Cut pool: deck cards minus commanders and combo pieces.
         const comboKeys = new Set((deck.combosHave || []).flatMap(c => c.cards || []).map(normCardName));
@@ -12603,22 +12791,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
 
 
               ${openLibEntry()?.built && (() => {
-                // Built deck: cards its claims can't be covered by the
-                // collection — not owned (any more), or owned fewer times
-                // than built decks use them.
-                const entry = openLibEntry();
-                const own = buildOwnershipIndex(groups, {}, {}, null, []);
-                const all = builtClaims(library);
-                const totals = new Map();
-                all.forEach(c => { const k = normCardName(c.name); totals.set(k, (totals.get(k) || 0) + c.qty); });
-                const issues = entryClaims(entry).map(c => {
-                  const k = normCardName(c.name);
-                  const owned = own.get(k)?.owned || 0;
-                  const claimed = totals.get(k) || 0;
-                  if (owned >= claimed) return null;
-                  const others = [...new Set(all.filter(x => normCardName(x.name) === k && x.deckId !== entry.id).map(x => x.deckTitle))];
-                  return { name: c.name, text: owned === 0 ? "not in your collection" : `you own ${owned}, ${others.length ? `also used in ${others.join(", ")}` : "the deck needs more"}` };
-                }).filter(Boolean);
+                const issues = builtCoverageIssues(openLibEntry());
                 if (!issues.length) return null;
                 return html`
                   <div style=${{ background:"var(--warning-bg)", border:"1px solid var(--warning)", borderRadius:10, padding:"10px 16px", marginBottom:14, fontSize:12, lineHeight:1.6 }}>
@@ -12763,7 +12936,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 const st = swapState?.key === key ? swapState : null;
                 const pctText = e => e ? `in ${Math.round((e.pct || 0) * 100)}% of ${selCmd.card.name.split(",")[0]} decks` : "not on EDHRec's list for this commander";
                 return html`
-                  <div style=${{ background:"var(--success-soft)", border:"1px solid var(--border)", borderRadius:10,
+                  <div data-swaps-panel style=${{ background:"var(--success-soft)", border:"1px solid var(--border)", borderRadius:10,
                     padding:"14px 18px", marginBottom:18 }}>
                     <div style=${{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
                       <button onClick=${() => { const next = !swapOpen; setSwapOpen(next); if (next && !st) findSwaps(); }}
@@ -12806,9 +12979,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                           : `Replace ${sw.cut.name} with ${sw.add.name} in this deck list`}
                                         style=${{ ...btnSec, padding:"3px 10px", fontSize:11 }}>⇄ Apply swap</button>`}
                                 </div>
-                                <div><span style=${{ color:"var(--success-text)", fontWeight:700 }}>＋ ${sw.add.name}</span>
+                                <div>${sw.add.isNew && html`<span title="Added by your last collection import" style=${{ fontSize:9, fontWeight:700, padding:"1px 6px", borderRadius:8, background:"var(--info-bg)", color:"var(--info)", marginRight:5 }}>🆕 NEW</span>`}<span style=${{ color:"var(--success-text)", fontWeight:700 }}>＋ ${sw.add.name}</span>
                                   ${" "}<${ManaCost} cost=${(sw.add.sf?.mana_cost || sw.add.sf?.card_faces?.[0]?.mana_cost || "").split("//")[0].trim()} size=${13} />
-                                  <span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}> · ${sw.add.fills?.length ? html`<strong style=${{ color:"var(--success-text)" }}>fills ${sw.add.fills.join(", ")}</strong> · ` : ""}${ROLE_LABEL[sw.add.role]} · ${pctText(sw.add.edh)}${sw.add.edh?.synergy ? ` · synergy ${sw.add.edh.synergy > 0 ? "+" : ""}${Math.round(sw.add.edh.synergy * 100)}%` : ""}${sw.add.price ? ` · $${sw.add.price.toFixed(2)}` : ""}${sw.add.from ? ` · in "${sw.add.from}"` : ""}</span></div>
+                                  <span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}> · ${sw.add.fills?.length ? html`<strong style=${{ color:"var(--success-text)" }}>${sw.add.fills.map(f => /^(💥|🎴)/u.test(f) ? f : `fills ${f}`).join(" · ")}</strong> · ` : ""}${ROLE_LABEL[sw.add.role]} · ${pctText(sw.add.edh)}${sw.add.edh?.synergy ? ` · synergy ${sw.add.edh.synergy > 0 ? "+" : ""}${Math.round(sw.add.edh.synergy * 100)}%` : ""}${sw.add.price ? ` · $${sw.add.price.toFixed(2)}` : ""}${sw.add.from ? ` · in "${sw.add.from}"` : ""}</span></div>
                                 <div><span style=${{ color:"var(--danger-text)", fontWeight:700 }}>− ${sw.cut.name}</span>
                                   ${" "}<${ManaCost} cost=${(sw.cut.mana_cost || "").split("//")[0].trim()} size=${13} />
                                   <span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}> · ${sw.cut.basic ? "one of your basic lands" : `${ROLE_LABEL[sw.cut.role]} · ${pctText(sw.cut.edh)}`}</span></div>
@@ -12820,7 +12993,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       <div style=${{ fontSize:11, color:"var(--fg-text-muted)", fontStyle:"italic", marginTop:8 }}>
                         ${!!openColDeck()
                           ? "Apply swap moves the cut card back to the binder it came from and takes the new card out of its binder. "
-                          : "Apply swap only edits this deck list — mark the deck as built to reserve its cards. "}
+                          : openLibEntry()?.built
+                            ? "Apply swap updates this built deck: the new card is reserved for it, the cut card becomes available again. "
+                            : "Apply swap only edits this deck list — mark the deck as built to reserve its cards. "}
                         Each swap replaces a card doing the same job (ramp for ramp, removal for removal…). Combo pieces and the commander are never cut.${Number.isFinite(st.cardCap) ? ` Cards over $${st.cardCap.toFixed(0)} (25% of your budget) are left out.` : ""}
                       </div>
                     `}
@@ -13612,6 +13787,35 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 </div>
               </div>
 
+              ${(() => {
+                // 🆕 What the last collection import means for these decks.
+                const missingDecks = library.filter(e => e.built && builtCoverageIssues(e).length > 0);
+                if (!newActive && !missingDecks.length) return null;
+                const states = library.filter(e => e.selCmd && e.deck).map(e => newUpg[e.id]);
+                const checking = newActive && states.some(u => !u || u.status === "loading");
+                const better = library.filter(e => newUpg[e.id]?.items?.length > 0);
+                const nNew = newActive ? newCards.cards.reduce((t, c) => t + (c.n || 1), 0) : 0;
+                return html`
+                  <div style=${{ background:"var(--info-bg)", border:"1px solid var(--info-border)", borderRadius:10,
+                    padding:"12px 16px", marginBottom:18, fontSize:13, color:"var(--fg-text-heading)", lineHeight:1.6,
+                    display:"flex", gap:12, alignItems:"flex-start", flexWrap:"wrap" }}>
+                    <span style=${{ fontSize:18 }}>🆕</span>
+                    <div style=${{ flex:1, minWidth:220 }}>
+                      ${newActive && html`<div>
+                        Your import on <strong>${new Date(newCards.at).toLocaleDateString(undefined, { day:"numeric", month:"short" })}</strong> added
+                        <strong> ${nNew} card${nNew === 1 ? "" : "s"}</strong>.
+                        ${checking ? html` <span style=${{ color:"var(--fg-text-muted)" }}><span class="spin">⚙️</span> checking your decks…</span>`
+                          : better.length ? html` <strong>${better.length} deck${better.length === 1 ? "" : "s"}</strong> can use some of them — see "⬆ new upgrades" on the deck${better.length === 1 ? "" : "s"} below.`
+                          : " None of them is a clear upgrade for your Library decks."}
+                      </div>`}
+                      ${missingDecks.length > 0 && html`<div style=${{ color:"var(--warning)" }}>
+                        ⚠ ${missingDecks.length} built deck${missingDecks.length === 1 ? " uses" : "s use"} cards that aren't in your collection (any more): ${missingDecks.map(e => e.deck?.theme || e.selCmd?.card?.name).join(", ")}.
+                      </div>`}
+                    </div>
+                    ${newActive && html`<button onClick=${markNewSeen} style=${{ ...btnSec, padding:"5px 12px", fontSize:11 }}>✓ Mark as seen</button>`}
+                  </div>`;
+              })()}
+
               ${(unsavedDeck || (deck && selCmd && !libSaved && !fromSaved && !fromCollection)) && html`
                 <div style=${{
                   background:"var(--bg-surface-soft)", border:"1px solid var(--border-input)", borderRadius:10,
@@ -13856,6 +14060,16 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           </div>
                         `}
 
+                        ${isLibrary && newUpg[entry.id]?.items?.length > 0 && html`
+                          <button onClick=${() => openDeckSwaps(entry)}
+                            title=${`From your last import: ${newUpg[entry.id].items.map(x => `${x.name}${x.cut ? ` (for ${x.cut})` : ""}`).join(", ")}`}
+                            style=${{ width:"100%", marginTop:12, padding:"7px", fontSize:12, fontWeight:700, fontFamily:"inherit", cursor:"pointer",
+                              borderRadius:9, border:"1px solid var(--info-border)", background:"var(--info-bg)", color:"var(--info)" }}>
+                            ⬆ ${newUpg[entry.id].items.length} new upgrade${newUpg[entry.id].items.length === 1 ? "" : "s"} from your import
+                            <span style=${{ fontWeight:400 }}> · ${newUpg[entry.id].items.slice(0, 2).map(x => x.name).join(", ")}${newUpg[entry.id].items.length > 2 ? ", …" : ""}</span>
+                          </button>`}
+                        ${isLibrary && entry.built && builtCoverageIssues(entry).length > 0 && html`
+                          <div style=${{ marginTop:8, fontSize:11, color:"var(--warning)" }}>⚠ ${builtCoverageIssues(entry).length} card(s) not covered by your collection</div>`}
                         <button onClick=${onOpen}
                           style=${{ ...btn, width:"100%", marginTop:12, padding:"9px", fontSize:12 }}>
                           View Full Deck →
