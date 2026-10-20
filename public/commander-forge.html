@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.16-a";
+  const APP_VERSION = "v2026.10.20-a";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -1986,7 +1986,8 @@
   // Detect which collection-tracker emitted a given CSV by inspecting headers.
   // Returns one of "manabox" | "moxfield" | "unknown".
   // Heuristics:
-  //   Manabox  → has `binder type` or `binder name` columns
+  //   Manabox  → has `binder type` or `binder name` columns, or (exports
+  //              without binders) `manabox id` / name + set code + quantity
   //   Moxfield → has `tradelist count` (specifically Haves export) OR
   //              the combination of `name`+`edition`+`collector number`
   //              with NO binder columns
@@ -1996,6 +1997,9 @@
     const hdr = rows[0].map(h => h.toLowerCase().trim());
     const has = name => hdr.includes(name);
     if (has("binder type") || has("binder name") || has("binder_type")) return "manabox";
+    // Manabox exports without binder columns (whole collection / a list):
+    // still Manabox — "ManaBox ID", or Name + Set code + Quantity.
+    if (has("manabox id") || (has("name") && has("set code") && has("quantity"))) return "manabox";
     if (has("tradelist count")) return "moxfield";
     // Moxfield's deck export uses Name + CMC + Type + … without "tradelist count".
     if (has("name") && has("edition") && has("collector number") && !has("binder type")) return "moxfield";
@@ -2399,7 +2403,9 @@
       const qty  = parseInt((cols[iQty] || "").trim()) || 1;
       const btRaw = (cols[iBT] || "binder").toLowerCase().trim();
       const bt   = btRaw === "binder" ? "binder" : "deck";
-      const bn   = iBN >= 0 ? ((cols[iBN] || "").trim() || "Default Binder") : "Default Binder";
+      // No binder columns (collection-wide export): everything goes into one
+      // "Manabox collection" binder.
+      const bn   = iBN >= 0 ? ((cols[iBN] || "").trim() || "Default Binder") : "Manabox collection";
       const sfid = iSF >= 0 ? (cols[iSF] || "").trim() : "";
       const setCode = iSet >= 0 ? (cols[iSet] || "").trim().toLowerCase() : "";
       const cn      = iCN  >= 0 ? (cols[iCN]  || "").trim() : "";
