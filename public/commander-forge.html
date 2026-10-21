@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.21-b";
+  const APP_VERSION = "v2026.10.21-c";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -13668,6 +13668,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       style=${{ fontWeight:700, color:"var(--fg-text-heading)", textDecoration:"none" }}>${it.name}</a>
                     <${ManaCost} cost=${(it.mana_cost || "").split("//")[0].trim()} size=${13} />
                     ${it.gc && html`<span title="Game Changer — counts towards the bracket 3 limit of 3" style=${{ fontSize:9, fontWeight:700, color:"var(--warning)" }}>GAME CHANGER</span>`}
+                    ${it._own && html`<span style=${{ fontSize:10, fontWeight:700, padding:"1px 7px", borderRadius:8,
+                      background: it._own.kind === "free" ? "var(--success-soft)" : "var(--warning-bg)",
+                      color: it._own.kind === "free" ? "var(--success-text)" : "var(--accent-dark)" }}>${it._own.text}</span>`}
                   </div>
                   ${extra}
                 </div>
@@ -13681,7 +13684,42 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             // Saved suggestions: hide cards bought since (now in the collection)
             // and apply the price / deck filters.
             const ownNow = buildOwnershipIndex(groups, {}, {}, null, []);
-            const visible = it => !ownNow.has(normCardName(it.name)) && (upgMaxPrice == null || (price(it) ?? Infinity) <= upgMaxPrice);
+            const visible = it => upgMaxPrice == null || (price(it) ?? Infinity) <= upgMaxPrice;
+            // Decks are named after their commander ("Rydia, Summoner of Mist");
+            // two decks with the same commander add their theme.
+            const cmdrCount = new Map();
+            upgradeTargets.forEach(e => cmdrCount.set(e.selCmd.card.name, (cmdrCount.get(e.selCmd.card.name) || 0) + 1));
+            const deckLabel = e => cmdrCount.get(e.selCmd.card.name) > 1 && e.deck?.theme
+              ? `${e.selCmd.card.name} · ${e.deck.theme}` : e.selCmd.card.name;
+            const libLabel = e => {
+              const n = library.filter(x => x.selCmd?.card?.name === e.selCmd?.card?.name).length;
+              return n > 1 && e.deck?.theme ? `${e.selCmd.card.name} · ${e.deck.theme}` : (e.selCmd?.card?.name || e.deck?.theme || "deck");
+            };
+            // Do you already have the card? In the collection (free, or in use)
+            // or in one of your Library decks.
+            const ownAvail = buildOwnershipIndex(groups, deckInc, binInc, null, builtClaims(library));
+            const inLibDecks = new Map();
+            library.forEach(e => (e.deck?.categories || []).forEach(c => (c.cards || []).forEach(x => {
+              const k = normCardName(x.name);
+              if (!inLibDecks.has(k)) inLibDecks.set(k, new Set());
+              inLibDecks.get(k).add(e);
+            })));
+            const ownStatus = (it, forDeck) => {
+              const k = normCardName(it.name);
+              const rec = ownAvail.get(k);
+              if (rec?.available) {
+                const w = rec.where.find(x => x.included && x.kind !== "built");
+                return { kind: "free", text: `✓ You own it — available${w ? ` in "${w.name}"` : ""}` };
+              }
+              if (rec) {
+                const used = rec.where.find(x => x.kind === "built") || rec.where.find(x => !x.included);
+                return { kind: "used", text: `You own it — ${used?.kind === "built" ? `used in ${used.name}` : used ? `in "${used.name}" (excluded)` : "in use"}` };
+              }
+              const decks = [...(inLibDecks.get(k) || [])].filter(e => !forDeck || e.id !== forDeck);
+              if (decks.length) return { kind: "deck", text: `In your deck ${decks.map(libLabel).join(", ")}` };
+              return null;
+            };
+            const toBuy = it => !ownStatus(it);   // totals and copy list only count cards you don't have
             const shownTargets = upgradeTargets.filter(e => !upgDecks.length || upgDecks.includes(e.id));
             const savedAts = upgradeTargets.map(e => upgrades[e.id]).filter(u => u?.status === "done" && u.at).map(u => u.at);
             const oldest = savedAts.length ? Math.min(...savedAts) : null;
@@ -13695,7 +13733,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               for (const it of (u.items || []).filter(visible)) {
                 const k = normCardName(it.name);
                 const m = merged.get(k) || { ...it, decks: [], value: 0, gap: false, kind: it.kind };
-                m.decks.push({ id: e.id, title: e.deck?.theme || e.selCmd.card.name, reasons: it.reasons, cut: it.cut, entry: e });
+                m.decks.push({ id: e.id, title: deckLabel(e), reasons: it.reasons, cut: it.cut, entry: e });
                 m.value = Math.max(m.value, it.value) + (m.decks.length > 1 ? 0.2 : 0);
                 m.gap = m.gap || it.gap; m.pct = Math.max(m.pct || 0, it.pct || 0); m.syn = Math.max(m.syn || 0, it.syn || 0);
                 if (it.kind === "combo") m.kind = "combo";
@@ -13703,7 +13741,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               }
             }
             const allItems = sortItems([...merged.values()].filter(it => !upgFilter.length || tags(it).some(t => upgFilter.includes(t))));
-            const allTotal = allItems.reduce((t, it) => t + (price(it) ?? 0), 0);
+            const allBuy = allItems.filter(toBuy);
+            const allTotal = allBuy.reduce((t, it) => t + (price(it) ?? 0), 0);
             const counts = Object.fromEntries(FILTERS.map(f => [f.id, [...merged.values()].filter(it => tags(it).includes(f.id)).length]));
 
             return html`
@@ -13738,7 +13777,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     ${(() => {
                       const picked = upgradeTargets.filter(e => upgDecks.includes(e.id));
                       const label = !picked.length ? "All decks"
-                        : picked.length === 1 ? (picked[0].deck?.theme || picked[0].selCmd.card.name)
+                        : picked.length === 1 ? deckLabel(picked[0])
                         : `${picked.length} decks`;
                       const toggle = id => setUpgDecks(ds => ds.includes(id) ? ds.filter(x => x !== id) : [...ds, id]);
                       return html`
@@ -13763,7 +13802,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               return html`
                                 <label key=${e.id} style=${{ display:"flex", gap:8, alignItems:"center", padding:"6px 8px", fontSize:12, cursor:"pointer" }}>
                                   <input type="checkbox" checked=${upgDecks.includes(e.id)} onChange=${() => toggle(e.id)} />
-                                  <span style=${{ flex:1, minWidth:0, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>${e.deck?.theme || e.selCmd.card.name}</span>
+                                  <span style=${{ flex:1, minWidth:0, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>${deckLabel(e)}</span>
                                   ${n != null && html`<span style=${{ color:"var(--fg-text-muted)", fontSize:11 }}>${n}</span>`}
                                 </label>`;
                             })}
@@ -13794,11 +13833,12 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       style=${{ ...pill(upgFilter.includes(f.id)), opacity: counts[f.id] ? 1 : 0.45, cursor: counts[f.id] ? "pointer" : "default" }}>${f.label} · ${counts[f.id]}</button>`)}
                   </div>
                   <div style=${{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap", marginBottom:10 }}>
-                    <span style=${{ fontSize:13, color:"var(--fg-text-body)" }}>${allItems.length} card${allItems.length === 1 ? "" : "s"} · <strong>≈ €${allTotal.toFixed(2)}</strong></span>
-                    ${allItems.length > 0 && copyBtn("all", allItems)}
+                    <span style=${{ fontSize:13, color:"var(--fg-text-body)" }}>${allBuy.length} card${allBuy.length === 1 ? "" : "s"} to buy · <strong>≈ €${allTotal.toFixed(2)}</strong></span>
+                    ${allBuy.length > 0 && copyBtn("all", allBuy)}
+                    ${allItems.length > allBuy.length && html`<span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}>${allItems.length - allBuy.length} you already have — not counted</span>`}
                   </div>
                   <div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
-                    ${allItems.map(it => cardRow(it, html`
+                    ${allItems.map(it => cardRow({ ...it, _own: ownStatus(it) }, html`
                       ${it.decks.map(dk => html`<div key=${dk.id} style=${{ color:"var(--fg-text-body)" }}>
                         <button onClick=${() => loadFromLibrary(dk.entry)} title="Open this deck"
                           style=${{ all:"unset", cursor:"pointer", fontWeight:700, color:"var(--accent-dark)" }}>${dk.title}</button>:
@@ -13811,8 +13851,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
               ${upgView === "deck" && shownTargets.map(e => {
                 const u = upgrades[e.id];
                 const items = u?.status === "done" ? sortItems((u.items || []).filter(visible)) : [];
-                const total = items.reduce((t, it) => t + (price(it) ?? 0), 0);
-                const title = e.deck?.theme || e.selCmd.card.name;
+                const buy = items.filter(it => !ownStatus(it, e.id));
+                const total = buy.reduce((t, it) => t + (price(it) ?? 0), 0);
+                const title = deckLabel(e);
                 const sf = e.selCmd.card.scryfall || {};
                 const open = !!upgOpen[e.id];
                 return html`
@@ -13825,15 +13866,15 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         <span style=${{ minWidth:0 }}>
                           <span style=${{ display:"block", fontSize:15, fontWeight:700, color:"var(--fg-text-heading)" }}>${title}
                             ${e.built && html`<span style=${{ marginLeft:8, fontSize:9, fontWeight:700, padding:"1px 7px", borderRadius:10, background:"var(--warning-bg)", color:"var(--accent-dark)", verticalAlign:"middle" }}>📦 BUILT</span>`}</span>
-                          <span style=${{ display:"block", fontSize:12, color:"var(--fg-text-soft)" }}>👑 ${e.selCmd.card.name}${e.deck?.buildPrefs?.bracket ? ` · bracket ${e.deck.buildPrefs.bracket}` : ""}</span>
+                          <span style=${{ display:"block", fontSize:12, color:"var(--fg-text-soft)" }}>${e.deck?.theme || ""}${e.deck?.buildPrefs?.bracket ? ` · bracket ${e.deck.buildPrefs.bracket}` : ""}</span>
                         </span>
                       </button>
                       ${(!u || u.status === "loading") && html`<span style=${{ fontSize:12, color:"var(--fg-text-muted)" }}><span class="spin">⚙️</span> looking up…</span>`}
                       ${u?.status === "done" && html`<span style=${{ fontSize:13, color:"var(--fg-text-body)" }}>${items.length
-                        ? html`${items.length} card${items.length === 1 ? "" : "s"}${items.some(it => it.kind === "combo") ? " · 💥 combo" : ""} · <strong>≈ €${total.toFixed(2)}</strong>`
+                        ? html`${buy.length} to buy${items.length > buy.length ? ` · ${items.length - buy.length} owned` : ""}${items.some(it => it.kind === "combo") ? " · 💥 combo" : ""} · <strong>≈ €${total.toFixed(2)}</strong>`
                         : (u.items || []).length ? "none match the filters" : "nothing to buy"}</span>`}
                       ${u?.status === "error" && html`<span style=${{ fontSize:12, color:"var(--danger-text)" }}>couldn't load</span>`}
-                      ${items.length > 0 && copyBtn(e.id, items)}
+                      ${buy.length > 0 && copyBtn(e.id, buy)}
                       <button onClick=${() => loadFromLibrary(e)} style=${{ ...btnSec, padding:"5px 12px", fontSize:11 }}>Open deck →</button>
                       ${u && u.status !== "loading" && html`<button onClick=${() => refreshUpgrades(e.id)} title="Look again (EDHRec + prices)"
                         style=${{ ...btnSec, padding:"5px 10px", fontSize:11 }}>↻</button>`}
@@ -13843,7 +13884,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         ${u?.status === "error" && html`<div style=${{ fontSize:12, color:"var(--danger-text)" }}>Couldn't find upgrades: ${u.error}</div>`}
                         ${u?.status === "done" && !items.length && html`<div style=${{ fontSize:12, color:"var(--fg-text-muted)" }}>${u.note || "No upgrades found."}</div>`}
                         <div style=${{ display:"flex", flexDirection:"column", gap:6 }}>
-                          ${items.map(it => cardRow(it, html`
+                          ${items.map(it => cardRow({ ...it, _own: ownStatus(it, e.id) }, html`
                             <div style=${{ color:"var(--fg-text-body)" }}>${it.reasons.join(" · ")}</div>
                             <div style=${{ color:"var(--fg-text-muted)", fontSize:11 }}>${it.cut ? html`would replace <strong>${it.cut}</strong>` : "an addition — no obvious card to cut"}</div>`))}
                         </div>
