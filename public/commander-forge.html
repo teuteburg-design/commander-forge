@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.20-a";
+  const APP_VERSION = "v2026.10.21-a";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -347,6 +347,7 @@
   const LS_THEME      = "cmdr_forge_theme";
   const LS_PICKLISTS  = "cmdr_forge_picklists";    // { [commander name]: { checked: [card names], updatedAt } }
   const LS_NEW_CARDS  = "cmdr_forge_new_cards";    // { at, cards: [{ name, n }], seen? } — what the last collection import added
+  const LS_UPGRADES   = "cmdr_forge_upgrades";     // { [deckId]: { key, at, items } } — saved upgrade suggestions (synced)
   const LS_SYNC_BASE  = "cmdr_forge_sync_base";    // { lastModified, hashes } of the last state known to match the cloud
 
   const THEMES = [
@@ -381,6 +382,7 @@
     LS_USE_SHARED,
     LS_PICKLISTS,   // tick cards off on the phone at the drawers, see it on desktop
     LS_NEW_CARDS,   // "your import added N cards" notice in the Library, on every device
+    LS_UPGRADES,    // 🛒 upgrade suggestions — worked out once, kept until the deck changes or ↻
   ];
   // fetch keepalive bodies are capped at 64 KiB in browsers; bigger pushes
   // must go out as normal requests.
@@ -596,7 +598,6 @@
     }
     return new Map(names.map(n => [normCardName(n), _priceCache.get(normCardName(n)) || null]));
   }
-  const LS_UPGRADES = "cmdr_forge_upgrades";   // { [deckId]: { key, at, items } } — not synced, refreshed daily
 
   // Standard basic lands (5 colours + Wastes). We have hardcoded image URIs and
   // metadata for these (BASIC_IMG / BASIC_LAND maps further down), so there's no
@@ -4834,6 +4835,7 @@
         }
       } catch {}
       try { setNewCards(JSON.parse(localStorage.getItem(LS_NEW_CARDS) || "null")); } catch {}   // may have arrived via sync
+      try { const up = JSON.parse(localStorage.getItem(LS_UPGRADES) || "null"); if (up) setUpgrades(up); } catch {}
       const savedLib = localStorage.getItem(LS_LIBRARY);
       if (savedLib) { try {
         const lib = JSON.parse(localStorage.getItem(LS_LIBRARY) || savedLib);
@@ -5283,8 +5285,7 @@ Use 3-7 roles that directly enable or pay off the commander's abilities; targets
           setNewCards(nc); setNewUpg({});
           lsSetItemSafe(LS_NEW_CARDS, JSON.stringify(nc));
         }
-        // The shopping list may contain cards that were just bought.
-        setUpgrades({}); try { localStorage.removeItem(LS_UPGRADES); } catch {}
+        // (The 🛒 list hides cards that are now owned when it's shown.)
       }
       setGroups({ decks: nextDecks, binders: nextBinders });
       setDeckInc(di);
@@ -6399,6 +6400,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     const [upgView, setUpgView] = useState("all");          // "all" cards across decks | "deck" per deck
     const [upgOpen, setUpgOpen] = useState({});             // per-deck view: expanded decks
     const [upgFilter, setUpgFilter] = useState([]);         // all-cards view: combo / gc / synergy / staple / gap
+    const [upgMaxPrice, setUpgMaxPrice] = useState(null);   // € cap per card (null = any)
+    const [upgDecks, setUpgDecks] = useState([]);           // deck ids to show (empty = all)
 
     const computeUpgrades = async (e) => {
       const sel = e.selCmd, d = e.deck || {};
@@ -6489,7 +6492,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       if (phase !== "upgrades" || upgBusyRef.current) return;
       const todo = upgradeTargets.filter(e => {
         const u = upgrades[e.id];
-        return !u || u.key !== upgradeKey(e) || (u.status === "done" && Date.now() - (u.at || 0) > 864e5);
+        // Saved suggestions stay until the deck changes or the user hits ↻.
+        return !u || u.key !== upgradeKey(e);
       });
       if (!todo.length) return;
       upgBusyRef.current = true;
@@ -6503,7 +6507,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
             const n = { ...u, [e.id]: rec };
             try {
               const keep = Object.fromEntries(Object.entries(n).filter(([, v]) => v.status === "done"));
-              localStorage.setItem(LS_UPGRADES, JSON.stringify(keep));
+              lsSetItemSafe(LS_UPGRADES, JSON.stringify(keep));
             } catch {}
             return n;
           });
@@ -13651,13 +13655,21 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 </div>
               </div>`;
             const loading = upgradeTargets.filter(e => !upgrades[e.id] || upgrades[e.id].status === "loading").length;
+            // Saved suggestions: hide cards bought since (now in the collection)
+            // and apply the price / deck filters.
+            const ownNow = buildOwnershipIndex(groups, {}, {}, null, []);
+            const visible = it => !ownNow.has(normCardName(it.name)) && (upgMaxPrice == null || (price(it) ?? Infinity) <= upgMaxPrice);
+            const shownTargets = upgradeTargets.filter(e => !upgDecks.length || upgDecks.includes(e.id));
+            const savedAts = upgradeTargets.map(e => upgrades[e.id]).filter(u => u?.status === "done" && u.at).map(u => u.at);
+            const oldest = savedAts.length ? Math.min(...savedAts) : null;
+            const PRICE_CAPS = [null, 1, 2, 5, 10, 20];
 
             // All-cards view: one row per card, listing every deck it would improve.
             const merged = new Map();
-            for (const e of upgradeTargets) {
+            for (const e of shownTargets) {
               const u = upgrades[e.id];
               if (u?.status !== "done") continue;
-              for (const it of u.items || []) {
+              for (const it of (u.items || []).filter(visible)) {
                 const k = normCardName(it.name);
                 const m = merged.get(k) || { ...it, decks: [], value: 0, gap: false, kind: it.kind };
                 m.decks.push({ id: e.id, title: e.deck?.theme || e.selCmd.card.name, reasons: it.reasons, cut: it.cut, entry: e });
@@ -13692,6 +13704,27 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   Include decks that aren't built yet
                 </label>
               </div>
+              ${upgradeTargets.length > 0 && html`
+                <div class="card" style=${{ padding:"10px 14px", marginBottom:12, display:"flex", flexDirection:"column", gap:8 }}>
+                  <div style=${{ display:"flex", gap:6, flexWrap:"wrap", alignItems:"center" }}>
+                    <span style=${{ fontSize:12, color:"var(--fg-text-soft)", minWidth:70 }}>Max price:</span>
+                    ${PRICE_CAPS.map(c => html`<button key=${String(c)} onClick=${() => setUpgMaxPrice(c)} style=${pill(upgMaxPrice === c)}>${c == null ? "Any" : `≤ €${c}`}</button>`)}
+                  </div>
+                  <div style=${{ display:"flex", gap:6, flexWrap:"wrap", alignItems:"center" }}>
+                    <span style=${{ fontSize:12, color:"var(--fg-text-soft)", minWidth:70 }}>Decks:</span>
+                    <button onClick=${() => setUpgDecks([])} style=${pill(!upgDecks.length)}>All</button>
+                    ${upgradeTargets.map(e => html`<button key=${e.id}
+                      onClick=${() => setUpgDecks(ds => ds.includes(e.id) ? ds.filter(x => x !== e.id) : [...ds, e.id])}
+                      style=${pill(upgDecks.includes(e.id))}>${e.deck?.theme || e.selCmd.card.name}</button>`)}
+                  </div>
+                  <div style=${{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap", fontSize:11, color:"var(--fg-text-muted)" }}>
+                    <span>${oldest
+                      ? `Suggestions are saved (from ${new Date(oldest).toLocaleDateString(undefined, { day:"numeric", month:"short" })}) and only worked out again when a deck changes — prices may have moved since. Cards you've bought since are hidden.`
+                      : "Suggestions are saved once worked out."}</span>
+                    <button onClick=${() => setUpgrades({})} disabled=${loading > 0}
+                      style=${{ ...btnSec, padding:"3px 10px", fontSize:11, marginLeft:"auto" }}>↻ Refresh all</button>
+                  </div>
+                </div>`}
               ${loading > 0 && html`<div style=${{ fontSize:12, color:"var(--fg-text-muted)", marginBottom:12 }}><span class="spin">⚙️</span> Looking up EDHRec, combos and prices for ${loading} deck${loading === 1 ? "" : "s"}…</div>`}
               ${upgradeTargets.length === 0 && html`
                 <div class="card" style=${{ fontSize:13, color:"var(--fg-text-body)" }}>
@@ -13722,9 +13755,9 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   </div>
                 </div>`}
 
-              ${upgView === "deck" && upgradeTargets.map(e => {
+              ${upgView === "deck" && shownTargets.map(e => {
                 const u = upgrades[e.id];
-                const items = u?.status === "done" ? sortItems(u.items || []) : [];
+                const items = u?.status === "done" ? sortItems((u.items || []).filter(visible)) : [];
                 const total = items.reduce((t, it) => t + (price(it) ?? 0), 0);
                 const title = e.deck?.theme || e.selCmd.card.name;
                 const sf = e.selCmd.card.scryfall || {};
@@ -13745,7 +13778,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       ${(!u || u.status === "loading") && html`<span style=${{ fontSize:12, color:"var(--fg-text-muted)" }}><span class="spin">⚙️</span> looking up…</span>`}
                       ${u?.status === "done" && html`<span style=${{ fontSize:13, color:"var(--fg-text-body)" }}>${items.length
                         ? html`${items.length} card${items.length === 1 ? "" : "s"}${items.some(it => it.kind === "combo") ? " · 💥 combo" : ""} · <strong>≈ €${total.toFixed(2)}</strong>`
-                        : "nothing to buy"}</span>`}
+                        : (u.items || []).length ? "none match the filters" : "nothing to buy"}</span>`}
                       ${u?.status === "error" && html`<span style=${{ fontSize:12, color:"var(--danger-text)" }}>couldn't load</span>`}
                       ${items.length > 0 && copyBtn(e.id, items)}
                       <button onClick=${() => loadFromLibrary(e)} style=${{ ...btnSec, padding:"5px 12px", fontSize:11 }}>Open deck →</button>
