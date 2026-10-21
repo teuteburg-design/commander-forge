@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.21-a";
+  const APP_VERSION = "v2026.10.21-b";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -348,6 +348,7 @@
   const LS_PICKLISTS  = "cmdr_forge_picklists";    // { [commander name]: { checked: [card names], updatedAt } }
   const LS_NEW_CARDS  = "cmdr_forge_new_cards";    // { at, cards: [{ name, n }], seen? } — what the last collection import added
   const LS_UPGRADES   = "cmdr_forge_upgrades";     // { [deckId]: { key, at, items } } — saved upgrade suggestions (synced)
+  const LS_UPG_PREFS  = "cmdr_forge_upgrade_prefs"; // 🛒 page view, sort and filters
   const LS_SYNC_BASE  = "cmdr_forge_sync_base";    // { lastModified, hashes } of the last state known to match the cloud
 
   const THEMES = [
@@ -383,6 +384,7 @@
     LS_PICKLISTS,   // tick cards off on the phone at the drawers, see it on desktop
     LS_NEW_CARDS,   // "your import added N cards" notice in the Library, on every device
     LS_UPGRADES,    // 🛒 upgrade suggestions — worked out once, kept until the deck changes or ↻
+    LS_UPG_PREFS,   // 🛒 view / sort / filters
   ];
   // fetch keepalive bodies are capped at 64 KiB in browsers; bigger pushes
   // must go out as normal requests.
@@ -6392,16 +6394,37 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     const [upgrades, setUpgrades] = useState(() => {
       try { return JSON.parse(localStorage.getItem(LS_UPGRADES) || "{}"); } catch { return {}; }
     });
-    const [upgSort, setUpgSort] = useState("price");          // "price" | "impact"
-    const [upgAllDecks, setUpgAllDecks] = useState(false);    // include unbuilt Library decks
+    const upgSaved = (() => { try { return JSON.parse(localStorage.getItem(LS_UPG_PREFS) || "{}") || {}; } catch { return {}; } })();
+    const [upgSort, setUpgSort] = useState(upgSaved.sort || "price");          // "price" | "impact"
+    const [upgAllDecks, setUpgAllDecks] = useState(!!upgSaved.allDecks);       // include unbuilt Library decks
+    const [upgDeckMenu, setUpgDeckMenu] = useState(false);                     // deck multi-select dropdown open
     const [upgCopied, setUpgCopied] = useState(null);
     const upgBusyRef = useRef(false);
     const upgradeKey = e => "v2|" + (deckFingerprint(e.selCmd?.card?.name, e.deck) || String(e.id));
-    const [upgView, setUpgView] = useState("all");          // "all" cards across decks | "deck" per deck
+    const [upgView, setUpgView] = useState(upgSaved.view || "all");          // "all" cards across decks | "deck" per deck
     const [upgOpen, setUpgOpen] = useState({});             // per-deck view: expanded decks
-    const [upgFilter, setUpgFilter] = useState([]);         // all-cards view: combo / gc / synergy / staple / gap
-    const [upgMaxPrice, setUpgMaxPrice] = useState(null);   // € cap per card (null = any)
-    const [upgDecks, setUpgDecks] = useState([]);           // deck ids to show (empty = all)
+    const [upgFilter, setUpgFilter] = useState(upgSaved.filter || []);         // all-cards view: combo / gc / synergy / staple / gap
+    const [upgMaxPrice, setUpgMaxPrice] = useState(upgSaved.maxPrice ?? null); // € cap per card (null = any)
+    const [upgDecks, setUpgDecks] = useState(upgSaved.decks || []);           // deck ids to show (empty = all)
+    // Remember view, sort and filters (synced, like the build preferences).
+    const upgPrefsLoaded = useRef(false);
+    useEffect(() => {
+      if (!didInitRef.current) return;
+      if (!upgPrefsLoaded.current) {
+        // First run after init: take what sync may have brought in.
+        upgPrefsLoaded.current = true;
+        try {
+          const p = JSON.parse(localStorage.getItem(LS_UPG_PREFS) || "null");
+          if (p) {
+            if (p.sort) setUpgSort(p.sort); if (p.view) setUpgView(p.view);
+            setUpgAllDecks(!!p.allDecks); setUpgFilter(p.filter || []);
+            setUpgMaxPrice(p.maxPrice ?? null); setUpgDecks(p.decks || []);
+            return;
+          }
+        } catch {}
+      }
+      lsSetItemSafe(LS_UPG_PREFS, JSON.stringify({ sort: upgSort, view: upgView, allDecks: upgAllDecks, filter: upgFilter, maxPrice: upgMaxPrice, decks: upgDecks }));
+    }, [upgSort, upgView, upgAllDecks, upgFilter, upgMaxPrice, upgDecks, phase]);
 
     const computeUpgrades = async (e) => {
       const sel = e.selCmd, d = e.deck || {};
@@ -13710,12 +13733,42 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                     <span style=${{ fontSize:12, color:"var(--fg-text-soft)", minWidth:70 }}>Max price:</span>
                     ${PRICE_CAPS.map(c => html`<button key=${String(c)} onClick=${() => setUpgMaxPrice(c)} style=${pill(upgMaxPrice === c)}>${c == null ? "Any" : `≤ €${c}`}</button>`)}
                   </div>
-                  <div style=${{ display:"flex", gap:6, flexWrap:"wrap", alignItems:"center" }}>
+                  <div style=${{ display:"flex", gap:6, flexWrap:"wrap", alignItems:"center", position:"relative" }}>
                     <span style=${{ fontSize:12, color:"var(--fg-text-soft)", minWidth:70 }}>Decks:</span>
-                    <button onClick=${() => setUpgDecks([])} style=${pill(!upgDecks.length)}>All</button>
-                    ${upgradeTargets.map(e => html`<button key=${e.id}
-                      onClick=${() => setUpgDecks(ds => ds.includes(e.id) ? ds.filter(x => x !== e.id) : [...ds, e.id])}
-                      style=${pill(upgDecks.includes(e.id))}>${e.deck?.theme || e.selCmd.card.name}</button>`)}
+                    ${(() => {
+                      const picked = upgradeTargets.filter(e => upgDecks.includes(e.id));
+                      const label = !picked.length ? "All decks"
+                        : picked.length === 1 ? (picked[0].deck?.theme || picked[0].selCmd.card.name)
+                        : `${picked.length} decks`;
+                      const toggle = id => setUpgDecks(ds => ds.includes(id) ? ds.filter(x => x !== id) : [...ds, id]);
+                      return html`
+                        <button onClick=${() => setUpgDeckMenu(o => !o)} aria-haspopup="listbox" aria-expanded=${upgDeckMenu}
+                          style=${{ ...pill(picked.length > 0), display:"inline-flex", alignItems:"center", gap:6, maxWidth:280 }}>
+                          <span style=${{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>${label}</span> ▾
+                        </button>
+                        ${picked.length > 0 && html`<button onClick=${() => setUpgDecks([])}
+                          style=${{ background:"transparent", border:"none", color:"var(--accent-dark)", cursor:"pointer", fontSize:11, fontFamily:"inherit", textDecoration:"underline" }}>clear</button>`}
+                        ${upgDeckMenu && html`
+                          <div onClick=${() => setUpgDeckMenu(false)} style=${{ position:"fixed", inset:0, zIndex:50 }}></div>
+                          <div role="listbox" aria-multiselectable="true"
+                            style=${{ position:"absolute", top:"100%", left:76, zIndex:60, marginTop:4, minWidth:240, maxWidth:"min(420px, 86vw)",
+                              maxHeight:320, overflowY:"auto", background:"var(--bg-surface)", border:"1px solid var(--border)", borderRadius:8,
+                              boxShadow:"0 6px 20px rgba(0,0,0,0.18)", padding:4 }}>
+                            <label style=${{ display:"flex", gap:8, alignItems:"center", padding:"6px 8px", fontSize:12, cursor:"pointer", borderBottom:"1px solid var(--border-soft)" }}>
+                              <input type="checkbox" checked=${!picked.length} onChange=${() => setUpgDecks([])} /> <strong>All decks</strong>
+                            </label>
+                            ${upgradeTargets.map(e => {
+                              const u = upgrades[e.id];
+                              const n = u?.status === "done" ? (u.items || []).filter(visible).length : null;
+                              return html`
+                                <label key=${e.id} style=${{ display:"flex", gap:8, alignItems:"center", padding:"6px 8px", fontSize:12, cursor:"pointer" }}>
+                                  <input type="checkbox" checked=${upgDecks.includes(e.id)} onChange=${() => toggle(e.id)} />
+                                  <span style=${{ flex:1, minWidth:0, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>${e.deck?.theme || e.selCmd.card.name}</span>
+                                  ${n != null && html`<span style=${{ color:"var(--fg-text-muted)", fontSize:11 }}>${n}</span>`}
+                                </label>`;
+                            })}
+                          </div>`}`;
+                    })()}
                   </div>
                   <div style=${{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap", fontSize:11, color:"var(--fg-text-muted)" }}>
                     <span>${oldest
