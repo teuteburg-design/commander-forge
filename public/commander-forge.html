@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.22-a";
+  const APP_VERSION = "v2026.10.22-c";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -6122,11 +6122,41 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
           }
         };
 
-        // 1. Trim if total cards > 99.
+        // Singleton: a non-basic card may appear only once.
+        {
+          const seen = new Set(); let dupes = 0;
+          for (const cat of deckData.categories) {
+            cat.cards = cat.cards.filter(dc => {
+              if (basicSet.has(dc.name)) return true;
+              const k = normCardName(dc.name);
+              if (seen.has(k)) { dupes++; return false; }
+              seen.add(k); return true;
+            });
+          }
+          if (dupes) addLog(`♻️ Removed ${dupes} duplicate card(s) — Commander allows one copy of each non-basic card.`);
+        }
+        // 1. Too many cards: first lands above the land target, then the
+        //    weakest non-land cards (never combo pieces), down to 99.
         if (flatCount() > 99) {
           const over = flatCount() - 99;
-          addLog(`⚠️ AI returned ${flatCount()} cards — trimming ${over} land(s) to reach 99.`);
-          trimLands(over);
+          addLog(`⚠️ AI returned ${flatCount()} cards — cutting ${over} to reach 99.`);
+          trimLands(Math.min(over, Math.max(0, countLands() - MAX_LANDS)));
+          let still = flatCount() - 99;
+          if (still > 0) {
+            const comboKeys = new Set(combosAllowed.flatMap(c => c.cards || []).map(normCardName));
+            const pool = deckData.categories.flatMap(cat => cat.cards.map(dc => ({ cat, dc })))
+              .filter(({ dc }) => !isLandName(dc.name) && !comboKeys.has(normCardName(dc.name)))
+              .map(x => ({ ...x, score: eligibleByNorm.get(normCardName(x.dc.name))?._score ?? -1 }))
+              .sort((a, b) => a.score - b.score);
+            const cut = [];
+            for (const { cat, dc } of pool) {
+              if (still <= 0) break;
+              const i = cat.cards.indexOf(dc);
+              if (i >= 0) { cat.cards.splice(i, 1); cut.push(dc.name); still--; }
+            }
+            if (cut.length) addLog(`✂️ Cut the ${cut.length} weakest card(s): ${cut.slice(0, 8).join(", ")}${cut.length > 8 ? ", …" : ""}.`);
+            if (still > 0) trimLands(still);
+          }
         }
         // 2. Trim if land count > MAX_LANDS (can happen when many utility lands land in wrong categories).
         if (countLands() > MAX_LANDS) {
@@ -8644,6 +8674,83 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
       } finally { setBinderLoading(false); }
     };
 
+    // ── Background card data ──────────────────────────────────────────────
+    // After an import (and on start) the whole collection's Scryfall data is
+    // loaded quietly in small batches, so binders, the forge and deck views
+    // don't have to wait for it. Everything loaded goes straight into the
+    // Scryfall cache, so a reload continues where it stopped. If Scryfall
+    // doesn't answer, it waits a minute and carries on.
+    const [bgLoad, setBgLoad] = useState(null);   // { done, total, status: "running" | "paused" | "done", notFound }
+    const bgRef = useRef({ running: false, skip: new Set() });
+    const groupsRef = useRef(groups);
+    groupsRef.current = groups;
+    const bgKeyOf = c => (c.id || c.name || "").toLowerCase();
+    const bgTargets = () => {
+      const m = new Map();
+      const g = groupsRef.current;
+      [...(g.binders || []), ...(g.decks || [])].forEach(src => (src.cards || []).forEach(c => {
+        if (!c?.name || SF_SKIP_NAMES.has(c.name)) return;
+        const k = bgKeyOf(c);
+        if (!m.has(k)) m.set(k, { name: c.name, id: c.id || "", qty: 1 });
+      }));
+      return [...m.values()];
+    };
+    const bgMissing = rows => {
+      const cache = getSFCache(), now = Date.now();
+      return rows.filter(c => {
+        if (bgRef.current.skip.has(bgKeyOf(c))) return false;
+        const h = cache[bgKeyOf(c)];
+        return !(h && now - h.ts < SF_CACHE_TTL);
+      });
+    };
+    // Binders already open(ed) pick up the newly loaded data from the cache.
+    const refreshBindersFromCache = () => setBinderEnriched(m => {
+      const cache = getSFCache(), next = {};
+      for (const name of Object.keys(m)) {
+        const b = (groupsRef.current.binders || []).find(x => x.name === name);
+        if (!b) continue;
+        next[name] = b.cards.map(c => {
+          const sf = SF_SKIP_NAMES.has(c.name) ? basicLandStub(c.name) : cache[bgKeyOf(c)]?.d;
+          return sf ? { ...c, scryfall: sf } : null;
+        }).filter(Boolean);
+      }
+      return next;
+    });
+    const runBgLoad = async () => {
+      if (bgRef.current.running) return;
+      bgRef.current.running = true;
+      let failures = 0, loadedAny = false;
+      try {
+        for (;;) {
+          const all = bgTargets();
+          const todo = bgMissing(all);
+          setBgLoad({ done: all.length - todo.length, total: all.length, status: todo.length ? "running" : "done", notFound: bgRef.current.skip.size });
+          if (!todo.length) break;
+          const chunk = todo.slice(0, 150);
+          await fetchAllScryfall(chunk, () => {}, () => {});
+          const left = bgMissing(chunk);
+          if (left.length === chunk.length) {
+            // Nothing came back: Scryfall busy or offline — wait, then retry.
+            if (++failures > 5) { setBgLoad(st => ({ ...st, status: "paused" })); break; }
+            setBgLoad(st => ({ ...st, status: "paused" }));
+            await new Promise(r => setTimeout(r, 60000));
+            continue;
+          }
+          failures = 0; loadedAny = true;
+          // Cards Scryfall doesn't know (tokens, renamed cards) — don't ask again.
+          left.forEach(c => bgRef.current.skip.add(bgKeyOf(c)));
+        }
+      } finally {
+        bgRef.current.running = false;
+        if (loadedAny) refreshBindersFromCache();
+      }
+    };
+    useEffect(() => {
+      if (!didInitRef.current) return;
+      const t = setTimeout(runBgLoad, 3000);
+      return () => clearTimeout(t);
+    }, [groups]);
+
     const openBinder = async (binderName) => {
       setViewingBinder(binderName);
       setBinderFilters({ colors:[], colorMode:"any", types:[], cmcMin:0, cmcMax:20, query:"", sort:"type", conditions:[], finishes:[], states:[] });
@@ -9539,6 +9646,13 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         : ""}
                       <span style=${{ color:"var(--header-muted)" }}>${syncLine}</span>
                     </div>
+                    ${bgLoad && bgLoad.status !== "done" && bgLoad.total > 0 && html`
+                      <div title=${bgLoad.status === "paused"
+                          ? "Scryfall didn't answer — loading continues automatically in a minute (or on the next start)."
+                          : "Card details (pictures, types, prices) for your collection are loading in the background. Keep the tab open; you can use the app meanwhile."}
+                        style=${{ marginTop:4, fontSize:10, color:"var(--header-muted)" }}>
+                        ${bgLoad.status === "paused" ? "⏸" : html`<span class="spin">⚙️</span>`} Card data ${bgLoad.done.toLocaleString()} / ${bgLoad.total.toLocaleString()}${bgLoad.status === "paused" ? " · paused" : ""}
+                      </div>`}
                   </div>
                 `;
               })()}
@@ -10631,8 +10745,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       const isCmdr = fmt === "commander";
                       const total  = maindeck + (isCmdr ? cmdrCount : 0);
                       const target = isCmdr ? 100 : 60;
-                      const complete = total >= target;
-                      const badge = complete ? `✓ ${total} cards` : `${total}/${target}`;
+                      const complete = isCmdr ? total === target : total >= target;   // Commander: exactly 100
+                      const badge = complete ? `✓ ${total} cards` : total > target && isCmdr ? `${total}/${target} · ${total - target} too many` : `${total}/${target}`;
                       const isGen = d.source === "generated" && d.deckData;
                       const included = !!deckInc[d.name];
                       const colors = deckColorIdentity(d);
@@ -12579,7 +12693,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                       const cmdrCount = (selCmd ? 1 : 0) + (deck.partner ? 1 : 0);
                       const total = maindeck + cmdrCount;
                       const target = 100; // Commander deck size
-                      const ok = total >= target;
+                      const ok = total === target;   // a Commander deck is exactly 100 cards
                       return html`
                         <span>${total} cards · ${deck.categories.length} categories</span>
                         ${(() => {
@@ -12594,7 +12708,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                           marginLeft:8, padding:"1px 8px", borderRadius:10, fontSize:10, fontWeight:700,
                           background: ok ? "var(--success-soft)" : "var(--warning-bg)",
                           color: ok ? "var(--success-text)" : "var(--warning)",
-                        }}>${ok ? `✓ ${total} cards` : `${total}/${target} ⚠`}</span>
+                        }} title=${total > target ? `${total - target} card${total - target === 1 ? "" : "s"} too many — a Commander deck has exactly ${target}` : ok ? "" : `${target - total} card${target - total === 1 ? "" : "s"} missing`}>${ok ? `✓ ${total} cards` : total > target ? `${total}/${target} ⚠ ${total - target} too many` : `${total}/${target} ⚠`}</span>
                       `;
                     })()}
                   </div>
