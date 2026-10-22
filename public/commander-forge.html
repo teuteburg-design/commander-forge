@@ -327,7 +327,7 @@
 
   // Build marker — shown next to the wordmark so we can confirm which build
   // a browser is actually running (edge/browser caching can serve stale JS).
-  const APP_VERSION = "v2026.10.21-c";
+  const APP_VERSION = "v2026.10.22-a";
 
   const LS_APIKEY     = "cmdr_forge_apikey";       // legacy single-key (migrated on load)
   const LS_PROVIDER   = "cmdr_forge_provider";     // primary/preferred provider
@@ -815,18 +815,20 @@
 
     const failed = [];        // batches to retry once at the end
     const ingest = (batch, data) => {
-      const matched = new Set();
+      const matched = new Set();   // batch rows already paired with a result
       const front = s => (s || "").toLowerCase().split("//")[0].trim();
       data.forEach(sf => {
-        // Match by id, full name, or front face — a request for the front
+        // Pair by Scryfall id first: a batch can hold several printings of
+        // the same card (Evolving Wilds from 7 sets), and matching by name
+        // gave every result to the first of them, leaving the rest without
+        // data. Then by full name or front face — a request for the front
         // face of a double-faced card ("Kuja, Genome Sorcerer") must still
         // pair with Scryfall's full "Front // Back" response.
-        const loc = batch.find(c =>
-          c.id === sf.id
-          || c.name.toLowerCase() === sf.name.toLowerCase()
-          || front(c.name) === front(sf.name));
+        const loc = batch.find(c => !matched.has(c) && c.id && c.id === sf.id)
+          || batch.find(c => !matched.has(c) && !c.id
+            && (c.name.toLowerCase() === sf.name.toLowerCase() || front(c.name) === front(sf.name)));
         if (loc) {
-          matched.add(loc.name.toLowerCase());
+          matched.add(loc);
           const slim = slimSF(sf);
           const entry = { d: slim, ts: now };
           // Write EVERY key a later lookup might use: the request id, the
@@ -834,21 +836,24 @@
           // Previously only (id || name) was written, so a card fetched by
           // id couldn't be found by a name lookup (and vice versa) — which
           // left double-faced cards stuck uncategorised in "Other".
+          const row = loc._orig || loc;   // name-fallback lookups carry the original row
           const keys = new Set();
-          if (loc.id) keys.add(loc.id.toLowerCase());
+          if (row.id) keys.add(row.id.toLowerCase());
           if (sf.id)  keys.add(sf.id.toLowerCase());
-          for (const nm of [loc.name, sf.name]) {
+          for (const nm of [row.name, sf.name]) {
             if (!nm) continue;
             keys.add(nm.toLowerCase());
             keys.add(front(nm));
           }
           keys.forEach(k => { if (k) cache[k] = entry; });
-          out.push({ ...loc, scryfall: sf });
+          out.push({ ...row, scryfall: sf });
           cacheUpdated = true;
         }
       });
+      batch.forEach(c => { if (!matched.has(c) && c.id && !c._orig) idMisses.push(c); });
       unmatched += batch.length - matched.size;
     };
+    const idMisses = [];   // rows whose Scryfall id wasn't found — looked up by name at the end
 
     for (let i = 0; i < batches.length; i++) {
       const batch = batches[i];
@@ -887,6 +892,17 @@
         if (error) errors.push({ error, batch_size: batch.length });
         else ingest(batch, data);
       }
+    }
+    // Printings Scryfall doesn't know by id (special / new prints): use the
+    // card's name instead, so the row still gets its data.
+    if (idMisses.length) {
+      const shadows = idMisses.map(c => ({ ...c, id: "", _orig: c }));
+      for (let i = 0; i < shadows.length; i += BATCH) {
+        const batch = shadows.slice(i, i + BATCH);
+        const { data, error } = await fetchBatch(batch);
+        if (!error) { unmatched -= batch.length; ingest(batch, data); }
+      }
+      if (cacheUpdated) setSFCache(cache);
     }
     const lost = errors.reduce((n, e) => n + e.batch_size, 0);
     if (lost) {
@@ -8615,6 +8631,19 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
     // Open a binder in the detail view. Enriches its cards on-demand
     // (Scryfall metadata) the first time so we can render thumbnails,
     // filters, and metrics. Subsequent opens hit the in-memory cache.
+    // Load (missing) Scryfall data for a binder again — after Scryfall was busy.
+    const retryBinderData = async (binderName) => {
+      const binder = (groups.binders || []).find(b => b.name === binderName);
+      if (!binder) return;
+      setBinderLoading(true);
+      try {
+        const enr = await fetchAllScryfall(binder.cards, () => {}, () => {});
+        setBinderEnriched(m => ({ ...m, [binderName]: enr }));
+      } catch (e) {
+        setError(`Couldn't load card data: ${e.message || e}`);
+      } finally { setBinderLoading(false); }
+    };
+
     const openBinder = async (binderName) => {
       setViewingBinder(binderName);
       setBinderFilters({ colors:[], colorMode:"any", types:[], cmcMin:0, cmcMax:20, query:"", sort:"type", conditions:[], finishes:[], states:[] });
@@ -10557,7 +10586,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                             <div style=${{ fontSize:13, fontWeight:600, color:"var(--fg-text-strong)",
                               whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>${b.name}</div>
                             <div style=${{ fontSize:11, color:"var(--fg-text-muted)", display:"flex", flexWrap:"wrap", gap:6, alignItems:"center" }}>
-                              <span>Binder · ${total} cards (${b.cards.length} unique)</span>
+                              <span>Binder · ${total} cards (${new Set(b.cards.map(c => normCardName(c.name))).size} different)</span>
                               ${(b.tags || []).length > 0 && (b.tags || []).map(t => html`<span key=${t} style=${{
                                 padding:"1px 7px", borderRadius:10, fontSize:10,
                                 background:"var(--bg-tag)", color:"var(--fg-text-body)",
@@ -10652,7 +10681,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                                 fontSize:9, padding:"1px 6px", borderRadius:8, fontWeight:700, letterSpacing:0.5,
                                 background:"var(--border-soft)", color:"var(--fg-text-body)", textTransform:"uppercase",
                               }}>${fmt}</span>
-                              <span>${total} cards (${d.cards.length} unique)</span>
+                              <span>${total} cards (${new Set(d.cards.map(c => normCardName(c.name))).size} different)</span>
                               ${total > 0 && html`<span style=${{
                                 fontSize:10, padding:"1px 7px", borderRadius:10, fontWeight:600,
                                 background: complete ? "var(--success-soft)" : "var(--warning-bg)",
@@ -10913,8 +10942,14 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                 <button style=${btnSec} onClick=${() => { setViewingBinder(null); setPhase("select"); }}>← Back</button>
               </div>`;
             const enriched = binderEnriched[viewingBinder] || [];
-            // Display rows: prefer enriched data, fall back to raw rows while loading.
-            const rows = enriched.length ? enriched : binder.cards.map(c => ({ ...c, scryfall: null }));
+            // Every binder row, with its Scryfall data where it loaded. Rows
+            // Scryfall didn't return (busy / unknown name) still show, in "Other".
+            const sfByRow = new Map(enriched.map(c => [((c.id || "") + "|" + c.name).toLowerCase(), c.scryfall]));
+            const rows = binder.cards.map(c => ({ ...c, scryfall: sfByRow.get(((c.id || "") + "|" + c.name).toLowerCase()) || null }));
+            const missingData = enriched.length ? rows.filter(c => !c.scryfall && !BASIC_NAMES.has(c.name)).length : 0;
+            const printingKey = c => ((c.id || "") + "|" + c.name).toLowerCase();
+            const totalPrintings = new Set(binder.cards.map(printingKey)).size;
+            const distinctNames = new Set(binder.cards.map(c => normCardName(c.name))).size;
 
             // Per-card derived metadata for filtering / metrics.
             const meta = rows.map(c => {
@@ -11096,7 +11131,8 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                         `}
                       </div>
                       <div style=${{ fontSize:12, color:"var(--fg-text-muted)", marginTop:2 }}>
-                        ${binder.cards.reduce((s,c) => s + (c.qty||1), 0).toLocaleString()} cards · ${binder.cards.length.toLocaleString()} unique
+                        ${binder.cards.reduce((s,c) => s + (c.qty||1), 0).toLocaleString()} cards · ${distinctNames.toLocaleString()} different cards
+                        <span title="Distinct printings (set + collector number); the same card in another set, condition, finish or language is listed separately" style=${{ color:"var(--fg-text-muted)" }}> · ${totalPrintings.toLocaleString()} printings</span>
                         ${binderLoading && html` <span style=${{ color:"var(--accent-text)", marginLeft:8 }}>· enriching…</span>`}
                       </div>
                     </div>
@@ -11315,8 +11351,16 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                   <!-- RIGHT: Card grid -->
                   <div>
                     <div style=${{ marginBottom:8, fontSize:12, color:"var(--fg-text-muted)" }}>
-                      Showing <strong>${filtered.length.toLocaleString()}</strong> of ${meta.length.toLocaleString()} unique cards
+                      Showing <strong>${filtered.length.toLocaleString()}</strong> of ${totalPrintings.toLocaleString()} printings
                     </div>
+                    ${missingData > 0 && html`
+                      <div style=${{ marginBottom:10, padding:"8px 12px", borderRadius:8, fontSize:12, lineHeight:1.5,
+                        background:"var(--warning-bg)", border:"1px solid var(--warning)", color:"var(--fg-text-body)",
+                        display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
+                        <span style=${{ flex:1, minWidth:200 }}>⚠ Card details for <strong>${missingData.toLocaleString()}</strong> entr${missingData === 1 ? "y" : "ies"} couldn't be loaded from Scryfall (it limits how fast cards can be looked up). They're listed under "Other" without pictures, and colour / type filters skip them.</span>
+                        <button onClick=${() => retryBinderData(viewingBinder)} disabled=${binderLoading}
+                          style=${{ ...btnSec, padding:"4px 12px", fontSize:11 }}>${binderLoading ? "Loading…" : "↻ Load the rest"}</button>
+                      </div>`}
                     ${(() => {
                       if (filtered.length === 0) return html`<div style=${{ padding:30, textAlign:"center", fontSize:13, color:"var(--fg-text-placeholder)", fontStyle:"italic",
                         background:"var(--bg-surface)", border:"1px dashed var(--border-strong)", borderRadius:8 }}>
@@ -11401,7 +11445,7 @@ No theme, no description, no warnings. Categories first. Reasons ≤ 50 chars.`;
                               }}>
                               <span style=${{ fontSize:11, color:"var(--fg-text-soft)", width:14, display:"inline-block" }}>${collapsed ? "▶" : "▼"}</span>
                               <span style=${{ fontSize:13, fontWeight:700, color:"var(--fg-text-heading)", letterSpacing:0.3 }}>${t}</span>
-                              <span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}>· ${cs.length} unique${total !== cs.length ? ` · ${total} cards` : ""}</span>
+                              <span style=${{ fontSize:11, color:"var(--fg-text-muted)" }}>· ${cs.length} printing${cs.length === 1 ? "" : "s"}${total !== cs.length ? ` · ${total} cards` : ""}</span>
                             </div>
                             ${!collapsed && html`<div style=${gridStyle}>${cs.map(renderCard)}</div>`}
                           </div>`;
